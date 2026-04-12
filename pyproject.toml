@@ -1,0 +1,33 @@
+[project]
+name = "microwaveos"
+version = "0.2.0"
+description = "Cognitive agent runtime — triage, search, assembly, reflection"
+requires-python = ">=3.11"
+dependencies = [
+    "claude-agent-sdk",
+    "anthropic",
+    "python-telegram-bot>=21.0",
+    "sqlite-vec",
+    "openai",
+    "tiktoken",
+    "pydantic>=2.0",
+    "apsw",
+    "aiohttp",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "ruff",
+]
+
+[project.scripts]
+microwaveos = "src.main:main"
+
+[tool.ruff]
+line-length = 100
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
