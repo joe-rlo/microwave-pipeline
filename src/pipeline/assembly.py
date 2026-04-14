@@ -25,6 +25,7 @@ def assemble(
     memory_store: MemoryStore,
     memory_index: MemoryIndex,
     channel: str | None = None,
+    output_dir: str = "",
 ) -> AssemblyResult:
     """Assemble stable and dynamic context for this turn."""
     # Build stable context (for reconnect if needed)
@@ -35,30 +36,39 @@ def assemble(
     dynamic_parts = []
     dynamic_parts.append(f"[Current datetime: {datetime.now().isoformat(timespec='minutes')}]")
 
-    # File output capability — channel-aware
-    file_instructions = (
-        '[File output]\n'
-        'You can create files for the user. Write them to the current working directory '
-        'using the Write tool. The system will automatically detect new files and deliver '
-        'them to the user.\n'
-        'Use this when the user asks you to write, generate, or create a file, '
-        'or when your response is a complete code file, document, config, or dataset '
-        'that would be more useful as a downloadable file than inline text. '
-        'You can create multiple files in one response. '
-        'Include a brief message explaining what you created.'
-    )
+    # File output instructions — channel-aware
     if channel == "telegram":
-        file_instructions += (
-            '\n\n'
-            'IMPORTANT for this channel: Tables, charts, flowcharts, diagrams, '
-            'timelines, and comparisons MUST be created as self-contained HTML files '
-            'rather than inline text. Telegram markdown cannot render these properly. '
-            'Create a <file name="descriptive-name.html"> with inline CSS, mobile-friendly '
-            'responsive design, and dark mode support. For charts use Chart.js CDN, '
-            'for diagrams use Mermaid.js CDN. Always provide a brief text summary '
-            'alongside the file.'
+        dynamic_parts.append(
+            '[File output — Telegram]\n'
+            'Tables, charts, flowcharts, diagrams, timelines, and comparisons '
+            'CANNOT be rendered properly in Telegram. Instead, output them as '
+            'complete HTML documents inside ```html code fences. The system will '
+            'automatically extract them and send as file attachments.\n\n'
+            'HTML requirements:\n'
+            '- Self-contained: inline CSS, no external stylesheets\n'
+            '- Include <!DOCTYPE html> and full <html> structure\n'
+            '- Descriptive <title> tag (used for the filename)\n'
+            '- Dark mode: use prefers-color-scheme media query\n'
+            '- For charts: use Chart.js via CDN\n'
+            '- For diagrams: use a ```mermaid code fence (auto-wrapped in HTML)\n\n'
+            'CRITICAL mobile layout rules (files open on phones):\n'
+            '- viewport meta tag: <meta name="viewport" content="width=device-width, initial-scale=1.0">\n'
+            '- Tables: use width:100%, word-wrap:break-word, and font-size ~14px\n'
+            '- Tables: do NOT use fixed-width columns. Use percentage or auto widths.\n'
+            '- If a table has 5+ columns, use a card/list layout instead (each row becomes a stacked card)\n'
+            '- Body padding: 12px-16px, never 0\n'
+            '- Max-width on content containers: 100vw, with overflow-x:auto as fallback\n'
+            '- Test assumption: screen is 375px wide\n\n'
+            'Write a brief summary OUTSIDE the code fence explaining what the file contains. '
+            'The code fence content becomes the file; the surrounding text becomes the message.'
         )
-    dynamic_parts.append(file_instructions)
+    else:
+        dynamic_parts.append(
+            '[File output]\n'
+            'When creating complete files (code, HTML, configs, documents), '
+            'use code fences with language hints. Complete HTML documents '
+            '(with <!DOCTYPE html>) will be auto-extracted as downloadable files.'
+        )
 
     fragments_text = _format_fragments(search_result.fragments)
     if fragments_text:

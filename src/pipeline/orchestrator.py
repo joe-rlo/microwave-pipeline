@@ -141,6 +141,7 @@ class Orchestrator:
             self.memory_store,
             self.memory_index,
             channel=self._channel,
+            output_dir=str(self.config.output_dir),
         )
 
         # Reconnect only if underlying files actually changed on disk
@@ -229,14 +230,16 @@ class Orchestrator:
                         full_response = chunk.get("text", full_response)
 
         # --- File collection ---
-        # 1. Extract <file> tags from response text (works with API key mode too)
+        # 1. Extract files from response text (tags, HTML docs, large code blocks)
         from src.pipeline.file_extract import extract_files
-        cleaned_text, file_blocks = extract_files(full_response)
+        cleaned_text, file_blocks = extract_files(full_response, channel=channel)
         if file_blocks:
-            log.info(f"Extracted {len(file_blocks)} file(s) from response tags")
+            log.info(f"Extracted {len(file_blocks)} file(s) from response text")
             for fb in file_blocks:
                 yield {"type": "file", "name": fb.name, "content": fb.content}
             full_response = cleaned_text
+            # Tell channels to replace their accumulated text with the cleaned version
+            yield {"type": "text_replace", "text": cleaned_text}
 
         # 2. Pick up files written to output dir by SDK tool use
         new_files = _new_files(output_dir, pre_files)

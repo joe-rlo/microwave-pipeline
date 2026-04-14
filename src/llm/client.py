@@ -48,18 +48,14 @@ class LLMClient:
         try:
             from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions
 
-            # Allow file tools scoped to output directory, auto-accept permissions
+            # No tools — the model outputs content as text and the pipeline
+            # handles file extraction from code fences automatically.
             opts = dict(
                 system_prompt=self._stable_prompt,
                 model=self.model,
                 cli_path=self.cli_path or None,
-                permission_mode="acceptEdits",
+                allowed_tools=[],
             )
-            if self.output_dir:
-                opts["cwd"] = self.output_dir
-                opts["allowed_tools"] = ["Write", "Read", "Edit"]
-            else:
-                opts["allowed_tools"] = []
 
             options = ClaudeAgentOptions(**opts)
             self._client = ClaudeSDKClient(options)

@@ -194,6 +194,10 @@ class TelegramChannel(Channel):
                         chat_id, document=file_buf, filename=chunk["name"]
                     )
 
+                elif chunk["type"] == "text_replace":
+                    # File extraction cleaned the response — update accumulated text
+                    accumulated = chunk["text"]
+
                 elif chunk["type"] == "metadata":
                     last_metadata = chunk["pipeline"]
 
