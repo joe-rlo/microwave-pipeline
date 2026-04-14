@@ -30,10 +30,35 @@ def assemble(
     # Build stable context (for reconnect if needed)
     stable_prompt = memory_store.assemble_stable_context(channel=channel)
 
-    # Build dynamic context: datetime + retrieved fragments
+    # Build dynamic context: datetime + capabilities + retrieved fragments
     # Datetime goes here (not in stable prompt) so it doesn't trigger reconnects
     dynamic_parts = []
     dynamic_parts.append(f"[Current datetime: {datetime.now().isoformat(timespec='minutes')}]")
+
+    # File output capability — channel-aware
+    file_instructions = (
+        '[File output]\n'
+        'You can create files for the user. Write them to the current working directory '
+        'using the Write tool. The system will automatically detect new files and deliver '
+        'them to the user.\n'
+        'Use this when the user asks you to write, generate, or create a file, '
+        'or when your response is a complete code file, document, config, or dataset '
+        'that would be more useful as a downloadable file than inline text. '
+        'You can create multiple files in one response. '
+        'Include a brief message explaining what you created.'
+    )
+    if channel == "telegram":
+        file_instructions += (
+            '\n\n'
+            'IMPORTANT for this channel: Tables, charts, flowcharts, diagrams, '
+            'timelines, and comparisons MUST be created as self-contained HTML files '
+            'rather than inline text. Telegram markdown cannot render these properly. '
+            'Create a <file name="descriptive-name.html"> with inline CSS, mobile-friendly '
+            'responsive design, and dark mode support. For charts use Chart.js CDN, '
+            'for diagrams use Mermaid.js CDN. Always provide a brief text summary '
+            'alongside the file.'
+        )
+    dynamic_parts.append(file_instructions)
 
     fragments_text = _format_fragments(search_result.fragments)
     if fragments_text:

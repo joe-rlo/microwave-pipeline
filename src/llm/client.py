@@ -22,11 +22,13 @@ class LLMClient:
     The SDK manages multi-turn conversation state internally.
     """
 
-    def __init__(self, model: str = "sonnet", auth_mode: str = "max", api_key: str = "", cli_path: str = ""):
+    def __init__(self, model: str = "sonnet", auth_mode: str = "max", api_key: str = "",
+                 cli_path: str = "", output_dir: str = ""):
         self.model = model
         self.auth_mode = auth_mode
         self.api_key = api_key
         self.cli_path = cli_path
+        self.output_dir = output_dir
         self._client = None
         self._stable_prompt: str | None = None
         self._conversation: list[dict] = []
@@ -46,12 +48,20 @@ class LLMClient:
         try:
             from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions
 
-            options = ClaudeAgentOptions(
+            # Allow file tools scoped to output directory, auto-accept permissions
+            opts = dict(
                 system_prompt=self._stable_prompt,
-                allowed_tools=[],
                 model=self.model,
                 cli_path=self.cli_path or None,
+                permission_mode="acceptEdits",
             )
+            if self.output_dir:
+                opts["cwd"] = self.output_dir
+                opts["allowed_tools"] = ["Write", "Read", "Edit"]
+            else:
+                opts["allowed_tools"] = []
+
+            options = ClaudeAgentOptions(**opts)
             self._client = ClaudeSDKClient(options)
             await self._client.connect()
             log.info("Connected via Agent SDK (Max auth)")

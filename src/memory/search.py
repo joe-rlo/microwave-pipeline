@@ -77,9 +77,7 @@ class MemorySearcher:
                 "SELECT v.id, v.distance, f.content, f.source, f.timestamp, f.retrieval_count "
                 "FROM fragments_vec v "
                 "JOIN fragments f ON f.id = v.id "
-                "WHERE v.embedding MATCH ? "
-                "ORDER BY v.distance "
-                "LIMIT ?",
+                "WHERE v.embedding MATCH ? AND k = ?",
                 (_serialize_vector(embedding), limit),
             ))
 

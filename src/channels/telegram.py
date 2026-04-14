@@ -159,64 +159,78 @@ class TelegramChannel(Channel):
                     accumulated += new_text
 
                     # Send or edit message with rate limiting
+                    # Only update the streaming preview while under the limit;
+                    # once we exceed it, stop editing and let the final split handle it
                     now = asyncio.get_event_loop().time()
-                    if now - last_edit >= EDIT_INTERVAL:
-                        display = accumulated[:MAX_MESSAGE_LENGTH]
+                    if now - last_edit >= EDIT_INTERVAL and len(accumulated) <= MAX_MESSAGE_LENGTH:
                         try:
                             if sent_msg is None:
                                 sent_msg = await context.bot.send_message(
-                                    chat_id, display, parse_mode="Markdown"
+                                    chat_id, accumulated, parse_mode="Markdown"
                                 )
                             else:
                                 await context.bot.edit_message_text(
-                                    display, chat_id, sent_msg.message_id,
+                                    accumulated, chat_id, sent_msg.message_id,
                                     parse_mode="Markdown",
                                 )
                             last_edit = now
                         except Exception as e:
                             try:
                                 if sent_msg is None:
-                                    sent_msg = await context.bot.send_message(chat_id, display)
+                                    sent_msg = await context.bot.send_message(chat_id, accumulated)
                                 else:
                                     await context.bot.edit_message_text(
-                                        display, chat_id, sent_msg.message_id
+                                        accumulated, chat_id, sent_msg.message_id
                                     )
                                 last_edit = now
                             except Exception:
                                 log.warning(f"Message edit failed: {e}")
 
+                elif chunk["type"] == "file":
+                    # Send extracted file as a document
+                    file_buf = io.BytesIO(chunk["content"].encode("utf-8"))
+                    file_buf.name = chunk["name"]
+                    await context.bot.send_document(
+                        chat_id, document=file_buf, filename=chunk["name"]
+                    )
+
                 elif chunk["type"] == "metadata":
                     last_metadata = chunk["pipeline"]
 
-            # Decide: send as text or as file
-            if accumulated and len(accumulated) > FILE_THRESHOLD and _looks_like_file_content(accumulated):
-                # Send as document
-                await self._send_as_file(chat_id, accumulated, sent_msg, context)
-            elif accumulated:
-                # Final text update
-                display = accumulated[:MAX_MESSAGE_LENGTH]
+            # Final delivery: split into multiple messages if needed
+            if accumulated:
+                parts = _split_message(accumulated)
+
+                # First part: update the streaming preview message
+                first = parts[0]
                 try:
                     if sent_msg is None:
-                        await context.bot.send_message(chat_id, display, parse_mode="Markdown")
-                    elif display != (sent_msg.text or ""):
+                        sent_msg = await context.bot.send_message(
+                            chat_id, first, parse_mode="Markdown"
+                        )
+                    elif first != (sent_msg.text or ""):
                         await context.bot.edit_message_text(
-                            display, chat_id, sent_msg.message_id, parse_mode="Markdown"
+                            first, chat_id, sent_msg.message_id, parse_mode="Markdown"
                         )
                 except Exception:
                     if sent_msg is None:
-                        await context.bot.send_message(chat_id, display)
+                        await context.bot.send_message(chat_id, first)
                     else:
                         try:
                             await context.bot.edit_message_text(
-                                display, chat_id, sent_msg.message_id
+                                first, chat_id, sent_msg.message_id
                             )
                         except Exception:
                             pass
 
-                # If it's over the limit, also send the full thing as a file
-                if len(accumulated) > MAX_MESSAGE_LENGTH:
-                    await self._send_as_file(chat_id, accumulated, None, context,
-                                             caption="Full response attached.")
+                # Remaining parts: send as new messages
+                for part in parts[1:]:
+                    try:
+                        await context.bot.send_message(
+                            chat_id, part, parse_mode="Markdown"
+                        )
+                    except Exception:
+                        await context.bot.send_message(chat_id, part)
 
             context.user_data["last_metadata"] = last_metadata
 
@@ -299,6 +313,48 @@ class TelegramChannel(Channel):
             f"Auth: {self.orchestrator.config.auth_mode}\n"
             f"Model: {self.orchestrator.config.model_main}"
         )
+
+
+def _split_message(text: str, max_len: int = MAX_MESSAGE_LENGTH) -> list[str]:
+    """Split a long message into chunks that fit Telegram's limit.
+
+    Splits at paragraph boundaries (\n\n) first, then at line breaks,
+    then hard-cuts as a last resort. Never splits mid-code-block.
+    """
+    if len(text) <= max_len:
+        return [text]
+
+    parts = []
+    remaining = text
+
+    while remaining:
+        if len(remaining) <= max_len:
+            parts.append(remaining)
+            break
+
+        # Find a good split point within the limit
+        chunk = remaining[:max_len]
+        split_at = -1
+
+        # Prefer splitting at paragraph boundary
+        split_at = chunk.rfind("\n\n")
+
+        # Fall back to line break
+        if split_at < max_len // 4:
+            split_at = chunk.rfind("\n")
+
+        # Last resort: split at space
+        if split_at < max_len // 4:
+            split_at = chunk.rfind(" ")
+
+        # Absolute last resort: hard cut
+        if split_at < max_len // 4:
+            split_at = max_len
+
+        parts.append(remaining[:split_at].rstrip())
+        remaining = remaining[split_at:].lstrip("\n")
+
+    return [p for p in parts if p.strip()]
 
 
 def _looks_like_file_content(text: str) -> bool:

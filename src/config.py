@@ -60,6 +60,10 @@ class Config(BaseModel):
         return self.workspace_dir / "memory"
 
     @property
+    def output_dir(self) -> Path:
+        return self.workspace_dir / "output"
+
+    @property
     def db_path(self) -> Path:
         return self.data_dir / "memory.db"
 
@@ -67,6 +71,7 @@ class Config(BaseModel):
         self.workspace_dir.mkdir(parents=True, exist_ok=True)
         self.daily_dir.mkdir(parents=True, exist_ok=True)
         self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
 
 
 def _load_dotenv() -> None:

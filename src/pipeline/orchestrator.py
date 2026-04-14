@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import AsyncIterator
 
 from src.config import Config
@@ -67,12 +68,13 @@ class Orchestrator:
         )
         self.session_engine.connect()
 
-        # LLM client
+        # LLM client — with sandboxed output directory for file creation
         self.llm = LLMClient(
             model=self.config.model_main,
             auth_mode=self.config.auth_mode,
             api_key=self.config.anthropic_api_key,
             cli_path=self.config.cli_path,
+            output_dir=str(self.config.output_dir),
         )
 
         # Assemble stable context and connect
@@ -149,6 +151,10 @@ class Orchestrator:
             self._stable_mtime = current_mtime
 
         # --- LLM Generation ---
+        # Snapshot output dir before generation to detect new files
+        output_dir = self.config.output_dir
+        pre_files = _snapshot_dir(output_dir)
+
         # Escalate to Opus+thinking for complex tasks
         escalated = triage_result.complexity == "complex"
         if escalated:
@@ -221,6 +227,28 @@ class Orchestrator:
                         yield chunk
                     elif chunk["type"] == "result":
                         full_response = chunk.get("text", full_response)
+
+        # --- File collection ---
+        # 1. Extract <file> tags from response text (works with API key mode too)
+        from src.pipeline.file_extract import extract_files
+        cleaned_text, file_blocks = extract_files(full_response)
+        if file_blocks:
+            log.info(f"Extracted {len(file_blocks)} file(s) from response tags")
+            for fb in file_blocks:
+                yield {"type": "file", "name": fb.name, "content": fb.content}
+            full_response = cleaned_text
+
+        # 2. Pick up files written to output dir by SDK tool use
+        new_files = _new_files(output_dir, pre_files)
+        if new_files:
+            log.info(f"Found {len(new_files)} file(s) written to output dir")
+            for path in new_files:
+                try:
+                    content = path.read_text(encoding="utf-8")
+                    yield {"type": "file", "name": path.name, "content": content}
+                    path.unlink()  # clean up after sending
+                except Exception as e:
+                    log.warning(f"Could not read output file {path}: {e}")
 
         # Store assistant turn
         assistant_turn = Turn(
@@ -354,3 +382,24 @@ class Orchestrator:
         if self.session_engine:
             self.session_engine.close()
         log.info("Orchestrator stopped")
+
+
+def _snapshot_dir(path: Path) -> dict[str, float]:
+    """Snapshot file mtimes in a directory. Returns {name: mtime}."""
+    if not path.exists():
+        return {}
+    return {f.name: f.stat().st_mtime for f in path.iterdir() if f.is_file()}
+
+
+def _new_files(path: Path, before: dict[str, float]) -> list[Path]:
+    """Find files that are new or modified since the snapshot."""
+    if not path.exists():
+        return []
+    result = []
+    for f in path.iterdir():
+        if not f.is_file():
+            continue
+        old_mtime = before.get(f.name)
+        if old_mtime is None or f.stat().st_mtime > old_mtime:
+            result.append(f)
+    return result

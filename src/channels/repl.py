@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+from pathlib import Path
 
 from src.channels.base import Channel
 from src.pipeline.orchestrator import Orchestrator
@@ -65,6 +66,12 @@ class REPLChannel(Channel):
                         print(chunk["text"], end="", flush=True)
                     elif chunk["type"] == "text":
                         print(chunk["chunk"], end="", flush=True)
+                    elif chunk["type"] == "file":
+                        # Write file to current directory
+                        out_path = Path.cwd() / chunk["name"]
+                        out_path.parent.mkdir(parents=True, exist_ok=True)
+                        out_path.write_text(chunk["content"])
+                        print(f"\n  [wrote {out_path}]", flush=True)
                     elif chunk["type"] == "metadata":
                         self._last_metadata = chunk["pipeline"]
                         if self.show_metadata:

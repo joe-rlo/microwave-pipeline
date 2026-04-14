@@ -47,7 +47,40 @@ claude whoami  # should show your username
 
 The Agent SDK authenticates through your Claude Code session. No API key needed.
 
-### 4. Run
+### 4. Import existing data (optional)
+
+If you're coming from another AI tool, you can import your conversation history and memory into MicrowaveOS. Imported data is chunked, embedded, and indexed for vector + keyword search.
+
+```bash
+# OpenClaw — auto-detects ~/.openclaw, prompts to select agent
+python3 src/import_data.py openclaw
+python3 src/import_data.py openclaw --path ~/.openclaw/agents/abc123
+
+# Hermes Agent — auto-detects ~/.hermes
+python3 src/import_data.py hermes
+python3 src/import_data.py hermes --path ~/.hermes
+
+# NanoClaw — auto-detects common install locations
+python3 src/import_data.py nanoclaw
+python3 src/import_data.py nanoclaw --path ~/nanoclaw
+```
+
+Options:
+- `--dry-run` — show what would be imported without doing it
+- `--sessions-only` — import conversations, skip memory files
+- `--memory-only` — import memory/knowledge, skip conversations
+
+**What gets imported:**
+
+| Source | Conversations | Memory | Daily notes | Topic memories |
+|--------|:---:|:---:|:---:|:---:|
+| OpenClaw | JSONL sessions | MEMORY.md | daily .md files | people/, projects/, topics/ |
+| Hermes | SQLite sessions | ~/.hermes/memories/ | — | — |
+| NanoClaw | SQLite messages | CLAUDE.md per group | — | FTS conversations |
+
+Imported content becomes searchable immediately — the pipeline's triage and search stages will surface relevant fragments from your history.
+
+### 5. Run
 
 ```bash
 # REPL (default)
