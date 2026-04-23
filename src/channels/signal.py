@@ -310,6 +310,17 @@ class SignalChannel(Channel):
 
     # --- Send ---
 
+    async def send_text(self, recipient: str, text: str) -> None:
+        """Public send. Delegates to the private implementation so internal
+        callers keep working while external callers (e.g. scheduler) stay
+        off the `_` prefix."""
+        await self._send_text(recipient, text)
+
+    async def send_attachment(
+        self, recipient: str, filename: str, content: str | bytes
+    ) -> None:
+        await self._send_attachment(recipient, filename, content)
+
     async def _send_text(self, recipient: str, text: str) -> None:
         if not text:
             return

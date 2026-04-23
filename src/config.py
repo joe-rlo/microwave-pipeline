@@ -36,6 +36,10 @@ class Config(BaseModel):
     signal_phone_number: str = ""  # the bot's Signal-registered number
     signal_allowed_senders: tuple[str, ...] = ()  # optional allowlist
 
+    # Scheduler — runs as a background task inside --signal when enabled.
+    # Fires cron-scheduled jobs (LLM or direct) defined via `microwaveos scheduler add`.
+    scheduler_enabled: bool = False
+
     # OpenAI (embeddings only)
     openai_api_key: str = ""
 
@@ -124,5 +128,6 @@ def load_config() -> Config:
         signal_allowed_senders=tuple(
             s.strip() for s in os.getenv("SIGNAL_ALLOWED_SENDERS", "").split(",") if s.strip()
         ),
+        scheduler_enabled=os.getenv("SCHEDULER_ENABLED", "").lower() in ("1", "true", "yes", "on"),
         openai_api_key=os.getenv("OPENAI_API_KEY", ""),
     )

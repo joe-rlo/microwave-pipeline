@@ -78,6 +78,34 @@ class TelegramChannel(Channel):
             await self.app.stop()
             await self.app.shutdown()
 
+    # --- Outbound API (used by scheduler and other non-interactive callers) ---
+
+    async def send_text(self, recipient: str, text: str) -> None:
+        """Send a message to a chat_id. `recipient` can be a string or int;
+        Telegram accepts either for chat_id."""
+        if not self.app:
+            raise RuntimeError("TelegramChannel not started")
+        formatted = markdown_to_telegram_html(text)
+        try:
+            await self.app.bot.send_message(
+                chat_id=recipient, text=formatted, parse_mode="HTML"
+            )
+        except BadRequest:
+            # HTML render failed — fall back to plain
+            await self.app.bot.send_message(chat_id=recipient, text=_strip_tags(formatted))
+
+    async def send_attachment(
+        self, recipient: str, filename: str, content: str | bytes
+    ) -> None:
+        if not self.app:
+            raise RuntimeError("TelegramChannel not started")
+        data = content.encode("utf-8") if isinstance(content, str) else content
+        buf = io.BytesIO(data)
+        buf.name = filename
+        await self.app.bot.send_document(
+            chat_id=recipient, document=buf, filename=filename
+        )
+
     # --- Message handling ---
 
     async def _on_message(self, update: Update, context) -> None:

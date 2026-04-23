@@ -22,3 +22,17 @@ class Channel(ABC):
     async def stop(self) -> None:
         """Stop the channel."""
         ...
+
+    # --- outbound API (used by the scheduler and other non-interactive callers) ---
+    # Channels override these. The scheduler talks to channels through this
+    # pair instead of reaching into private `_send_*` methods.
+
+    async def send_text(self, recipient: str, text: str) -> None:
+        """Deliver a plain text message to a recipient."""
+        raise NotImplementedError
+
+    async def send_attachment(
+        self, recipient: str, filename: str, content: str | bytes
+    ) -> None:
+        """Deliver a file attachment. `content` may be text or raw bytes."""
+        raise NotImplementedError

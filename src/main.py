@@ -1,11 +1,20 @@
 """MicrowaveOS entry point.
 
 Usage:
-    microwaveos              # REPL mode (default)
-    microwaveos --telegram   # Telegram bot
-    microwaveos --signal     # Signal bot (via signal-cli-rest-api)
-    microwaveos --http       # HTTP API server
+    microwaveos                          # REPL mode (default)
+    microwaveos --telegram               # Telegram bot
+    microwaveos --signal                 # Signal bot (via signal-cli-rest-api)
+    microwaveos --http                   # HTTP API server
     microwaveos --http --port 9000
+    microwaveos scheduler <subcommand>   # Manage scheduled jobs
+
+Scheduler subcommands:
+    scheduler list                       # show all jobs
+    scheduler add --name ... --cron ... --mode llm|direct ...
+    scheduler remove <name>
+    scheduler enable <name>
+    scheduler disable <name>
+    scheduler run <name>                 # fire one job right now
 """
 
 from __future__ import annotations
@@ -71,10 +80,11 @@ async def run_telegram(config) -> None:
 
 async def run_signal(config) -> None:
     from src.channels.signal import SignalChannel
+    from src.scheduler.engine import Scheduler
+    from src.scheduler.store import SchedulerStore
 
     if not config.signal_rest_url or not config.signal_phone_number:
         print("Error: SIGNAL_REST_URL and SIGNAL_PHONE_NUMBER must both be set")
-        print("See docs/SIGNAL_SETUP.md for how to run the signal-cli-rest-api daemon.")
         sys.exit(1)
 
     orchestrator = Orchestrator(config)
@@ -87,10 +97,28 @@ async def run_signal(config) -> None:
         allowed_senders=list(config.signal_allowed_senders),
         openai_api_key=config.openai_api_key,
     )
+
+    scheduler: Scheduler | None = None
+    store: SchedulerStore | None = None
+    if config.scheduler_enabled:
+        store = SchedulerStore(config.db_path)
+        store.connect()
+        scheduler = Scheduler(
+            store=store,
+            channels={"signal": channel},
+            config=config,
+        )
+
     try:
         await channel.start()
+        if scheduler:
+            await scheduler.start()
         await asyncio.Event().wait()
     finally:
+        if scheduler:
+            await scheduler.stop()
+        if store:
+            store.close()
         await channel.stop()
         await orchestrator.stop()
 
@@ -112,6 +140,13 @@ async def run_http(config, host: str = "127.0.0.1", port: int = 8080) -> None:
 
 
 def main() -> None:
+    # Branch early on `scheduler` subcommand so its flag surface doesn't
+    # collide with the main runtime flags. Everything after `scheduler`
+    # is parsed by scheduler_cli().
+    if len(sys.argv) >= 2 and sys.argv[1] == "scheduler":
+        from src.scheduler.cli import scheduler_cli
+        sys.exit(scheduler_cli(sys.argv[2:]))
+
     parser = argparse.ArgumentParser(description="MicrowaveOS — cognitive agent runtime")
     parser.add_argument("--telegram", action="store_true", help="Run Telegram bot")
     parser.add_argument("--signal", action="store_true", help="Run Signal bot (requires signal-cli-rest-api)")

@@ -7,7 +7,7 @@ A cognitive agent runtime where the pipeline — triage, search, assembly, refle
 ### 1. Install Python dependencies
 
 ```bash
-python3 -m pip install pydantic tiktoken apsw aiohttp anthropic openai sqlite-vec
+python3 -m pip install pydantic tiktoken apsw aiohttp anthropic openai sqlite-vec croniter
 ```
 
 For Telegram (optional):
@@ -32,8 +32,12 @@ Edit `.env`:
 |----------|----------|-------------|
 | `AUTH_MODE` | Yes | `max` (Agent SDK, no API key) or `api_key` (pay-as-you-go) |
 | `ANTHROPIC_API_KEY` | If `api_key` mode | Your Anthropic API key |
-| `OPENAI_API_KEY` | Yes | For embeddings only (text-embedding-3-small) |
+| `OPENAI_API_KEY` | Yes | Embeddings + Whisper transcription (Signal voice-in) |
 | `TELEGRAM_BOT_TOKEN` | For Telegram | From @BotFather |
+| `SIGNAL_REST_URL` | For Signal | URL of signal-cli-rest-api daemon (e.g. `http://[::1]:8080`) |
+| `SIGNAL_PHONE_NUMBER` | For Signal | Bot's Signal-registered number (e.g. `+15551234567`) |
+| `SIGNAL_ALLOWED_SENDERS` | For Signal | Comma-separated allowlist; omit to accept anyone |
+| `SCHEDULER_ENABLED` | No | `true` to run the scheduler alongside `--signal` |
 | `CLAUDE_CLI_PATH` | No | Auto-detected. Override if needed. |
 
 ### 3. Authenticate Claude Code
@@ -92,9 +96,17 @@ python3 src/main.py -v
 # Telegram bot
 python3 src/main.py --telegram
 
+# Signal bot (requires signal-cli-rest-api daemon)
+python3 src/main.py --signal
+
 # HTTP API server
 python3 src/main.py --http
 python3 src/main.py --http --port 9000
+
+# Scheduler management (no daemon required for these)
+python3 src/main.py scheduler list
+python3 src/main.py scheduler add --name ... --cron ... --mode llm|direct ...
+python3 src/main.py scheduler run <name>
 ```
 
 ## Customization
@@ -266,8 +278,83 @@ ESCALATION_EFFORT=high   # thinking budget
 | Channel | Description |
 |---------|-------------|
 | REPL | stdin/stdout, `/debug` shows pipeline metadata |
-| Telegram | Typing indicators, streaming via message edits |
+| Telegram | Typing indicators, streaming via message edits, HTML-file attachments for tables/charts |
+| Signal | Typing indicators, read receipts, voice-message transcription (Whisper), HTML card-view attachments |
 | HTTP | `POST /chat` returns JSON with response + pipeline stats |
+
+### Signal setup
+
+Signal has no official bot API. MicrowaveOS talks to [`signal-cli-rest-api`](https://github.com/bbernhard/signal-cli-rest-api) over HTTP + WebSocket. You need a dedicated phone number for the bot (spare SIM, Google Voice, Twilio, etc. — not your personal Signal number unless you want to take it over).
+
+```bash
+# 1. Run the daemon
+docker run -d --name signal-api -p 8080:8080 \
+  -v signal-data:/home/.local/share/signal-cli \
+  -e MODE=json-rpc \
+  bbernhard/signal-cli-rest-api:latest
+
+# 2. Register the bot number (will prompt for a captcha token
+#    from https://signalcaptchas.org/registration/generate.html)
+curl -X POST http://localhost:8080/v1/register/%2B15551234567 \
+  -H 'Content-Type: application/json' \
+  -d '{"captcha": "<captcha-token>"}'
+
+# 3. Verify with the 6-digit SMS code
+curl -X POST http://localhost:8080/v1/register/%2B15551234567/verify/123456
+
+# 4. Run the bot
+python3 src/main.py --signal
+```
+
+**Voice messages:** send a Signal voice note to the bot — it downloads the audio, transcribes via Whisper (uses your `OPENAI_API_KEY`, ~$0.006/min), shows a `_heard: "..."_` preview so you can verify, and feeds the transcript into the pipeline tagged as `[voice]`.
+
+**Card view:** list-shaped bot output (multiple Substack notes, PR digests, etc.) is delivered as an HTML attachment with per-card Copy buttons so you can copy cleanly from Signal's mobile client (where text selection is painful).
+
+### Scheduler
+
+Cron-scheduled recurring jobs — daily writing prompts, reminders, digests. Runs as a background task inside `--signal` when `SCHEDULER_ENABLED=true`. Two modes:
+
+| Mode | Behavior | Cost |
+|------|----------|------|
+| `llm` | Runs the job's prompt through a one-shot LLM call, delivers as HTML card-view attachment (per-card Copy buttons) | ~1 LLM call per fire |
+| `direct` | Sends a literal text message verbatim. No LLM involvement. | $0 |
+
+LLM jobs deliberately bypass the main pipeline — no shared session with your live conversation, no contamination of recent-turn recall, no compaction triggers on your real context. Card-view output is the default for LLM jobs because Signal's mobile text selection is hostile to multi-item copying.
+
+**CLI:**
+
+```bash
+# Create an LLM job — prompt stored in a file
+python3 src/main.py scheduler add \
+  --name substack-notes \
+  --cron "57 6 * * *" \
+  --mode llm \
+  --channel signal \
+  --recipient "+15551234567" \
+  --prompt-file prompts/substack-notes.txt
+
+# Create a direct reminder — no LLM
+python3 src/main.py scheduler add \
+  --name vitamins \
+  --cron "30 9 * * *" \
+  --mode direct \
+  --channel signal \
+  --recipient "+15551234567" \
+  --text "💊 Vitamine — take 'em before the day eats you."
+
+# Manage
+python3 src/main.py scheduler list
+python3 src/main.py scheduler disable vitamins
+python3 src/main.py scheduler enable vitamins
+python3 src/main.py scheduler remove substack-notes
+
+# Fire one right now (regardless of schedule) — useful for testing
+python3 src/main.py scheduler run substack-notes
+```
+
+**Missed runs:** if the daemon was offline when a job was due (laptop closed, process crashed), the scheduler does **not** fire the backlog on restart. It fast-forwards the job's baseline and waits for the next scheduled fire. A 3pm vitamin reminder for a 9am ping helps nobody.
+
+**Persistence across reboots:** use the launchd template at `deploy/com.microwaveos.daemon.plist.template`. Replace `{{PROJECT_DIR}}` and `{{PYTHON}}` with absolute paths, copy to `~/Library/LaunchAgents/`, then `launchctl load`. It only restarts on crashes (not clean shutdowns), so `launchctl unload` actually stops it.
 
 ### Data storage
 
@@ -278,11 +365,12 @@ ESCALATION_EFFORT=high   # thinking budget
 │   ├── MEMORY.md          # long-term facts
 │   ├── channels/          # per-channel rules
 │   │   ├── telegram.md
+│   │   ├── signal.md
 │   │   ├── repl.md
 │   │   └── http.md
 │   └── memory/            # daily notes
 └── data/
-    └── memory.db          # SQLite: vectors, FTS, session history
+    └── memory.db          # SQLite: vectors, FTS, session history, scheduled_jobs
 ```
 
 The `workspace/` directory in the project root is for development. In production, files live at `~/.microwaveos/workspace/` (configurable via `WORKSPACE_DIR` in `.env`).
@@ -305,6 +393,16 @@ In Telegram:
 | `/debug` | Pipeline stats for last message |
 | `/memory` | Show MEMORY.md contents |
 | `/status` | Session info, auth mode, model |
+
+Scheduler CLI (runs without the daemon):
+
+| Command | Description |
+|---------|-------------|
+| `scheduler list` | Show all jobs with last-run status |
+| `scheduler add` | Create a new job (see flags above) |
+| `scheduler remove <name>` | Delete a job |
+| `scheduler enable <name>` / `disable <name>` | Toggle without deleting |
+| `scheduler run <name>` | Fire one job right now |
 
 ### Telegram file handling
 
@@ -344,8 +442,8 @@ When the orchestrator resumes a previous session after restart, it replays histo
 ### Embedding model requires OpenAI
 Vector search uses OpenAI's `text-embedding-3-small`. There's no local embedding option and no Anthropic embedding model. If the OpenAI key is missing or invalid, vector search silently returns nothing and only BM25 keyword search works.
 
-### No voice, no audio
-Text only. No speech-to-text or text-to-speech integration.
+### Voice is one-way
+Signal supports voice-in via Whisper transcription, but there's no text-to-speech path for replies and no voice-call support (signal-cli-rest-api is messaging-only). Other channels are text-only.
 
 ### Agent SDK auth is machine-local
 Max auth works through your Claude Code CLI login session. It doesn't transfer across machines, can't be shared, and expires. If your Claude Code session expires mid-conversation, the next LLM call fails with a 401.

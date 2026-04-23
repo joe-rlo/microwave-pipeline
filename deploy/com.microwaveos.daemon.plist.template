@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  MicrowaveOS launchd template
+  ============================
+  Install:
+    1. Copy to ~/Library/LaunchAgents/com.microwaveos.daemon.plist
+    2. Replace {{PROJECT_DIR}} with the absolute path to MicrowaveOS-v2/
+    3. Replace {{PYTHON}} with an absolute path to a venv python
+       (e.g. /Users/joe/Development/Skunk/MicrowaveOS-v2/.venv/bin/python)
+    4. launchctl load ~/Library/LaunchAgents/com.microwaveos.daemon.plist
+
+  Notes:
+  - WorkingDirectory is set so .env is found via load_dotenv()
+  - KeepAlive=true + SuccessfulExit=false: only restart on crashes,
+    not on clean shutdown (so `launchctl unload` actually stops it)
+  - Logs go to ~/.microwaveos/daemon.{out,err}.log
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.microwaveos.daemon</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>{{PYTHON}}</string>
+    <string>-m</string>
+    <string>src.main</string>
+    <string>--signal</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>{{PROJECT_DIR}}</string>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+    <key>Crashed</key>
+    <true/>
+  </dict>
+
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <key>StandardOutPath</key>
+  <string>/Users/joe/.microwaveos/daemon.out.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/Users/joe/.microwaveos/daemon.err.log</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- PATH must include any tools Claude Agent SDK may shell out to -->
+    <key>PATH</key>
+    <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+  </dict>
+</dict>
+</plist>
