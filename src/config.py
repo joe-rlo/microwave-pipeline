@@ -31,6 +31,11 @@ class Config(BaseModel):
     # Telegram
     telegram_bot_token: str = ""
 
+    # Signal (talks to a signal-cli-rest-api daemon)
+    signal_rest_url: str = ""
+    signal_phone_number: str = ""  # the bot's Signal-registered number
+    signal_allowed_senders: tuple[str, ...] = ()  # optional allowlist
+
     # OpenAI (embeddings only)
     openai_api_key: str = ""
 
@@ -114,5 +119,10 @@ def load_config() -> Config:
         workspace_dir=Path(os.getenv("WORKSPACE_DIR", str(Path.home() / ".microwaveos" / "workspace"))),
         data_dir=Path(os.getenv("DATA_DIR", str(Path.home() / ".microwaveos" / "data"))),
         telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", ""),
+        signal_rest_url=os.getenv("SIGNAL_REST_URL", ""),
+        signal_phone_number=os.getenv("SIGNAL_PHONE_NUMBER", ""),
+        signal_allowed_senders=tuple(
+            s.strip() for s in os.getenv("SIGNAL_ALLOWED_SENDERS", "").split(",") if s.strip()
+        ),
         openai_api_key=os.getenv("OPENAI_API_KEY", ""),
     )

@@ -37,7 +37,26 @@ def assemble(
     dynamic_parts.append(f"[Current datetime: {datetime.now().isoformat(timespec='minutes')}]")
 
     # File output instructions — channel-aware
-    if channel == "telegram":
+    if channel == "signal":
+        dynamic_parts.append(
+            '[File output — Signal]\n'
+            'Signal renders plain text with only inline formatting '
+            '(`**bold**`, `*italic*`, `~strike~`, `` `code` ``). No headers, '
+            'no link markup, no tables, no HTML in the message body.\n\n'
+            'For tabular data: output a markdown table normally — the channel '
+            'will auto-convert it to a card layout (`**Header:** value` blocks) '
+            'that reads well on a phone. Do not pre-flatten tables yourself.\n\n'
+            'For charts, diagrams, flowcharts, or any visual output: produce a '
+            'complete self-contained HTML document inside a ```html code fence. '
+            'The pipeline extracts it and sends as a file attachment. Keep the '
+            'surrounding text brief — that becomes the message body.\n\n'
+            'HTML requirements (same as Telegram):\n'
+            '- Self-contained: inline CSS, no external stylesheets\n'
+            '- <!DOCTYPE html> + descriptive <title>\n'
+            '- Mobile viewport meta tag, 12–16px body padding\n'
+            '- Dark mode via prefers-color-scheme'
+        )
+    elif channel == "telegram":
         dynamic_parts.append(
             '[File output — Telegram]\n'
             'Tables, charts, flowcharts, diagrams, timelines, and comparisons '
@@ -108,19 +127,43 @@ def assemble(
 
 
 def _format_fragments(fragments: list[MemoryFragment]) -> str:
-    """Format retrieved fragments for prepending to user message."""
+    """Format retrieved context for prepending to user message.
+
+    Two sources get rendered as distinct blocks so the LLM can weight them
+    appropriately:
+    - "Retrieved memory" — durable fragments (MEMORY.md, identity, notes).
+      These are curated, committed facts.
+    - "Recent conversation" — live turns from the last ~48h. These are raw,
+      unvetted, and may contain questions or half-formed thoughts.
+    """
     if not fragments:
         return ""
 
-    lines = []
-    for i, frag in enumerate(fragments, 1):
-        source_label = frag.source.split("/")[-1] if "/" in frag.source else frag.source
-        ts_label = frag.timestamp.strftime("%Y-%m-%d") if frag.timestamp else "unknown"
-        lines.append(f"[{i}. {source_label} ({ts_label})]")
-        lines.append(frag.content.strip())
-        lines.append("")
+    durable = [f for f in fragments if f.source_type == "fragment"]
+    turns = [f for f in fragments if f.source_type == "turn"]
 
-    return "\n".join(lines)
+    blocks: list[str] = []
+    if durable:
+        lines = ["[Retrieved memory]"]
+        for i, frag in enumerate(durable, 1):
+            source_label = frag.source.split("/")[-1] if "/" in frag.source else frag.source
+            ts_label = frag.timestamp.strftime("%Y-%m-%d") if frag.timestamp else "unknown"
+            lines.append(f"[{i}. {source_label} ({ts_label})]")
+            lines.append(frag.content.strip())
+            lines.append("")
+        blocks.append("\n".join(lines).rstrip())
+
+    if turns:
+        lines = [
+            "[Recent conversation — raw turns from the last ~48h, possibly "
+            "incomplete or recanted. Treat as context, not as committed facts.]"
+        ]
+        for frag in turns:
+            ts_label = frag.timestamp.strftime("%m-%d %H:%M") if frag.timestamp else "?"
+            lines.append(f"[{ts_label}] {frag.content.strip()}")
+        blocks.append("\n".join(lines))
+
+    return "\n\n".join(blocks)
 
 
 def promote_fragments(

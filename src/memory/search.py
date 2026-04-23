@@ -1,6 +1,11 @@
 """Hybrid retrieval: vector + BM25 keyword search, merged via RRF.
 
 Applies temporal decay and MMR diversity per triage parameters.
+
+Also queries the session `turns` table directly (if a SessionEngine is
+wired in), so recent conversation is recoverable even when it hasn't
+been promoted to MEMORY.md yet. Results from that path are marked with
+`source_type="turn"` so assembly can render them under a distinct label.
 """
 
 from __future__ import annotations
@@ -8,20 +13,32 @@ from __future__ import annotations
 import logging
 import time
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 from src.memory.embeddings import EmbeddingClient
 from src.memory.index import MemoryIndex, _serialize_vector
 from src.session.models import MemoryFragment, SearchResult, TriageResult
 
+if TYPE_CHECKING:
+    from src.session.engine import SessionEngine
+
 log = logging.getLogger(__name__)
 
 RRF_K = 60  # Reciprocal Rank Fusion constant
+RECENT_TURN_HOURS = 48.0
+RECENT_TURN_LIMIT = 4
 
 
 class MemorySearcher:
-    def __init__(self, index: MemoryIndex, embedder: EmbeddingClient):
+    def __init__(
+        self,
+        index: MemoryIndex,
+        embedder: EmbeddingClient,
+        session_engine: "SessionEngine | None" = None,
+    ):
         self.index = index
         self.embedder = embedder
+        self.session_engine = session_engine
 
     def search(
         self,
@@ -58,16 +75,54 @@ class MemorySearcher:
         # MMR diversity filtering
         selected = self._mmr_select(merged, max_results, mmr_lambda)
 
-        # Increment retrieval counts
+        # Increment retrieval counts (only for durable fragments, not live turns)
         for frag in selected:
             self.index.increment_retrieval(frag.id)
 
+        # Recent-turn recall: live query the turns table so conversation from
+        # the last ~48h is retrievable even before compaction indexes it.
+        # These are NOT ranked against fragments — they occupy a separate slot
+        # and get rendered under their own label by the assembly stage.
+        turn_fragments = self._recent_turn_fragments(query)
+
         elapsed_ms = int((time.time() - start) * 1000)
         return SearchResult(
-            fragments=selected,
-            strategy_used=f"hybrid(decay={decay_half_life}, recency={weight_recency})",
+            fragments=selected + turn_fragments,
+            strategy_used=f"hybrid(decay={decay_half_life}, recency={weight_recency})"
+            + (f"+turns({len(turn_fragments)})" if turn_fragments else ""),
             search_time_ms=elapsed_ms,
         )
+
+    def _recent_turn_fragments(self, query: str) -> list[MemoryFragment]:
+        """Pull recent conversation turns matching the query. Returns them as
+        MemoryFragments with source_type='turn' so assembly can label them."""
+        if self.session_engine is None:
+            return []
+        try:
+            turns = self.session_engine.search_recent_turns(
+                query, hours=RECENT_TURN_HOURS, limit=RECENT_TURN_LIMIT
+            )
+        except Exception as e:
+            log.debug(f"Recent-turn search failed: {e}")
+            return []
+
+        out: list[MemoryFragment] = []
+        for t in turns:
+            speaker = "User" if t.role == "user" else (
+                "Summary" if t.metadata.get("type") == "compaction_summary" else "Microwave"
+            )
+            content = f"{speaker}: {t.content}"
+            out.append(
+                MemoryFragment(
+                    id=-(t.id or 0),  # negative to avoid collision with fragment IDs
+                    content=content,
+                    source=f"session:{t.session_id}",
+                    timestamp=t.timestamp,
+                    score=0.0,
+                    source_type="turn",
+                )
+            )
+        return out
 
     def _vector_search(self, query: str, limit: int) -> list[MemoryFragment]:
         """Search by vector similarity using sqlite-vec."""

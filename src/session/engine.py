@@ -111,6 +111,78 @@ class SessionEngine:
         ))
         return [self._row_to_turn(row) for row in reversed(rows)]
 
+    def search_recent_turns(
+        self,
+        query: str,
+        hours: float = 48.0,
+        limit: int = 5,
+        channel: str | None = None,
+        user_id: str | None = None,
+        exclude_session: str | None = None,
+    ) -> list[Turn]:
+        """Find recent user/assistant turns matching a query.
+
+        Volume is low (hundreds of turns/day) so a plain LIKE scan is fine —
+        no FTS needed. Each query word contributes; turns that match more
+        words rank higher, ties broken by recency.
+        Returns up to `limit` turns, most relevant first.
+        """
+        import re
+
+        words = [w.lower() for w in re.findall(r"[a-zA-Z0-9]{3,}", query)]
+        if not words:
+            return []
+
+        # Build SQL and params together, in order, so placeholder positions
+        # match their values. Order: time, optional channel, optional user,
+        # optional session exclusion, word LIKEs, limit.
+        filters: list[str] = ["role IN ('user', 'assistant', 'system')"]
+        params: list = []
+
+        filters.append("timestamp >= datetime('now', ?)")
+        params.append(f"-{int(hours * 3600)} seconds")
+
+        if channel:
+            filters.append("channel = ?")
+            params.append(channel)
+        if user_id:
+            filters.append("user_id = ?")
+            params.append(user_id)
+        if exclude_session:
+            filters.append("session_id != ?")
+            params.append(exclude_session)
+
+        clauses = ["LOWER(content) LIKE ?" for _ in words]
+        params.extend(f"%{w}%" for w in words)
+
+        sql = (
+            "SELECT * FROM turns WHERE "
+            + " AND ".join(filters)
+            + " AND (" + " OR ".join(clauses) + ") "
+            "ORDER BY timestamp DESC LIMIT ?"
+        )
+        params.append(limit * 4)  # over-fetch so we can score and trim
+
+        rows = list(self.conn.execute(sql, params))
+        if not rows:
+            return []
+
+        # Score: word hits + small recency bonus
+        now = datetime.now()
+        scored: list[tuple[float, Turn]] = []
+        for row in rows:
+            turn = self._row_to_turn(row)
+            content_l = turn.content.lower()
+            hits = sum(1 for w in words if w in content_l)
+            if hits == 0:
+                continue
+            age_hours = (now - turn.timestamp).total_seconds() / 3600
+            recency = max(0.0, 1.0 - (age_hours / hours))
+            scored.append((hits + 0.3 * recency, turn))
+
+        scored.sort(key=lambda t: t[0], reverse=True)
+        return [t for _, t in scored[:limit]]
+
     def session_token_count(self, session_id: str) -> int:
         """Total tokens used in a session."""
         for row in self.conn.execute(
@@ -168,6 +240,38 @@ class SessionEngine:
             token_count=row["token_count"] or 0,
             metadata=json.loads(row["metadata"]) if row["metadata"] else {},
         )
+
+    def get_recent_stats(self, channel: str, user_id: str, limit: int = 10) -> dict:
+        """Aggregate pipeline stats from recent assistant turns."""
+        rows = list(self.conn.execute(
+            "SELECT metadata FROM turns WHERE channel = ? AND user_id = ? AND role = 'assistant' "
+            "ORDER BY timestamp DESC LIMIT ?",
+            (channel, user_id, limit),
+        ))
+
+        intents: list[str] = []
+        fragments: list[int] = []
+        confidences: list[float] = []
+
+        for row in rows:
+            meta = json.loads(row["metadata"]) if row["metadata"] else {}
+            if meta.get("triage_intent"):
+                intents.append(meta["triage_intent"])
+            if meta.get("search_fragments") is not None:
+                fragments.append(int(meta["search_fragments"]))
+            if meta.get("reflection_confidence") is not None:
+                confidences.append(float(meta["reflection_confidence"]))
+
+        intent_counts: dict[str, int] = {}
+        for intent in intents:
+            intent_counts[intent] = intent_counts.get(intent, 0) + 1
+
+        return {
+            "turns_sampled": len(rows),
+            "intent_distribution": intent_counts,
+            "avg_search_fragments": sum(fragments) / len(fragments) if fragments else 0.0,
+            "avg_reflection_confidence": sum(confidences) / len(confidences) if confidences else 0.0,
+        }
 
     def close(self) -> None:
         if self.conn:

@@ -22,6 +22,10 @@ class MemoryFragment:
     timestamp: datetime
     score: float = 0.0
     retrieval_count: int = 0
+    # "fragment" = durable indexed content (MEMORY.md, identity, daily notes).
+    # "turn" = recent conversation turn pulled live from the turns table.
+    # Used by assembly to label the two retrieval sources distinctly in the prompt.
+    source_type: str = "fragment"
 
 
 @dataclass

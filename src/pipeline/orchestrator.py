@@ -57,16 +57,17 @@ class Orchestrator:
         self.memory_index = MemoryIndex(self.config.db_path, embedder)
         self.memory_index.connect()
 
-        # Memory searcher
-        self.searcher = MemorySearcher(self.memory_index, embedder)
-
-        # Session engine
+        # Session engine (created before searcher so searcher can query turns)
         self.session_engine = SessionEngine(
             self.config.db_path,
             context_limit=self.config.context_window_limit,
             compaction_threshold=self.config.compaction_threshold,
         )
         self.session_engine.connect()
+
+        # Memory searcher — wired to session engine so it can also pull
+        # matching turns from recent conversation as a second retrieval path.
+        self.searcher = MemorySearcher(self.memory_index, embedder, self.session_engine)
 
         # LLM client — with sandboxed output directory for file creation
         self.llm = LLMClient(
@@ -81,6 +82,9 @@ class Orchestrator:
         stable_prompt = self.memory_store.assemble_stable_context(channel=self._channel)
         self._stable_mtime = self.memory_store.stable_context_mtime(channel=self._channel)
         await self.llm.connect(stable_prompt)
+
+        # Index workspace files into the memory fragment store
+        self._index_workspace()
 
         # Resume last session if one exists, otherwise start fresh
         last_session = self.session_engine.get_last_session_id()
@@ -262,8 +266,13 @@ class Orchestrator:
             content=full_response,
             metadata={
                 "triage_intent": triage_result.intent,
+                "triage_complexity": triage_result.complexity,
                 "search_fragments": len(search_result.fragments),
+                "search_time_ms": search_result.search_time_ms,
                 "reflection_confidence": reflection_result.confidence,
+                "reflection_action": reflection_result.action,
+                "reflection_hedging_detected": reflection_result.hedging_detected,
+                "escalated": escalated,
             },
         )
         self.session_engine.add_turn(assistant_turn)
@@ -273,10 +282,17 @@ class Orchestrator:
             changed = promote_fragments(assembly_result.promote_candidates, self.memory_store)
             if changed:
                 log.info("Write-back promoted fragments, will reconnect on next turn")
+                # Re-index MEMORY.md since write-back just changed it
+                try:
+                    self.memory_index.index_file(self.memory_store.memory_path, force=True)
+                except Exception as e:
+                    log.warning(f"Memory re-index after write-back failed: {e}")
 
-        # Check for compaction
+        # Check for compaction — yield any events it produces so the channel
+        # can surface them (the user deserves to know their context was reset).
         if self.session_engine.needs_compaction(self._session_id):
-            await self._compact()
+            async for chunk in self._compact():
+                yield chunk
 
         elapsed_ms = int((time.time() - start) * 1000)
 
@@ -293,8 +309,57 @@ class Orchestrator:
             ),
         }
 
-    async def _compact(self) -> None:
-        """Compact old turns into a summary."""
+    def _index_workspace(self) -> None:
+        """Index workspace markdown files into the memory fragment store.
+
+        Runs on every startup. Files are skipped if unchanged since last index
+        (mtime comparison). Requires OPENAI_API_KEY — silently skips if absent.
+        """
+        if not self.config.openai_api_key:
+            log.info("OpenAI API key not set — skipping memory indexing")
+            return
+
+        from datetime import date, timedelta
+
+        files_to_index = [
+            self.memory_store.identity_path,
+            self.memory_store.memory_path,
+        ]
+        today = date.today()
+        for i in range(3):  # today + 2 days back
+            daily = self.memory_store.daily_path(today - timedelta(days=i))
+            if daily.exists():
+                files_to_index.append(daily)
+
+        total = 0
+        for path in files_to_index:
+            if not path.exists():
+                continue
+            try:
+                n = self.memory_index.index_file(path)
+                if n > 0:
+                    log.info(f"Indexed {n} fragments from {path.name}")
+                total += n
+            except Exception as e:
+                log.warning(f"Failed to index {path.name}: {e}")
+
+        if total > 0:
+            log.info(f"Memory index updated: {total} new/changed fragments")
+        else:
+            log.debug("Memory index: all workspace files up to date")
+
+    async def _compact(self):
+        """Compact old turns into a summary.
+
+        Yields a `{"type": "compaction"}` chunk so the channel can tell the
+        user their earlier context was archived — silent compaction leaves
+        the user wondering why the bot "forgot" what was just discussed.
+
+        After reconnect, re-injects the summary + retained recent turns
+        into the LLM session so continuity survives the context reset.
+        Also indexes the summary into the fragment store so future search
+        can recover it across sessions.
+        """
         from src.llm.client import SingleTurnClient
 
         old_turns, recent_turns = self.session_engine.get_turns_for_compaction(self._session_id)
@@ -329,10 +394,41 @@ class Orchestrator:
         old_ids = [t.id for t in old_turns if t.id is not None]
         self.session_engine.replace_with_summary(self._session_id, old_ids, summary)
 
-        # Reconnect with fresh stable context (compaction wrote to daily notes)
+        # Index the summary into the fragment store so it's searchable in the
+        # future — even from a different session after a restart.
+        if self.memory_index and self.config.openai_api_key:
+            try:
+                self.memory_index.index_text(
+                    summary,
+                    source=f"session:{self._session_id}:summary",
+                )
+            except Exception as e:
+                log.warning(f"Failed to index compaction summary: {e}")
+
+        # Reconnect with fresh stable context (compaction wrote to daily notes).
+        # This wipes the LLM's live session — everything said so far is gone
+        # from its working memory.
         stable = self.memory_store.assemble_stable_context(channel=self._channel)
         await self.llm.reconnect(stable)
         self._stable_mtime = self.memory_store.stable_context_mtime(channel=self._channel)
+
+        # Restore conversational continuity: re-inject the summary + retained
+        # recent turns into the new live session. Without this, the bot has
+        # zero knowledge of what was just discussed and the next user message
+        # lands in a cold context.
+        try:
+            remaining = self.session_engine.get_turns(self._session_id)
+            if remaining:
+                await self._inject_history(remaining)
+        except Exception as e:
+            log.warning(f"Post-compaction history injection failed: {e}")
+
+        # Tell the channel so it can surface a status message to the user.
+        yield {
+            "type": "compaction",
+            "turns_compacted": len(old_turns),
+            "turns_kept": len(recent_turns),
+        }
 
     async def _inject_history(self, turns: list[Turn]) -> None:
         """Inject prior conversation history into the LLM session.
@@ -362,6 +458,10 @@ class Orchestrator:
                 pass  # consume and discard the response
         except Exception as e:
             log.warning(f"History injection failed (non-fatal): {e}")
+
+    def get_pipeline_stats(self, user_id: str = "default", channel: str = "telegram", limit: int = 10) -> dict:
+        """Return aggregated pipeline stats for recent assistant turns."""
+        return self.session_engine.get_recent_stats(channel, user_id, limit)
 
     async def new_session(self) -> str:
         """Start a completely fresh session. Returns the new session ID.

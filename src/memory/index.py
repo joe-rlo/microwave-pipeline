@@ -85,6 +85,62 @@ class MemoryIndex:
                 log.warning(f"Could not create vec table: {e}")
                 self._has_vec = False
 
+    def index_file(self, path: Path, force: bool = False) -> int:
+        """Index a file into fragments, skipping if unchanged since last index.
+
+        Compares file mtime against the timestamp of the most recent fragment
+        for that source. If the file is newer (or has never been indexed),
+        deletes stale fragments and reindexes from scratch.
+
+        Returns the number of new fragments created (0 = skipped/empty).
+        """
+        if not path.exists():
+            return 0
+
+        source = str(path)
+        file_mtime = path.stat().st_mtime
+
+        if not force:
+            rows = list(self.conn.execute(
+                "SELECT MAX(timestamp) FROM fragments WHERE source = ?",
+                (source,),
+            ))
+            if rows and rows[0][0]:
+                try:
+                    last_indexed = datetime.fromisoformat(rows[0][0]).timestamp()
+                    if file_mtime <= last_indexed:
+                        log.debug(f"Skipping {path.name} (unchanged)")
+                        return 0
+                except (ValueError, OSError):
+                    pass
+
+        self._delete_source(source)
+
+        text = path.read_text(encoding="utf-8")
+        if not text.strip():
+            return 0
+
+        return len(self.index_text(text, source))
+
+    def _delete_source(self, source: str) -> None:
+        """Remove all fragments and their FTS/vec entries for a given source."""
+        rows = list(self.conn.execute(
+            "SELECT id FROM fragments WHERE source = ?", (source,)
+        ))
+        ids = [r[0] for r in rows]
+        if not ids:
+            return
+        for fid in ids:
+            self.conn.execute("DELETE FROM fragments_fts WHERE rowid = ?", (fid,))
+        if self._has_vec:
+            for fid in ids:
+                try:
+                    self.conn.execute("DELETE FROM fragments_vec WHERE id = ?", (fid,))
+                except Exception:
+                    pass
+        self.conn.execute("DELETE FROM fragments WHERE source = ?", (source,))
+        log.debug(f"Deleted {len(ids)} fragments for source {source!r}")
+
     def index_text(self, text: str, source: str, timestamp: datetime | None = None) -> list[int]:
         """Chunk text and index each chunk. Returns list of fragment IDs."""
         timestamp = timestamp or datetime.now()

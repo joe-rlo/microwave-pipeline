@@ -13,13 +13,16 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import re
 import tempfile
 from pathlib import Path
 
 from telegram import Update
+from telegram.error import BadRequest
 from telegram.ext import Application, MessageHandler, CommandHandler, filters
 
 from src.channels.base import Channel
+from src.channels.telegram_format import markdown_to_telegram_html
 from src.pipeline.orchestrator import Orchestrator
 
 log = logging.getLogger(__name__)
@@ -53,6 +56,7 @@ class TelegramChannel(Channel):
         self.app.add_handler(CommandHandler("debug", self._cmd_debug))
         self.app.add_handler(CommandHandler("memory", self._cmd_memory))
         self.app.add_handler(CommandHandler("status", self._cmd_status))
+        self.app.add_handler(CommandHandler("stats", self._cmd_stats))
 
         # Document handler (files sent as attachments)
         self.app.add_handler(MessageHandler(filters.Document.ALL, self._on_document))
@@ -151,6 +155,7 @@ class TelegramChannel(Channel):
             accumulated = ""
             sent_msg = None
             last_edit = 0
+            last_rendered = ""
             last_metadata = None
 
             async for chunk in self.orchestrator.process(text, user_id=user_id, channel="telegram"):
@@ -162,29 +167,16 @@ class TelegramChannel(Channel):
                     # Only update the streaming preview while under the limit;
                     # once we exceed it, stop editing and let the final split handle it
                     now = asyncio.get_event_loop().time()
-                    if now - last_edit >= EDIT_INTERVAL and len(accumulated) <= MAX_MESSAGE_LENGTH:
-                        try:
-                            if sent_msg is None:
-                                sent_msg = await context.bot.send_message(
-                                    chat_id, accumulated, parse_mode="Markdown"
-                                )
-                            else:
-                                await context.bot.edit_message_text(
-                                    accumulated, chat_id, sent_msg.message_id,
-                                    parse_mode="Markdown",
-                                )
+                    if now - last_edit >= EDIT_INTERVAL:
+                        preview = markdown_to_telegram_html(accumulated)
+                        if len(preview) <= MAX_MESSAGE_LENGTH and preview != last_rendered:
+                            ok = await self._send_or_edit_html(
+                                context, chat_id, sent_msg, preview, accumulated
+                            )
+                            if ok is not None:
+                                sent_msg = ok
+                                last_rendered = preview
                             last_edit = now
-                        except Exception as e:
-                            try:
-                                if sent_msg is None:
-                                    sent_msg = await context.bot.send_message(chat_id, accumulated)
-                                else:
-                                    await context.bot.edit_message_text(
-                                        accumulated, chat_id, sent_msg.message_id
-                                    )
-                                last_edit = now
-                            except Exception:
-                                log.warning(f"Message edit failed: {e}")
 
                 elif chunk["type"] == "file":
                     # Send extracted file as a document
@@ -198,48 +190,96 @@ class TelegramChannel(Channel):
                     # File extraction cleaned the response — update accumulated text
                     accumulated = chunk["text"]
 
+                elif chunk["type"] == "compaction":
+                    # Surface compaction to the user — the LLM's live context
+                    # just got reset, so telling them avoids the "why did you
+                    # forget?" confusion.
+                    n_compacted = chunk.get("turns_compacted", 0)
+                    n_kept = chunk.get("turns_kept", 0)
+                    note = (
+                        f"<i>↻ Archived {n_compacted} earlier turn"
+                        f"{'s' if n_compacted != 1 else ''} "
+                        f"(summary saved, last {n_kept} kept in context).</i>"
+                    )
+                    try:
+                        await context.bot.send_message(chat_id, note, parse_mode="HTML")
+                    except Exception as e:
+                        log.debug(f"Failed to send compaction note: {e}")
+
                 elif chunk["type"] == "metadata":
                     last_metadata = chunk["pipeline"]
 
-            # Final delivery: split into multiple messages if needed
+            # Final delivery: render as HTML (tables become card-layout
+            # blocks inline), split into messages if needed.
             if accumulated:
-                parts = _split_message(accumulated)
+                final_html = markdown_to_telegram_html(accumulated)
+                parts = _split_message(final_html)
 
-                # First part: update the streaming preview message
+                # First part: update the streaming preview message (or send it
+                # fresh if we never did a streaming edit). Skip if the streaming
+                # preview already matches — re-editing to the same HTML would
+                # raise "message is not modified" and hit the fallback.
                 first = parts[0]
-                try:
-                    if sent_msg is None:
-                        sent_msg = await context.bot.send_message(
-                            chat_id, first, parse_mode="Markdown"
-                        )
-                    elif first != (sent_msg.text or ""):
-                        await context.bot.edit_message_text(
-                            first, chat_id, sent_msg.message_id, parse_mode="Markdown"
-                        )
-                except Exception:
-                    if sent_msg is None:
-                        await context.bot.send_message(chat_id, first)
-                    else:
-                        try:
-                            await context.bot.edit_message_text(
-                                first, chat_id, sent_msg.message_id
-                            )
-                        except Exception:
-                            pass
+                if first != last_rendered:
+                    ok = await self._send_or_edit_html(
+                        context, chat_id, sent_msg, first, accumulated
+                    )
+                    if ok is not None:
+                        sent_msg = ok
+                        last_rendered = first
 
                 # Remaining parts: send as new messages
                 for part in parts[1:]:
                     try:
                         await context.bot.send_message(
-                            chat_id, part, parse_mode="Markdown"
+                            chat_id, part, parse_mode="HTML"
                         )
-                    except Exception:
-                        await context.bot.send_message(chat_id, part)
+                    except BadRequest as e:
+                        log.warning(f"HTML send failed, sending as plain text: {e}")
+                        await context.bot.send_message(chat_id, _strip_tags(part))
 
             context.user_data["last_metadata"] = last_metadata
 
         finally:
             typing_task.cancel()
+
+    async def _send_or_edit_html(
+        self, context, chat_id: int, sent_msg, html_text: str, raw_fallback: str
+    ):
+        """Send or edit a message as HTML. Returns the message object on
+        success, the original `sent_msg` when Telegram reports no change,
+        or None on unrecoverable failure.
+
+        On HTML parse errors we fall back to plain text *without* the raw
+        markdown — otherwise unparsed `*asterisks*` end up in the chat.
+        """
+        try:
+            if sent_msg is None:
+                return await context.bot.send_message(
+                    chat_id, html_text, parse_mode="HTML"
+                )
+            await context.bot.edit_message_text(
+                html_text, chat_id, sent_msg.message_id, parse_mode="HTML"
+            )
+            return sent_msg
+        except BadRequest as e:
+            msg = str(e).lower()
+            if "not modified" in msg:
+                return sent_msg  # Already shows this content, nothing to do.
+            log.warning(f"HTML send/edit failed ({e}); retrying as plain text")
+            plain = _strip_tags(html_text) or raw_fallback
+            try:
+                if sent_msg is None:
+                    return await context.bot.send_message(chat_id, plain)
+                await context.bot.edit_message_text(
+                    plain, chat_id, sent_msg.message_id
+                )
+                return sent_msg
+            except BadRequest as e2:
+                if "not modified" in str(e2).lower():
+                    return sent_msg
+                log.warning(f"Plain-text fallback also failed: {e2}")
+                return None
 
     async def _send_as_file(
         self, chat_id: int, content: str, sent_msg, context, caption: str = ""
@@ -317,6 +357,36 @@ class TelegramChannel(Channel):
             f"Auth: {self.orchestrator.config.auth_mode}\n"
             f"Model: {self.orchestrator.config.model_main}"
         )
+
+    async def _cmd_stats(self, update: Update, context) -> None:
+        user_id = str(update.message.from_user.id)
+        stats = self.orchestrator.get_pipeline_stats(user_id=user_id, channel="telegram")
+
+        n = stats["turns_sampled"]
+        if n == 0:
+            await update.message.reply_text("No pipeline data yet.")
+            return
+
+        intent_dist = stats["intent_distribution"]
+        top_intents = sorted(intent_dist.items(), key=lambda x: -x[1])
+        intent_str = ", ".join(f"{k} ({v})" for k, v in top_intents) or "—"
+
+        lines = [
+            f"Pipeline stats — last {n} turns",
+            f"Intents: {intent_str}",
+            f"Avg search fragments: {stats['avg_search_fragments']:.1f}",
+            f"Avg reflection confidence: {stats['avg_reflection_confidence']:.2f}",
+        ]
+        await update.message.reply_text("\n".join(lines))
+
+
+_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _strip_tags(html_text: str) -> str:
+    """Remove HTML tags for plain-text fallback. Also decodes &amp;/&lt;/&gt;."""
+    text = _TAG_RE.sub("", html_text)
+    return text.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
 
 
 def _split_message(text: str, max_len: int = MAX_MESSAGE_LENGTH) -> list[str]:
