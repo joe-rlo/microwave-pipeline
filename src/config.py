@@ -99,6 +99,20 @@ def _load_dotenv() -> None:
             break
 
 
+def _path_from_env(key: str, default: Path) -> Path:
+    """Load a path from env with ~ expansion.
+
+    Python's `Path(str)` doesn't expand `~`, so a `.env` value like
+    `WORKSPACE_DIR=~/.microwaveos/workspace` would otherwise become a
+    literal tilde directory inside the CWD — a subtle footgun the codebase
+    hit in practice. Always route path env vars through here.
+    """
+    raw = os.getenv(key)
+    if raw is None or raw == "":
+        return default
+    return Path(raw).expanduser()
+
+
 def load_config() -> Config:
     _load_dotenv()
 
@@ -120,8 +134,8 @@ def load_config() -> Config:
         model_compaction=os.getenv("MODEL_COMPACTION", "sonnet"),
         model_escalation=os.getenv("MODEL_ESCALATION", "opus"),
         escalation_effort=os.getenv("ESCALATION_EFFORT", "high"),
-        workspace_dir=Path(os.getenv("WORKSPACE_DIR", str(Path.home() / ".microwaveos" / "workspace"))),
-        data_dir=Path(os.getenv("DATA_DIR", str(Path.home() / ".microwaveos" / "data"))),
+        workspace_dir=_path_from_env("WORKSPACE_DIR", Path.home() / ".microwaveos" / "workspace"),
+        data_dir=_path_from_env("DATA_DIR", Path.home() / ".microwaveos" / "data"),
         telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", ""),
         signal_rest_url=os.getenv("SIGNAL_REST_URL", ""),
         signal_phone_number=os.getenv("SIGNAL_PHONE_NUMBER", ""),

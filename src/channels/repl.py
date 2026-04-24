@@ -12,6 +12,7 @@ from pathlib import Path
 
 from src.channels.base import Channel
 from src.pipeline.orchestrator import Orchestrator
+from src.skills.chat import handle_skill_command
 
 log = logging.getLogger(__name__)
 
@@ -57,6 +58,12 @@ class REPLChannel(Channel):
                 # Handle debug command
                 if line == "/debug" and hasattr(self, "_last_metadata"):
                     self._print_metadata(self._last_metadata)
+                    continue
+
+                # Skill commands short-circuit before the pipeline.
+                skill_reply = handle_skill_command(line, self.orchestrator)
+                if skill_reply is not None:
+                    print(f"\n{skill_reply}")
                     continue
 
                 # Process through pipeline

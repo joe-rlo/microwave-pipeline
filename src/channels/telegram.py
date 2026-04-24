@@ -24,6 +24,7 @@ from telegram.ext import Application, MessageHandler, CommandHandler, filters
 from src.channels.base import Channel
 from src.channels.telegram_format import markdown_to_telegram_html
 from src.pipeline.orchestrator import Orchestrator
+from src.skills.chat import handle_skill_command
 
 log = logging.getLogger(__name__)
 
@@ -57,6 +58,8 @@ class TelegramChannel(Channel):
         self.app.add_handler(CommandHandler("memory", self._cmd_memory))
         self.app.add_handler(CommandHandler("status", self._cmd_status))
         self.app.add_handler(CommandHandler("stats", self._cmd_stats))
+        self.app.add_handler(CommandHandler("skill", self._cmd_skill))
+        self.app.add_handler(CommandHandler("skills", self._cmd_skills))
 
         # Document handler (files sent as attachments)
         self.app.add_handler(MessageHandler(filters.Document.ALL, self._on_document))
@@ -406,6 +409,21 @@ class TelegramChannel(Channel):
             f"Avg reflection confidence: {stats['avg_reflection_confidence']:.2f}",
         ]
         await update.message.reply_text("\n".join(lines))
+
+    async def _cmd_skill(self, update: Update, context) -> None:
+        # Telegram strips the leading `/skill`; context.args has the rest.
+        arg = " ".join(context.args) if context.args else ""
+        # Rebuild the full command string so the shared parser sees it
+        # in the same shape as REPL/Signal.
+        text = f"/skill {arg}".rstrip()
+        reply = handle_skill_command(text, self.orchestrator)
+        if reply:
+            await update.message.reply_text(reply)
+
+    async def _cmd_skills(self, update: Update, context) -> None:
+        reply = handle_skill_command("/skills", self.orchestrator)
+        if reply:
+            await update.message.reply_text(reply)
 
 
 _TAG_RE = re.compile(r"<[^>]+>")

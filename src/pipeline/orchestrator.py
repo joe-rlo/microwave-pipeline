@@ -23,6 +23,7 @@ from src.pipeline.search import search
 from src.pipeline.triage import triage
 from src.session.engine import SessionEngine
 from src.session.models import PipelineMetadata, Turn
+from src.skills import Skill, SkillLoader, SkillNotFound
 
 log = logging.getLogger(__name__)
 
@@ -40,6 +41,10 @@ class Orchestrator:
         self._stable_mtime: float = 0.0
         self._session_id: str | None = None
         self._channel: str = "repl"
+        # Skills — loader created during start(), active skill tracked
+        # per-orchestrator (one active at a time in v1).
+        self.skill_loader: SkillLoader | None = None
+        self._active_skill: Skill | None = None
 
     async def start(self, channel: str = "repl") -> None:
         """Initialize all components and connect."""
@@ -68,6 +73,11 @@ class Orchestrator:
         # Memory searcher — wired to session engine so it can also pull
         # matching turns from recent conversation as a second retrieval path.
         self.searcher = MemorySearcher(self.memory_index, embedder, self.session_engine)
+
+        # Skills — auto-created dir under workspace so new installs just work
+        skills_dir = self.config.workspace_dir / "skills"
+        skills_dir.mkdir(parents=True, exist_ok=True)
+        self.skill_loader = SkillLoader(skills_dir)
 
         # LLM client — with sandboxed output directory for file creation
         self.llm = LLMClient(
@@ -146,6 +156,7 @@ class Orchestrator:
             self.memory_index,
             channel=self._channel,
             output_dir=str(self.config.output_dir),
+            active_skill=self._active_skill,
         )
 
         # Reconnect only if underlying files actually changed on disk
@@ -458,6 +469,30 @@ class Orchestrator:
                 pass  # consume and discard the response
         except Exception as e:
             log.warning(f"History injection failed (non-fatal): {e}")
+
+    # --- Skill management (called by channel command handlers) ---
+
+    def set_active_skill(self, name: str) -> Skill:
+        """Activate a named skill for subsequent turns. Raises SkillNotFound."""
+        if not self.skill_loader:
+            raise RuntimeError("Orchestrator not started")
+        skill = self.skill_loader.load(name)
+        self._active_skill = skill
+        log.info(f"Active skill set: {name!r}")
+        return skill
+
+    def clear_active_skill(self) -> None:
+        if self._active_skill is not None:
+            log.info(f"Active skill cleared (was {self._active_skill.name!r})")
+        self._active_skill = None
+
+    def get_active_skill(self) -> Skill | None:
+        return self._active_skill
+
+    def list_skills(self) -> list[Skill]:
+        if not self.skill_loader:
+            return []
+        return self.skill_loader.list_all()
 
     def get_pipeline_stats(self, user_id: str = "default", channel: str = "telegram", limit: int = 10) -> dict:
         """Return aggregated pipeline stats for recent assistant turns."""

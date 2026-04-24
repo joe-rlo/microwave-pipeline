@@ -101,13 +101,17 @@ class MemoryIndex:
         file_mtime = path.stat().st_mtime
 
         if not force:
+            # apsw's Row factory keys rows by column name, so unaliased
+            # aggregate columns aren't accessible by integer index — alias
+            # explicitly so the lookup below is unambiguous.
             rows = list(self.conn.execute(
-                "SELECT MAX(timestamp) FROM fragments WHERE source = ?",
+                "SELECT MAX(timestamp) AS last_ts FROM fragments WHERE source = ?",
                 (source,),
             ))
-            if rows and rows[0][0]:
+            last_ts = rows[0]["last_ts"] if rows else None
+            if last_ts:
                 try:
-                    last_indexed = datetime.fromisoformat(rows[0][0]).timestamp()
+                    last_indexed = datetime.fromisoformat(last_ts).timestamp()
                     if file_mtime <= last_indexed:
                         log.debug(f"Skipping {path.name} (unchanged)")
                         return 0
@@ -127,7 +131,7 @@ class MemoryIndex:
         rows = list(self.conn.execute(
             "SELECT id FROM fragments WHERE source = ?", (source,)
         ))
-        ids = [r[0] for r in rows]
+        ids = [r["id"] for r in rows]
         if not ids:
             return
         for fid in ids:

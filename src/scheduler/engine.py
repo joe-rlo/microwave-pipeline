@@ -192,6 +192,11 @@ class Scheduler:
 
         Uses SingleTurnClient so the job's prompt doesn't touch the
         user's live SDK connection or turn history.
+
+        If the job references a skill, the skill's body becomes the
+        system prompt and any `fetch.py` alongside it is awaited first —
+        its output is prepended to the user message so the LLM has
+        fresh context (e.g., current open PRs for a github-tool job).
         """
         client = SingleTurnClient(
             model=self.config.model_main,
@@ -199,15 +204,63 @@ class Scheduler:
             api_key=self.config.anthropic_api_key,
             cli_path=self.config.cli_path,
         )
-        # SingleTurnClient takes (system_prompt, user_message). For scheduler
-        # jobs the prompt IS the task — put it in user_message with an
-        # empty/neutral system prompt so the prompt is treated as the
-        # authoritative instruction.
+
+        system_prompt, user_message = await self._compose_prompt(job)
         return await client.query(
-            system_prompt="You are executing a scheduled task. Follow the user's "
-            "instructions exactly and return only the requested output.",
-            user_message=job.prompt_or_text,
+            system_prompt=system_prompt, user_message=user_message
         )
+
+    async def _compose_prompt(self, job: ScheduledJob) -> tuple[str, str]:
+        """Build (system_prompt, user_message) for a job.
+
+        No skill: legacy behavior — generic system prompt, job.prompt_or_text
+        as the user message.
+
+        With skill: skill body as system prompt. User message is the skill's
+        pre-fetch output (if any) plus the job's trigger text.
+        """
+        if not job.skill_name:
+            return (
+                "You are executing a scheduled task. Follow the user's "
+                "instructions exactly and return only the requested output.",
+                job.prompt_or_text,
+            )
+
+        from src.skills import SkillLoader, SkillNotFound
+        loader = SkillLoader(self.config.workspace_dir / "skills")
+        try:
+            skill = loader.load(job.skill_name)
+        except SkillNotFound:
+            raise RuntimeError(
+                f"Job {job.name!r} references missing skill {job.skill_name!r}"
+            )
+
+        fetch_output = ""
+        if skill.has_fetch:
+            try:
+                fetch_output = await _run_fetch(
+                    skill,
+                    context={
+                        "job_name": job.name,
+                        "recipient": job.recipient_id,
+                        "channel": job.target_channel,
+                        "timezone": job.timezone,
+                    },
+                )
+            except Exception as e:
+                log.warning(f"Pre-fetch for skill {skill.name!r} failed: {e}")
+                fetch_output = f"[pre-fetch failed: {e}]"
+
+        parts: list[str] = []
+        if fetch_output.strip():
+            parts.append(f"[Pre-fetch context]\n{fetch_output.strip()}")
+        if job.prompt_or_text.strip():
+            parts.append(job.prompt_or_text.strip())
+        if not parts:
+            # No trigger text AND no fetch output — fall back so the call
+            # doesn't ship an empty user message.
+            parts.append(f"Run the {skill.name!r} skill.")
+        return skill.body, "\n\n".join(parts)
 
     async def _deliver_llm(
         self, job: ScheduledJob, channel: ChannelSender, response: str
@@ -264,3 +317,36 @@ def _safe_filename(s: str) -> str:
     import re
     cleaned = re.sub(r"[^a-zA-Z0-9._-]+", "-", s).strip("-")
     return cleaned or "output"
+
+
+async def _run_fetch(skill, context: dict) -> str:
+    """Execute a skill's fetch.py and return its output.
+
+    The script must expose either `async def fetch(context)` or
+    `def fetch(context)`. Blocking fetch() runs via asyncio.to_thread so
+    it doesn't stall the event loop — useful for subprocess calls like
+    the github-tool skill running `gh pr list`.
+    """
+    import importlib.util
+    fetch_path = skill.fetch_path
+    if fetch_path is None:
+        return ""
+
+    spec = importlib.util.spec_from_file_location(
+        f"skill_fetch_{skill.name}", fetch_path
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Could not load {fetch_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    fn = getattr(module, "fetch", None)
+    if fn is None:
+        raise RuntimeError(f"{fetch_path} has no `fetch(context)` function")
+
+    import asyncio, inspect
+    if inspect.iscoroutinefunction(fn):
+        result = await fn(context)
+    else:
+        result = await asyncio.to_thread(fn, context)
+    return str(result) if result is not None else ""

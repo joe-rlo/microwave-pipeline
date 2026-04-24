@@ -140,12 +140,15 @@ async def run_http(config, host: str = "127.0.0.1", port: int = 8080) -> None:
 
 
 def main() -> None:
-    # Branch early on `scheduler` subcommand so its flag surface doesn't
-    # collide with the main runtime flags. Everything after `scheduler`
-    # is parsed by scheduler_cli().
+    # Branch early on subcommands so their flag surface doesn't collide
+    # with the main runtime flags. Each subcommand owns argv from its
+    # keyword onwards.
     if len(sys.argv) >= 2 and sys.argv[1] == "scheduler":
         from src.scheduler.cli import scheduler_cli
         sys.exit(scheduler_cli(sys.argv[2:]))
+    if len(sys.argv) >= 2 and sys.argv[1] == "skills":
+        from src.skills.cli import skills_cli
+        sys.exit(skills_cli(sys.argv[2:]))
 
     parser = argparse.ArgumentParser(description="MicrowaveOS — cognitive agent runtime")
     parser.add_argument("--telegram", action="store_true", help="Run Telegram bot")

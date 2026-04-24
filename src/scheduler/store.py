@@ -37,6 +37,10 @@ class ScheduledJob:
     card_split: str = "---"
     # Only meaningful for LLM mode. If False, deliver as plain text.
     card_view: bool = True
+    # If set, scheduler loads this skill's body as the system prompt for
+    # the LLM call and runs any pre-fetch script before the call. The job's
+    # `prompt_or_text` is used as the kickoff user message ("the trigger").
+    skill_name: str = ""
     created_at: datetime | None = None
     last_run_at: datetime | None = None
     last_error: str | None = None
@@ -83,18 +87,22 @@ class SchedulerStore:
             self.conn.execute(
                 "ALTER TABLE scheduled_jobs ADD COLUMN card_view INTEGER NOT NULL DEFAULT 1"
             )
+        if "skill_name" not in cols:
+            self.conn.execute(
+                "ALTER TABLE scheduled_jobs ADD COLUMN skill_name TEXT NOT NULL DEFAULT ''"
+            )
 
     def add(self, job: ScheduledJob) -> int:
         self.conn.execute(
             "INSERT INTO scheduled_jobs "
             "(name, cron_expr, mode, prompt_or_text, target_channel, recipient_id, "
-            " enabled, timezone, card_split, card_view) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " enabled, timezone, card_split, card_view, skill_name) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 job.name, job.cron_expr, job.mode, job.prompt_or_text,
                 job.target_channel, job.recipient_id,
                 int(job.enabled), job.timezone,
-                job.card_split, int(job.card_view),
+                job.card_split, int(job.card_view), job.skill_name,
             ),
         )
         return self.conn.last_insert_rowid()
@@ -192,6 +200,7 @@ class SchedulerStore:
             timezone=row["timezone"],
             card_split=row["card_split"] or "---",
             card_view=bool(row["card_view"]),
+            skill_name=row["skill_name"] or "",
             created_at=_parse(row["created_at"]),
             last_run_at=_parse(row["last_run_at"]),
             last_error=row["last_error"],

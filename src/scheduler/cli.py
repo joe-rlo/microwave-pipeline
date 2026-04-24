@@ -42,6 +42,14 @@ def scheduler_cli(argv: list[str]) -> int:
     g.add_argument("--prompt-file", type=Path, help="File whose contents become the LLM prompt")
     g.add_argument("--prompt", help="Inline LLM prompt (prefer --prompt-file for long prompts)")
     g.add_argument("--text", help="Literal text to send (direct mode only)")
+    g.add_argument(
+        "--skill", help="Name of a skill whose body becomes the system prompt; "
+        "requires --trigger (the short kickoff user message)"
+    )
+    p_add.add_argument(
+        "--trigger", default="",
+        help="Short user-message kickoff when --skill is set (e.g. 'Generate today's notes.')",
+    )
     p_add.add_argument("--timezone", default="America/New_York")
     p_add.add_argument(
         "--no-card-view", action="store_true",
@@ -82,7 +90,7 @@ def scheduler_cli(argv: list[str]) -> int:
         if args.action == "list":
             return _cmd_list(store)
         if args.action == "add":
-            return _cmd_add(store, args)
+            return _cmd_add(store, args, config)
         if args.action == "remove":
             return _cmd_remove(store, args.name)
         if args.action == "enable":
@@ -124,7 +132,7 @@ def _cmd_list(store: SchedulerStore) -> int:
     return 0
 
 
-def _cmd_add(store: SchedulerStore, args) -> int:
+def _cmd_add(store: SchedulerStore, args, config) -> int:
     # Validate the cron expression up front — croniter raises helpfully
     try:
         croniter(args.cron)
@@ -132,13 +140,33 @@ def _cmd_add(store: SchedulerStore, args) -> int:
         print(f"Invalid cron expression {args.cron!r}: {e}", file=sys.stderr)
         return 2
 
+    skill_name = ""
     if args.mode == "direct":
         if not args.text:
             print("--mode direct requires --text", file=sys.stderr)
             return 2
         prompt_or_text = args.text
     else:  # llm
-        if args.prompt_file:
+        if args.skill:
+            # Skill-driven job: skill body is the system prompt, --trigger is
+            # the user message. Prompt-file/prompt flags aren't used.
+            if not args.trigger:
+                print("--skill requires --trigger (the kickoff user message)", file=sys.stderr)
+                return 2
+            # Verify the skill exists up front so add-time errors are visible.
+            from src.skills import SkillLoader, SkillNotFound
+            loader = SkillLoader(config.workspace_dir / "skills")
+            try:
+                loader.load(args.skill)
+            except SkillNotFound:
+                print(
+                    f"No skill named {args.skill!r} at {loader.skills_dir}",
+                    file=sys.stderr,
+                )
+                return 2
+            skill_name = args.skill
+            prompt_or_text = args.trigger
+        elif args.prompt_file:
             if not args.prompt_file.is_file():
                 print(f"Prompt file not found: {args.prompt_file}", file=sys.stderr)
                 return 2
@@ -146,7 +174,7 @@ def _cmd_add(store: SchedulerStore, args) -> int:
         elif args.prompt:
             prompt_or_text = args.prompt
         else:
-            print("--mode llm requires --prompt or --prompt-file", file=sys.stderr)
+            print("--mode llm requires --prompt, --prompt-file, or --skill", file=sys.stderr)
             return 2
 
     # Disallow duplicate names — SQLite would raise anyway but catch early.
@@ -165,9 +193,14 @@ def _cmd_add(store: SchedulerStore, args) -> int:
         timezone=args.timezone,
         card_split=args.card_split,
         card_view=(args.mode == "llm" and not args.no_card_view),
+        skill_name=skill_name,
     )
     store.add(job)
-    print(f"Added job {args.name!r} ({args.mode}, {args.cron}, {args.channel}:{args.recipient})")
+    suffix = f", skill={skill_name!r}" if skill_name else ""
+    print(
+        f"Added job {args.name!r} ({args.mode}, {args.cron}, "
+        f"{args.channel}:{args.recipient}{suffix})"
+    )
     return 0
 
 

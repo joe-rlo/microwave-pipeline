@@ -14,6 +14,7 @@ from datetime import datetime
 from src.memory.index import MemoryIndex
 from src.memory.store import MemoryStore
 from src.session.models import AssemblyResult, MemoryFragment, SearchResult
+from src.skills import Skill
 
 log = logging.getLogger(__name__)
 
@@ -26,6 +27,7 @@ def assemble(
     memory_index: MemoryIndex,
     channel: str | None = None,
     output_dir: str = "",
+    active_skill: Skill | None = None,
 ) -> AssemblyResult:
     """Assemble stable and dynamic context for this turn."""
     # Build stable context (for reconnect if needed)
@@ -35,6 +37,19 @@ def assemble(
     # Datetime goes here (not in stable prompt) so it doesn't trigger reconnects
     dynamic_parts = []
     dynamic_parts.append(f"[Current datetime: {datetime.now().isoformat(timespec='minutes')}]")
+
+    # Active skill block goes BEFORE channel file-output instructions so
+    # channel rules appear later in the prompt (higher recency priority).
+    # The explicit note below reinforces that precedence.
+    if active_skill is not None:
+        dynamic_parts.append(
+            f"[Active skill: {active_skill.name}]\n"
+            f"{active_skill.body.strip()}\n\n"
+            "Note: these skill instructions are additive to IDENTITY.md. "
+            "If anything above conflicts with the channel formatting rules "
+            "that follow (message length, markdown syntax, attachment "
+            "behavior), the channel rules win."
+        )
 
     # File output instructions — channel-aware
     if channel == "signal":

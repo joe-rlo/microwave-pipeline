@@ -22,6 +22,7 @@ import aiohttp
 from src.channels.base import Channel
 from src.channels.signal_format import markdown_to_signal_text
 from src.pipeline.orchestrator import Orchestrator
+from src.skills.chat import handle_skill_command
 
 log = logging.getLogger(__name__)
 
@@ -139,6 +140,15 @@ class SignalChannel(Channel):
         msg_ts = data.get("timestamp") or envelope.get("timestamp")
         if msg_ts:
             await self._send_read_receipt(source, int(msg_ts))
+
+        # Skill commands short-circuit before the pipeline. Skip if the user
+        # ALSO sent a voice note in the same message — that's a normal message
+        # with a command-like prefix, not a pure command.
+        if text and not voice_attachments:
+            skill_reply = handle_skill_command(text, self.orchestrator)
+            if skill_reply is not None:
+                await self._send_text(source, skill_reply)
+                return
 
         # Transcribe any voice notes; each becomes a line in the final message
         transcripts: list[str] = []
