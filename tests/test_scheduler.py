@@ -285,9 +285,10 @@ class TestFire:
         assert ch.attachments == []
 
     @pytest.mark.asyncio
-    async def test_llm_mode_card_view_delivers_text_and_attachment(self, tmp_path, monkeypatch):
-        """LLM job with card_view=True and output with --- separators
-        should deliver a plain-text header+fallback AND an HTML attachment."""
+    async def test_llm_mode_card_view_delivers_attachment_only(self, tmp_path, monkeypatch):
+        """LLM job with card_view=True and `---`-separated output should
+        deliver a one-line header + HTML attachment. No plain-text
+        fallback in the body — the attachment IS the content."""
         from src.config import Config
         from src.scheduler import engine as engine_mod
         store = _store(tmp_path)
@@ -320,8 +321,12 @@ class TestFire:
         assert len(ch.texts) == 1
         _, body = ch.texts[0]
         assert "substack" in body  # header mentions the job name
-        assert "3 items" in body
-        assert "Note 1" in body  # plain-text fallback included
+        assert "3 items" in body  # header mentions count
+        # Crucially, NO plain-text fallback content in the body. The
+        # whole point of attachment-only delivery is no double-posting.
+        assert "Note 1" not in body
+        assert "Note 2" not in body
+        assert "Body of the first" not in body
 
         assert len(ch.attachments) == 1
         _, filename, content = ch.attachments[0]
@@ -369,3 +374,155 @@ class TestFire:
         job.id = 1
         with pytest.raises(RuntimeError, match="No channel registered"):
             await sch._fire(job)
+
+    @pytest.mark.asyncio
+    async def test_script_mode_plain_stdout_sends_text(self, tmp_path):
+        """Script mode with non-HTML stdout should route through the LLM
+        delivery path — single chunk → plain text, no attachment."""
+        from src.config import Config
+        store = _store(tmp_path)
+        ch = self._FakeChannel()
+        sch = Scheduler(
+            store=store,
+            channels={"signal": ch},
+            config=Config(db_path=tmp_path / "test.db"),
+        )
+        job = _sample_job(
+            name="echo-job",
+            mode="script",
+            prompt_or_text="printf 'hello from script'",
+            card_view=True,
+        )
+        job.id = store.add(job)
+        await sch._fire(job)
+
+        assert ch.attachments == []
+        assert len(ch.texts) == 1
+        assert ch.texts[0][1] == "hello from script"
+
+    @pytest.mark.asyncio
+    async def test_script_mode_html_doc_ships_as_attachment(self, tmp_path):
+        """Script mode whose stdout is a full HTML doc should send a short
+        text body plus the HTML as a file attachment."""
+        from src.config import Config
+        store = _store(tmp_path)
+        ch = self._FakeChannel()
+        sch = Scheduler(
+            store=store,
+            channels={"signal": ch},
+            config=Config(db_path=tmp_path / "test.db"),
+        )
+        # printf emits a minimal HTML document to stdout
+        html_doc = "<!DOCTYPE html><html><head><title>t</title></head><body>hi</body></html>"
+        job = _sample_job(
+            name="html-report",
+            mode="script",
+            prompt_or_text=f"printf '%s' '{html_doc}'",
+        )
+        job.id = store.add(job)
+        await sch._fire(job)
+
+        assert len(ch.texts) == 1
+        body = ch.texts[0][1]
+        assert "html-report" in body
+        assert "attachment" in body.lower()
+
+        assert len(ch.attachments) == 1
+        _, filename, content = ch.attachments[0]
+        assert filename.endswith(".html")
+        assert "<!DOCTYPE html>" in content
+        assert "<title>t</title>" in content
+
+    @pytest.mark.asyncio
+    async def test_llm_mode_html_doc_ships_as_attachment_only(self, tmp_path, monkeypatch):
+        """When the LLM returns a complete HTML document, deliver it as
+        attachment only — no duplicate plain-text body. Skills that opt
+        into HTML output get full styling control (clickable links, etc.)
+        without the card-view fallback content posted alongside."""
+        from src.config import Config
+        from src.scheduler import engine as engine_mod
+        store = _store(tmp_path)
+        ch = self._FakeChannel()
+        sch = Scheduler(
+            store=store,
+            channels={"signal": ch},
+            config=Config(db_path=tmp_path / "test.db"),
+        )
+
+        html_doc = (
+            "<!DOCTYPE html><html><head><title>brief</title></head>"
+            "<body><h1>Hi</h1><a href='https://example.com'>link</a></body></html>"
+        )
+
+        async def _fake_run_llm(self, job):
+            return html_doc
+
+        monkeypatch.setattr(engine_mod.Scheduler, "_run_llm", _fake_run_llm)
+
+        job = _sample_job(name="briefing", mode="llm", card_view=True)
+        job.id = store.add(job)
+        await sch._fire(job)
+
+        # One short header text, NOT the rendered HTML content.
+        assert len(ch.texts) == 1
+        body = ch.texts[0][1]
+        assert "briefing" in body
+        assert "attachment" in body.lower()
+        # Crucially, the raw HTML must NOT appear inside the message body.
+        assert "<a href=" not in body
+        assert "<h1>" not in body
+
+        # The HTML rides on the attachment — including the clickable link.
+        assert len(ch.attachments) == 1
+        _, filename, content = ch.attachments[0]
+        assert filename.endswith(".html")
+        assert "https://example.com" in content
+
+    @pytest.mark.asyncio
+    async def test_script_mode_nonzero_exit_raises(self, tmp_path):
+        """Script exiting non-zero should bubble up so `_guarded_fire`
+        records the stderr tail in `last_error`."""
+        from src.config import Config
+        store = _store(tmp_path)
+        ch = self._FakeChannel()
+        sch = Scheduler(
+            store=store,
+            channels={"signal": ch},
+            config=Config(db_path=tmp_path / "test.db"),
+        )
+        job = _sample_job(
+            name="broken",
+            mode="script",
+            prompt_or_text="echo oops on stderr 1>&2; exit 7",
+        )
+        job.id = store.add(job)
+        with pytest.raises(RuntimeError, match="exited 7"):
+            await sch._fire(job)
+        # No delivery on failure
+        assert ch.texts == []
+        assert ch.attachments == []
+
+    @pytest.mark.asyncio
+    async def test_script_mode_guarded_fire_records_error(self, tmp_path):
+        """_guarded_fire (not _fire) should catch the RuntimeError and
+        persist it to last_error, so the daemon doesn't crash."""
+        from src.config import Config
+        store = _store(tmp_path)
+        ch = self._FakeChannel()
+        sch = Scheduler(
+            store=store,
+            channels={"signal": ch},
+            config=Config(db_path=tmp_path / "test.db"),
+        )
+        job = _sample_job(
+            name="broken2",
+            mode="script",
+            prompt_or_text="exit 3",
+        )
+        job.id = store.add(job)
+        # Should NOT raise — _guarded_fire swallows and records.
+        await sch._guarded_fire(job)
+        persisted = store.get_by_name("broken2")
+        assert persisted is not None
+        assert persisted.last_error is not None
+        assert "exited 3" in persisted.last_error

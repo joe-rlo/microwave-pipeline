@@ -363,6 +363,8 @@ class TelegramChannel(Channel):
         lines = ["Pipeline debug:"]
         if meta.triage:
             lines.append(f"Triage: {meta.triage.intent} ({meta.triage.complexity})")
+            if meta.triage.matched_skill:
+                lines.append(f"Matched skill: {meta.triage.matched_skill}")
         if meta.escalated:
             lines.append(f"Escalated: {meta.escalated_model}")
         if meta.search:

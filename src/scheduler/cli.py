@@ -35,7 +35,7 @@ def scheduler_cli(argv: list[str]) -> int:
     p_add = sub.add_parser("add", help="Create a new job")
     p_add.add_argument("--name", required=True, help="Unique job name (used in CLI commands)")
     p_add.add_argument("--cron", required=True, help='Cron expression, e.g. "57 6 * * *"')
-    p_add.add_argument("--mode", required=True, choices=["llm", "direct"])
+    p_add.add_argument("--mode", required=True, choices=["llm", "direct", "script"])
     p_add.add_argument("--channel", required=True, help="Target channel: 'signal' or 'telegram'")
     p_add.add_argument("--recipient", required=True, help="Phone number (Signal) or chat id (Telegram)")
     g = p_add.add_mutually_exclusive_group(required=True)
@@ -46,6 +46,10 @@ def scheduler_cli(argv: list[str]) -> int:
         "--skill", help="Name of a skill whose body becomes the system prompt; "
         "requires --trigger (the short kickoff user message)"
     )
+    g.add_argument(
+        "--command",
+        help="Shell command to run (script mode only). Runs with cwd=project root.",
+    )
     p_add.add_argument(
         "--trigger", default="",
         help="Short user-message kickoff when --skill is set (e.g. 'Generate today's notes.')",
@@ -53,11 +57,12 @@ def scheduler_cli(argv: list[str]) -> int:
     p_add.add_argument("--timezone", default="America/New_York")
     p_add.add_argument(
         "--no-card-view", action="store_true",
-        help="LLM mode: deliver as plain text instead of HTML card-view",
+        help="LLM/script modes: deliver as plain text instead of HTML card-view "
+             "(script mode's HTML-doc detection still routes full HTML to attachments)",
     )
     p_add.add_argument(
         "--card-split", default="---",
-        help="LLM mode: separator that splits output into cards (default: ---)",
+        help="LLM/script modes: separator that splits output into cards (default: ---)",
     )
 
     # remove
@@ -146,6 +151,11 @@ def _cmd_add(store: SchedulerStore, args, config) -> int:
             print("--mode direct requires --text", file=sys.stderr)
             return 2
         prompt_or_text = args.text
+    elif args.mode == "script":
+        if not args.command:
+            print("--mode script requires --command", file=sys.stderr)
+            return 2
+        prompt_or_text = args.command
     else:  # llm
         if args.skill:
             # Skill-driven job: skill body is the system prompt, --trigger is
@@ -192,7 +202,7 @@ def _cmd_add(store: SchedulerStore, args, config) -> int:
         enabled=True,
         timezone=args.timezone,
         card_split=args.card_split,
-        card_view=(args.mode == "llm" and not args.no_card_view),
+        card_view=(args.mode in ("llm", "script") and not args.no_card_view),
         skill_name=skill_name,
     )
     store.add(job)

@@ -107,6 +107,11 @@ python3 src/main.py --http --port 9000
 python3 src/main.py scheduler list
 python3 src/main.py scheduler add --name ... --cron ... --mode llm|direct ...
 python3 src/main.py scheduler run <name>
+
+# Skills management (no daemon required)
+python3 src/main.py skills list
+python3 src/main.py skills new <name> --description "..."
+python3 src/main.py skills edit <name>
 ```
 
 ## Customization
@@ -203,6 +208,61 @@ You can manually add notes for things you want Microwave to know today:
 ```bash
 echo "Meeting with design team at 3pm about the rebrand" >> workspace/memory/2026-04-12.md
 ```
+
+### Skills — `workspace/skills/`
+
+Skills are named, reusable instruction bundles that extend the pipeline's dynamic context for a specific task or domain. Think of a skill as a scoped IDENTITY.md — voice rules, topic guardrails, output format — that you can activate when you need it and turn off when you don't.
+
+Each skill is a directory with a `SKILL.md` file containing YAML-ish frontmatter and a markdown body:
+
+```
+workspace/skills/substack-writer/
+├── SKILL.md          # frontmatter + body (required)
+└── fetch.py          # optional: pre-fetch script for scheduled jobs
+```
+
+`SKILL.md` shape:
+
+```markdown
+---
+name: substack-writer
+description: >
+  Generate Substack Notes in Joe's voice. Direct, opinionated,
+  anti-LinkedIn. Use for short-form published content.
+triggers:
+  - substack
+  - note
+  - hot take
+---
+
+# Substack Writer
+
+## Voice rules
+- Direct, opinionated, a little sharp. No corporate sludge.
+- ...
+```
+
+**Activation — three paths:**
+
+1. **In chat** (REPL, Telegram, Signal): `/skill substack-writer` activates it for the next turns; `/skill off` deactivates; `/skills` lists. The skill body is spliced into the pipeline's dynamic context.
+2. **In scheduled jobs**: `scheduler add --skill substack-writer --trigger "Generate 3 notes for today."` — the skill body becomes the system prompt for a one-shot LLM call.
+3. **Direct invocation via CLI**: `skills show <name>` for inspection.
+
+**Precedence:** skill instructions are additive to IDENTITY.md. When they conflict with channel rules (message length, markdown syntax, attachment behavior), channel rules win — the assembler adds an explicit note to the prompt saying so.
+
+**Pre-fetch** (scheduler-only in v1): a skill can include a `fetch.py` with `async def fetch(context)` or `def fetch(context)`. The scheduler runs it before the LLM call and prepends the output to the prompt under `[Pre-fetch context]`. The seed `github-tool` skill uses this to shell out to `gh search prs --author=@me --state=open` before writing a digest.
+
+**CLI:**
+
+```bash
+microwaveos skills list
+microwaveos skills show <name>
+microwaveos skills new <name> [--description "..."]
+microwaveos skills edit <name>            # opens in $EDITOR
+microwaveos skills remove <name>          # asks for confirmation
+```
+
+Seed skills shipped with v1: `substack-writer`, `blog-writing`, `github-tool`.
 
 ### Model selection
 
@@ -324,16 +384,27 @@ LLM jobs deliberately bypass the main pipeline — no shared session with your l
 **CLI:**
 
 ```bash
-# Create an LLM job — prompt stored in a file
+# LLM job using a named skill (preferred) — skill body is the system
+# prompt, --trigger is the short user message that kicks off the call
 python3 src/main.py scheduler add \
   --name substack-notes \
   --cron "57 6 * * *" \
   --mode llm \
   --channel signal \
   --recipient "+15551234567" \
-  --prompt-file prompts/substack-notes.txt
+  --skill substack-writer \
+  --trigger "Generate 3 Substack Notes for today."
 
-# Create a direct reminder — no LLM
+# LLM job with an inline prompt (no skill)
+python3 src/main.py scheduler add \
+  --name morning-briefing \
+  --cron "30 6 * * *" \
+  --mode llm \
+  --channel signal \
+  --recipient "+15551234567" \
+  --prompt "Summarize the top 3 things I should think about today..."
+
+# Direct reminder — no LLM
 python3 src/main.py scheduler add \
   --name vitamins \
   --cron "30 9 * * *" \
@@ -352,6 +423,8 @@ python3 src/main.py scheduler remove substack-notes
 python3 src/main.py scheduler run substack-notes
 ```
 
+**Skill-driven jobs** (`--skill`) are the cleanest path for recurring LLM tasks: the skill's instructions live in one place and can be reused by interactive chat or other jobs. If the referenced skill has a `fetch.py`, the scheduler awaits it before the LLM call and prepends the output to the prompt — e.g., `github-tool`'s fetch runs `gh search prs` so the digest has fresh data.
+
 **Missed runs:** if the daemon was offline when a job was due (laptop closed, process crashed), the scheduler does **not** fire the backlog on restart. It fast-forwards the job's baseline and waits for the next scheduled fire. A 3pm vitamin reminder for a 9am ping helps nobody.
 
 **Persistence across reboots:** use the launchd template at `deploy/com.microwaveos.daemon.plist.template`. Replace `{{PROJECT_DIR}}` and `{{PYTHON}}` with absolute paths, copy to `~/Library/LaunchAgents/`, then `launchctl load`. It only restarts on crashes (not clean shutdowns), so `launchctl unload` actually stops it.
@@ -368,7 +441,10 @@ python3 src/main.py scheduler run substack-notes
 │   │   ├── signal.md
 │   │   ├── repl.md
 │   │   └── http.md
-│   └── memory/            # daily notes
+│   ├── skills/            # reusable instruction bundles
+│   │   └── <name>/SKILL.md[, fetch.py]
+│   ├── memory/            # daily notes
+│   └── output/            # files the LLM writes via SDK tool use
 └── data/
     └── memory.db          # SQLite: vectors, FTS, session history, scheduled_jobs
 ```
@@ -377,22 +453,19 @@ The `workspace/` directory in the project root is for development. In production
 
 ## Commands
 
-In the REPL:
+In-chat commands (REPL, Telegram, and Signal all support the skill commands):
 
-| Command | Description |
-|---------|-------------|
-| `/debug` | Show triage, search, and reflection stats for last message |
-| `/new` | Start a fresh session (wipes conversation context, keeps memory) |
-| `exit` / `quit` | Stop the REPL |
-
-In Telegram:
-
-| Command | Description |
-|---------|-------------|
-| `/new` | Start a fresh session |
-| `/debug` | Pipeline stats for last message |
-| `/memory` | Show MEMORY.md contents |
-| `/status` | Session info, auth mode, model |
+| Command | Where | Description |
+|---------|-------|-------------|
+| `/debug` | REPL, Telegram | Triage/search/reflection stats for the last message |
+| `/new` | REPL, Telegram | Start a fresh session (wipes conversation context, keeps memory) |
+| `/memory` | Telegram | Show MEMORY.md contents |
+| `/status` | Telegram | Session info, auth mode, model |
+| `/skill <name>` | all | Activate a skill for subsequent turns |
+| `/skill off` | all | Deactivate the current skill (also `none`, `clear`) |
+| `/skill` | all | Show which skill is currently active |
+| `/skills` | all | List every available skill |
+| `exit` / `quit` | REPL | Stop the REPL |
 
 Scheduler CLI (runs without the daemon):
 
@@ -403,6 +476,16 @@ Scheduler CLI (runs without the daemon):
 | `scheduler remove <name>` | Delete a job |
 | `scheduler enable <name>` / `disable <name>` | Toggle without deleting |
 | `scheduler run <name>` | Fire one job right now |
+
+Skills CLI (runs without the daemon):
+
+| Command | Description |
+|---------|-------------|
+| `skills list` | Show every skill with its description and fetch-script status |
+| `skills show <name>` | Print a skill's full content (frontmatter + body) |
+| `skills new <name>` | Scaffold a skill directory with a template SKILL.md |
+| `skills edit <name>` | Open the skill's SKILL.md in `$EDITOR` |
+| `skills remove <name>` | Delete a skill directory (asks for confirmation) |
 
 ### Telegram file handling
 
@@ -421,8 +504,10 @@ Things this pipeline can't do yet, or does poorly.
 ### No vision
 Images and photos are received but not seen. The pipeline is text-only — there's no multimodal path to pass images through to the LLM. Photos sent in Telegram are acknowledged but the model has no idea what's in them.
 
-### No tool use
-Microwave can't take actions — no web search, no code execution, no API calls, no file system access. It's a conversational agent with memory, not an agentic tool-user. The Agent SDK supports `allowed_tools` but the pipeline currently sets it to `[]`.
+### Limited tool use
+Microwave can't take actions mid-conversation — no live web search, no code execution, no runtime API calls, no file system access inside the turn. The Agent SDK supports `allowed_tools` but the pipeline currently sets it to `[]`.
+
+The one exception is **scheduler pre-fetch**: a skill can ship a `fetch.py` that the scheduler awaits *before* the LLM call, and the result is prepended to the prompt. That's how the seed `github-tool` skill pulls fresh `gh pr list` data for its weekly digests. It's a batch-mode shortcut, not real tool use — the LLM still can't call things during a turn.
 
 ### Single user per channel
 The orchestrator holds one session at a time. If multiple Telegram users message the bot, their conversations share the same LLM session and can bleed into each other. Fine for personal use, not safe for multi-user deployment.

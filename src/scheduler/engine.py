@@ -1,10 +1,16 @@
 """Scheduler engine — poll loop, job dispatch, and fire logic.
 
-Two dispatch paths:
-- `llm`  — run the job's prompt through a one-shot LLM call
-  (`SingleTurnClient`), optionally wrap the output as an HTML card-view
-  attachment, and deliver via the target channel.
+Three dispatch paths:
+- `llm`    — run the job's prompt through a one-shot LLM call
+             (`SingleTurnClient`), optionally wrap the output as an HTML
+             card-view attachment, and deliver via the target channel.
 - `direct` — send a literal string as a plain text message. Zero LLM cost.
+- `script` — run a shell command (cwd = project root), capture stdout,
+             and deliver it. If stdout is a complete HTML document it
+             ships as an attachment; otherwise it routes through the same
+             card-view delivery as `llm`. Use this for deterministic
+             metrics reports, log digests, or anything that needs real
+             numbers (LLM mode has no tool access).
 
 LLM jobs deliberately bypass `Orchestrator.process()` to avoid polluting
 the live user session: no shared SDK connection, no recent-turn
@@ -25,7 +31,6 @@ from croniter import croniter
 from src.config import Config
 from src.llm.client import SingleTurnClient
 from src.scheduler.card_view import (
-    plain_text_fallback,
     render_card_view,
     split_into_cards,
 )
@@ -38,6 +43,12 @@ POLL_INTERVAL_SEC = 30
 # treat it as "missed while offline" and skip forward to the next upcoming
 # fire instead of firing a stale backlog. Matches the spec's (b) behavior.
 MAX_CATCHUP_MINUTES = 5
+# Hard cap for `script` mode subprocesses. Long enough for real reports
+# (queries, aggregation, HTML rendering) but short enough to catch hangs.
+SCRIPT_TIMEOUT_SEC = 300
+# How many bytes of stderr to capture in the job's last_error on failure.
+# Enough to diagnose without blowing up the DB column.
+SCRIPT_STDERR_TAIL_BYTES = 600
 
 
 # A channel "sender" is anything that can deliver a text message and
@@ -185,6 +196,11 @@ class Scheduler:
             await self._deliver_llm(job, channel, response)
             return
 
+        if job.mode == "script":
+            stdout = await self._run_script(job)
+            await self._deliver_script(job, channel, stdout)
+            return
+
         raise RuntimeError(f"Unknown job mode: {job.mode!r}")
 
     async def _run_llm(self, job: ScheduledJob) -> str:
@@ -267,13 +283,22 @@ class Scheduler:
     ) -> None:
         """Ship the LLM output via the target channel.
 
-        In card-view mode, parse the response into cards and deliver as:
-        - short plain-text message body (for desktop/fallback)
-        - HTML card-view attachment (per-card Copy buttons, mobile-friendly)
+        Three paths, in priority order:
+        1. LLM emitted a complete HTML document → ship as attachment only,
+           with a short header text. No duplicate plain-text body. Skills
+           that want full styling control (e.g. clickable links) opt in
+           by returning HTML directly.
+        2. Card-view mode + multi-card output → header + plain-text
+           fallback + HTML card-view attachment.
+        3. Anything else → plain text.
         """
         response = response.strip()
         if not response:
             await channel.send_text(job.recipient_id, f"_{job.name}: (empty response)_")
+            return
+
+        if _looks_like_html_doc(response):
+            await self._send_html_attachment(job, channel, response)
             return
 
         if not job.card_view:
@@ -288,15 +313,104 @@ class Scheduler:
 
         title = job.name
         html_doc = render_card_view(cards, title=title)
-        plain = plain_text_fallback(cards)
 
-        # Message body first so the user sees something instantly on
-        # platforms that don't preview HTML quickly.
+        # Attachment-only delivery — the HTML card-view IS the content.
+        # We used to also post `plain_text_fallback(cards)` as a body, but
+        # that double-posted everything. Header alone tells the user
+        # there's something to tap.
         header = f"_{title} — {len(cards)} items, tap the attachment for copy buttons._"
-        await channel.send_text(job.recipient_id, f"{header}\n\n{plain}")
+        await channel.send_text(job.recipient_id, header)
 
         filename = _safe_filename(title) + ".html"
         await channel.send_attachment(job.recipient_id, filename, html_doc)
+
+    async def _send_html_attachment(
+        self, job: ScheduledJob, channel: ChannelSender, html: str
+    ) -> None:
+        """Deliver a complete HTML document as a file attachment with a
+        terse text header. Used by both LLM-emitted HTML and script-mode
+        HTML output. The body intentionally omits the rendered content —
+        the attachment IS the content, no duplication."""
+        title = job.name
+        kb = len(html.encode("utf-8")) / 1024
+        header = (
+            f"_{title} — {kb:.1f} KB, tap the attachment to view._"
+        )
+        await channel.send_text(job.recipient_id, header)
+        filename = _safe_filename(title) + ".html"
+        await channel.send_attachment(job.recipient_id, filename, html)
+
+    # --- script mode ---
+
+    async def _run_script(self, job: ScheduledJob) -> str:
+        """Run `job.prompt_or_text` as a shell command, return decoded stdout.
+
+        cwd is the project root so a job command like
+        `python3 scripts/weekly_pipeline_report.py` works without absolute
+        paths. Shell syntax (pipes, redirects) is supported — the command
+        comes from an operator (via the CLI), not user input.
+
+        Non-zero exit codes raise, with a stderr tail bubbled up so it
+        lands in the job's `last_error` row.
+        """
+        project_root = Path(__file__).resolve().parents[2]
+        proc = await asyncio.create_subprocess_shell(
+            job.prompt_or_text,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(project_root),
+        )
+        try:
+            stdout_b, stderr_b = await asyncio.wait_for(
+                proc.communicate(), timeout=SCRIPT_TIMEOUT_SEC
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            try:
+                await proc.wait()
+            except Exception:
+                pass
+            raise RuntimeError(
+                f"Script timed out after {SCRIPT_TIMEOUT_SEC}s"
+            )
+
+        stderr_text = (stderr_b or b"").decode("utf-8", "replace").strip()
+        if stderr_text:
+            # Log stderr even on success — scripts often emit progress there.
+            log.info(f"Script stderr for {job.name!r}: {stderr_text[-500:]}")
+
+        if proc.returncode != 0:
+            tail = stderr_text[-SCRIPT_STDERR_TAIL_BYTES:] or "(no stderr)"
+            raise RuntimeError(
+                f"Script exited {proc.returncode}: {tail}"
+            )
+
+        return (stdout_b or b"").decode("utf-8", "replace")
+
+    async def _deliver_script(
+        self, job: ScheduledJob, channel: ChannelSender, stdout: str
+    ) -> None:
+        """Ship script stdout via the target channel.
+
+        If the output is a complete HTML document, send a brief message
+        body plus the HTML as an attachment. Otherwise reuse the LLM
+        delivery path (card-split → plain text or card-view attachment).
+        """
+        out = stdout.strip()
+        if not out:
+            await channel.send_text(
+                job.recipient_id, f"_{job.name}: (empty script output)_"
+            )
+            return
+
+        if _looks_like_html_doc(out):
+            await self._send_html_attachment(job, channel, out)
+            return
+
+        # Non-HTML: reuse the LLM delivery path. Respects card_view +
+        # card_split so a script can still output "---"-separated cards
+        # and get the same rich card-view treatment.
+        await self._deliver_llm(job, channel, out)
 
     # --- manual invocation ---
 
@@ -317,6 +431,16 @@ def _safe_filename(s: str) -> str:
     import re
     cleaned = re.sub(r"[^a-zA-Z0-9._-]+", "-", s).strip("-")
     return cleaned or "output"
+
+
+def _looks_like_html_doc(s: str) -> bool:
+    """True if `s` looks like a complete HTML document.
+
+    Allows leading whitespace or a UTF-8 BOM. Case-insensitive on the
+    opening tag so `<HTML>` and `<!DOCTYPE html>` both match.
+    """
+    lead = s.lstrip("﻿ \n\r\t").lower()
+    return lead.startswith("<!doctype") or lead.startswith("<html")
 
 
 async def _run_fetch(skill, context: dict) -> str:

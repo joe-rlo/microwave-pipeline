@@ -25,7 +25,7 @@ class ScheduledJob:
     id: int | None = None
     name: str = ""
     cron_expr: str = ""
-    mode: str = "llm"  # "llm" | "direct"
+    mode: str = "llm"  # "llm" | "direct" | "script"
     prompt_or_text: str = ""
     target_channel: str = ""
     recipient_id: str = ""
@@ -55,25 +55,38 @@ class SchedulerStore:
         self.conn = db_connect(self.db_path)
         self._init_tables()
 
+    # Canonical table DDL — keep in sync with the migration below so both
+    # fresh installs and upgraded installs converge on the same schema.
+    # Includes every column that existed as of the last migration; the
+    # ALTER-based backfills below are only for DBs created *before* that
+    # column was added to this canonical DDL.
+    _CREATE_SQL = """
+        CREATE TABLE IF NOT EXISTS scheduled_jobs (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            name            TEXT UNIQUE NOT NULL,
+            cron_expr       TEXT NOT NULL,
+            mode            TEXT NOT NULL CHECK (mode IN ('llm', 'direct', 'script')),
+            prompt_or_text  TEXT NOT NULL,
+            target_channel  TEXT NOT NULL,
+            recipient_id    TEXT NOT NULL,
+            enabled         INTEGER NOT NULL DEFAULT 1,
+            timezone        TEXT NOT NULL DEFAULT 'America/New_York',
+            card_split      TEXT NOT NULL DEFAULT '---',
+            card_view       INTEGER NOT NULL DEFAULT 1,
+            skill_name      TEXT NOT NULL DEFAULT '',
+            created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+            last_run_at     TEXT,
+            last_error      TEXT
+        )
+    """
+
     def _init_tables(self) -> None:
-        self.conn.execute("""
-            CREATE TABLE IF NOT EXISTS scheduled_jobs (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                name            TEXT UNIQUE NOT NULL,
-                cron_expr       TEXT NOT NULL,
-                mode            TEXT NOT NULL CHECK (mode IN ('llm', 'direct')),
-                prompt_or_text  TEXT NOT NULL,
-                target_channel  TEXT NOT NULL,
-                recipient_id    TEXT NOT NULL,
-                enabled         INTEGER NOT NULL DEFAULT 1,
-                timezone        TEXT NOT NULL DEFAULT 'America/New_York',
-                card_split      TEXT NOT NULL DEFAULT '---',
-                card_view       INTEGER NOT NULL DEFAULT 1,
-                created_at      TEXT NOT NULL DEFAULT (datetime('now')),
-                last_run_at     TEXT,
-                last_error      TEXT
-            )
-        """)
+        # Older DBs have a CHECK constraint of IN ('llm', 'direct') that
+        # blocks inserting `mode='script'`. SQLite can't ALTER a CHECK in
+        # place, so rebuild the table if we detect the old signature.
+        self._migrate_relax_mode_check()
+
+        self.conn.execute(self._CREATE_SQL)
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_scheduled_jobs_enabled ON scheduled_jobs(enabled)"
         )
@@ -91,6 +104,42 @@ class SchedulerStore:
             self.conn.execute(
                 "ALTER TABLE scheduled_jobs ADD COLUMN skill_name TEXT NOT NULL DEFAULT ''"
             )
+
+    def _migrate_relax_mode_check(self) -> None:
+        """Rebuild scheduled_jobs if its CHECK constraint predates 'script' mode."""
+        rows = list(self.conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='scheduled_jobs'"
+        ))
+        if not rows:
+            return  # fresh install — CREATE below will do the right thing
+        ddl = rows[0]["sql"] or ""
+        # Detect the pre-script signature. Use a loose match so we don't miss
+        # single/double quote variations or whitespace differences.
+        if "'script'" in ddl:
+            return  # already migrated
+        if "'llm'" not in ddl or "'direct'" not in ddl:
+            return  # unrecognized — leave alone, safer than blindly rewriting
+
+        log.info("Migrating scheduled_jobs: relaxing mode CHECK to include 'script'")
+        existing_cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(scheduled_jobs)")}
+        self.conn.execute("BEGIN")
+        try:
+            self.conn.execute(self._CREATE_SQL.replace("scheduled_jobs", "scheduled_jobs_new"))
+            # Intersect old + new column sets so the migration survives drift
+            # in either direction (missing columns backfill via DEFAULTs).
+            new_cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(scheduled_jobs_new)")}
+            shared = [c for c in existing_cols if c in new_cols]
+            col_list = ", ".join(shared)
+            self.conn.execute(
+                f"INSERT INTO scheduled_jobs_new ({col_list}) "
+                f"SELECT {col_list} FROM scheduled_jobs"
+            )
+            self.conn.execute("DROP TABLE scheduled_jobs")
+            self.conn.execute("ALTER TABLE scheduled_jobs_new RENAME TO scheduled_jobs")
+            self.conn.execute("COMMIT")
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
 
     def add(self, job: ScheduledJob) -> int:
         self.conn.execute(

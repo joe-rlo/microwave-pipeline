@@ -137,6 +137,18 @@ class Orchestrator:
         recent = self.session_engine.get_recent_turns(channel, user_id, limit=6)
 
         # --- Stage 1: Triage ---
+        # Pass the skill catalog only when no skill is explicitly pinned.
+        # If the user has set `/skill foo`, we honor that and skip triage's
+        # matching work entirely — cheaper and more predictable.
+        skill_catalog: list[tuple[str, str]] = []
+        if self._active_skill is None and self.skill_loader is not None:
+            try:
+                skill_catalog = [
+                    (s.name, s.description) for s in self.skill_loader.list_all()
+                ]
+            except Exception as e:
+                log.warning(f"Could not enumerate skills for triage: {e}")
+
         triage_result = await triage(
             message,
             recent,
@@ -144,7 +156,34 @@ class Orchestrator:
             auth_mode=self.config.auth_mode,
             api_key=self.config.anthropic_api_key,
             cli_path=self.config.cli_path,
+            skills=skill_catalog or None,
         )
+
+        # Resolve the skill in effect for THIS turn. Explicit pin always wins;
+        # otherwise triage's ephemeral match is used. Neither mutates
+        # self._active_skill — auto-match is per-turn, not sticky.
+        turn_skill = self._active_skill
+        auto_matched = False
+        if turn_skill is None and triage_result.matched_skill:
+            try:
+                turn_skill = self.skill_loader.load(triage_result.matched_skill)
+                auto_matched = True
+            except Exception as e:
+                # Triage returned a name that doesn't resolve on disk —
+                # parse_triage_response should have filtered these out, but
+                # be defensive in case the skill was removed between enum
+                # and load.
+                log.debug(f"Auto-matched skill {triage_result.matched_skill!r} failed to load: {e}")
+                turn_skill = None
+
+        if auto_matched and turn_skill is not None:
+            # Tell the channel so it can surface the match if it wants
+            # (most channels stay silent; /debug metadata shows it too).
+            yield {
+                "type": "skill_matched",
+                "skill": turn_skill.name,
+                "description": turn_skill.description,
+            }
 
         # --- Stage 2: Search ---
         search_result = await search(message, triage_result, self.searcher)
@@ -156,7 +195,7 @@ class Orchestrator:
             self.memory_index,
             channel=self._channel,
             output_dir=str(self.config.output_dir),
-            active_skill=self._active_skill,
+            active_skill=turn_skill,
         )
 
         # Reconnect only if underlying files actually changed on disk

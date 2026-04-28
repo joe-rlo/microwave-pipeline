@@ -578,7 +578,11 @@ def render_text(stats: dict) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="Weekly cognitive pipeline report")
-    p.add_argument("--db", type=Path, default=Path(os.getenv("DATA_DIR", str(DEFAULT_DB.parent))) / "memory.db")
+    p.add_argument(
+        "--db",
+        type=lambda s: Path(os.path.expanduser(s)),
+        default=Path(os.path.expanduser(os.getenv("DATA_DIR", str(DEFAULT_DB.parent)))) / "memory.db",
+    )
     p.add_argument("--days", type=int, default=7)
     p.add_argument("--format", choices=["html", "text", "both"], default="html")
     p.add_argument("--out", type=Path, help="Write HTML to this path (default: stdout)")

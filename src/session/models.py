@@ -12,6 +12,11 @@ class TriageResult:
     complexity: str  # "simple", "moderate", "complex"
     search_params: dict = field(default_factory=dict)
     needs_memory: bool = True
+    # Name of a skill the triage stage matched to this message, or None.
+    # Ephemeral — this drives per-turn skill activation only; it doesn't
+    # persist anywhere. Orchestrator ignores it when an explicit skill is
+    # already pinned. Defaults to None for back-compat with older callers.
+    matched_skill: str | None = None
 
 
 @dataclass

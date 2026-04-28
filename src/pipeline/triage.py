@@ -13,7 +13,7 @@ from src.session.models import TriageResult, Turn
 
 log = logging.getLogger(__name__)
 
-TRIAGE_PROMPT = """\
+TRIAGE_PROMPT_BASE = """\
 You are a triage classifier for a personal AI assistant's memory system.
 Given a user message and recent conversation context, classify the intent and output search parameters.
 
@@ -28,7 +28,8 @@ Respond with ONLY valid JSON, no other text:
     "result_count": <int, 3-10>,
     "weight_recency": <float, 0.0-1.0 — high for recall, low for preferences>,
     "mmr_lambda": <float, 0.5-0.9 — diversity vs relevance tradeoff>
-  }
+  },
+  "matched_skill": <string or null>
 }
 
 Intent definitions:
@@ -52,6 +53,44 @@ Search parameter guidelines:
 - question: moderate decay (30 days), moderate recency (0.5), moderate results (5)
 - social: set needs_memory=false unless referencing something specific\
 """
+
+_SKILLS_PROMPT_TEMPLATE = """\
+
+Skills available — reusable instruction bundles the assistant can activate for
+specialized tasks. If (and only if) the current message clearly calls for one
+of them, set `matched_skill` to that skill's exact name. Otherwise set it to
+null. Strongly prefer null over a weak or uncertain match — a wrong skill is
+worse than no skill.
+
+Guidelines for matching:
+- The user's CURRENT intent must match the skill's purpose, not merely touch
+  the topic. Asking "what's a Substack Note?" is a question (null), not a
+  substack-writer job.
+- Recent conversation context can clarify intent — if the last few turns are
+  about drafting a blog post, a message like "cut the third paragraph" is
+  still blog-writing.
+- Skills are opt-in for generative work. Never match a skill for greetings,
+  small talk, debugging the bot itself, or meta-questions about the system.
+
+Available skills:
+{catalog}
+"""
+
+
+def _build_prompt(skills: list[tuple[str, str]] | None) -> str:
+    """Compose the triage prompt. Skill catalog is appended only when
+    skills are available so a zero-skill install keeps the original prompt
+    shape (and token count)."""
+    if not skills:
+        # Keep behavior identical to pre-skill triage — same prompt text.
+        # Return the base unmodified so unrelated tests stay stable.
+        return TRIAGE_PROMPT_BASE.replace(
+            ',\n  "matched_skill": <string or null>', ""
+        )
+    catalog_lines = [f"- {name}: {desc or '(no description)'}" for name, desc in skills]
+    return TRIAGE_PROMPT_BASE + _SKILLS_PROMPT_TEMPLATE.format(
+        catalog="\n".join(catalog_lines)
+    )
 
 
 def _format_triage_input(message: str, recent_turns: list[Turn]) -> str:
@@ -79,14 +118,28 @@ def _default_triage() -> TriageResult:
     )
 
 
-def _parse_triage_response(response: str) -> TriageResult:
-    """Parse JSON response from triage model, with fallback defaults."""
+def _parse_triage_response(
+    response: str, available_skills: set[str] | None = None
+) -> TriageResult:
+    """Parse JSON response from triage model, with fallback defaults.
+
+    `available_skills` is used to validate matched_skill — if Haiku
+    returns a name that doesn't match any real skill (hallucination or
+    case mismatch), we drop it to None rather than trust it.
+    """
     from src.pipeline.json_utils import extract_json
 
     data = extract_json(response)
     if data is None:
         log.warning(f"Triage parse failed, using defaults (response: {response[:100]!r})")
         return _default_triage()
+
+    matched = data.get("matched_skill")
+    if matched is not None:
+        matched = str(matched).strip() or None
+    if matched and available_skills is not None and matched not in available_skills:
+        log.info(f"Triage returned unknown skill {matched!r}; discarding")
+        matched = None
 
     return TriageResult(
         intent=data.get("intent", "question"),
@@ -98,6 +151,7 @@ def _parse_triage_response(response: str) -> TriageResult:
             "mmr_lambda": 0.7,
         }),
         needs_memory=data.get("needs_memory", True),
+        matched_skill=matched,
     )
 
 
@@ -108,17 +162,29 @@ async def triage(
     auth_mode: str = "max",
     api_key: str = "",
     cli_path: str = "",
+    skills: list[tuple[str, str]] | None = None,
 ) -> TriageResult:
-    """Run triage classification on a user message."""
+    """Run triage classification on a user message.
+
+    `skills` is an optional catalog of (name, description) tuples.
+    When provided, the prompt asks Haiku to also return a matched_skill
+    (or null) — enables the adaptive-skill activation feature without
+    any second model call.
+    """
     client = SingleTurnClient(model=model, auth_mode=auth_mode, api_key=api_key, cli_path=cli_path)
     input_text = _format_triage_input(message, recent_turns)
+    prompt = _build_prompt(skills)
+    available = {name for name, _ in skills} if skills else None
 
     try:
-        response = await client.query(TRIAGE_PROMPT, input_text)
-        result = _parse_triage_response(response)
-        log.info(f"Triage: intent={result.intent}, complexity={result.complexity}, "
-                 f"needs_memory={result.needs_memory}")
+        response = await client.query(prompt, input_text)
+        result = _parse_triage_response(response, available_skills=available)
+        skill_note = f", skill={result.matched_skill!r}" if result.matched_skill else ""
+        log.info(
+            f"Triage: intent={result.intent}, complexity={result.complexity}, "
+            f"needs_memory={result.needs_memory}{skill_note}"
+        )
         return result
     except Exception as e:
         log.error(f"Triage failed: {e}")
-        return _parse_triage_response("")  # returns defaults
+        return _parse_triage_response("", available_skills=available)  # returns defaults

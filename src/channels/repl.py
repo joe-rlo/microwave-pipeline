@@ -103,6 +103,8 @@ class REPLChannel(Channel):
         print(f"\n  --- pipeline ---")
         if meta.triage:
             print(f"  triage: {meta.triage.intent} ({meta.triage.complexity})")
+            if meta.triage.matched_skill:
+                print(f"  matched skill: {meta.triage.matched_skill}")
         if meta.escalated:
             print(f"  escalated: {meta.escalated_model}")
         if meta.search:
