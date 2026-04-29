@@ -24,6 +24,8 @@ from telegram.ext import Application, MessageHandler, CommandHandler, filters
 from src.channels.base import Channel
 from src.channels.telegram_format import markdown_to_telegram_html
 from src.pipeline.orchestrator import Orchestrator
+from src.projects.bible import handle_bible_command
+from src.projects.chat import handle_project_command
 from src.skills.chat import handle_skill_command
 
 log = logging.getLogger(__name__)
@@ -60,6 +62,9 @@ class TelegramChannel(Channel):
         self.app.add_handler(CommandHandler("stats", self._cmd_stats))
         self.app.add_handler(CommandHandler("skill", self._cmd_skill))
         self.app.add_handler(CommandHandler("skills", self._cmd_skills))
+        self.app.add_handler(CommandHandler("project", self._cmd_project))
+        self.app.add_handler(CommandHandler("projects", self._cmd_projects))
+        self.app.add_handler(CommandHandler("bible", self._cmd_bible))
 
         # Document handler (files sent as attachments)
         self.app.add_handler(MessageHandler(filters.Document.ALL, self._on_document))
@@ -216,6 +221,19 @@ class TelegramChannel(Channel):
                     await context.bot.send_document(
                         chat_id, document=file_buf, filename=chunk["name"]
                     )
+
+                elif chunk["type"] == "file_written":
+                    # Active-project file landed on disk — send a short note.
+                    name = chunk.get("name", "?")
+                    words = chunk.get("word_count", 0)
+                    preview = (chunk.get("preview") or "").split("\n", 1)[0]
+                    body = f"<i>✓ wrote <code>{name}</code> ({words:,} words)</i>"
+                    if preview:
+                        body += f"\n\n<blockquote>{preview}</blockquote>"
+                    try:
+                        await context.bot.send_message(chat_id, body, parse_mode="HTML")
+                    except Exception as e:
+                        log.debug(f"file_written note failed: {e}")
 
                 elif chunk["type"] == "text_replace":
                     # File extraction cleaned the response — update accumulated text
@@ -424,6 +442,25 @@ class TelegramChannel(Channel):
 
     async def _cmd_skills(self, update: Update, context) -> None:
         reply = handle_skill_command("/skills", self.orchestrator)
+        if reply:
+            await update.message.reply_text(reply)
+
+    async def _cmd_project(self, update: Update, context) -> None:
+        arg = " ".join(context.args) if context.args else ""
+        text = f"/project {arg}".rstrip()
+        reply = handle_project_command(text, self.orchestrator)
+        if reply:
+            await update.message.reply_text(reply)
+
+    async def _cmd_projects(self, update: Update, context) -> None:
+        reply = handle_project_command("/projects", self.orchestrator)
+        if reply:
+            await update.message.reply_text(reply)
+
+    async def _cmd_bible(self, update: Update, context) -> None:
+        arg = " ".join(context.args) if context.args else ""
+        text = f"/bible {arg}".rstrip()
+        reply = handle_bible_command(text, self.orchestrator)
         if reply:
             await update.message.reply_text(reply)
 

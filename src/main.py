@@ -149,6 +149,9 @@ def main() -> None:
     if len(sys.argv) >= 2 and sys.argv[1] == "skills":
         from src.skills.cli import skills_cli
         sys.exit(skills_cli(sys.argv[2:]))
+    if len(sys.argv) >= 2 and sys.argv[1] == "projects":
+        from src.projects.cli import projects_cli
+        sys.exit(projects_cli(sys.argv[2:]))
 
     parser = argparse.ArgumentParser(description="MicrowaveOS — cognitive agent runtime")
     parser.add_argument("--telegram", action="store_true", help="Run Telegram bot")

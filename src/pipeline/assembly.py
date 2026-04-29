@@ -21,6 +21,21 @@ log = logging.getLogger(__name__)
 PROMOTION_THRESHOLD = 3  # retrievals across different sessions
 
 
+_LENGTH_HINTS = {
+    "simple": (
+        "[Response length] The user's message is simple — match its brevity. "
+        "Aim for under ~50 words. One short paragraph or a single line is "
+        "often right. No preamble, no signoff. Don't pad."
+    ),
+    "complex": (
+        "[Response length] The user is asking for depth — take whatever space "
+        "the answer needs. Develop the argument, walk through the steps, "
+        "show the reasoning. Don't artificially compress."
+    ),
+    # 'moderate' adds no hint — that's the default response calibration.
+}
+
+
 def assemble(
     search_result: SearchResult,
     memory_store: MemoryStore,
@@ -28,10 +43,17 @@ def assemble(
     channel: str | None = None,
     output_dir: str = "",
     active_skill: Skill | None = None,
+    complexity: str = "moderate",
+    bible_path=None,
 ) -> AssemblyResult:
     """Assemble stable and dynamic context for this turn."""
-    # Build stable context (for reconnect if needed)
-    stable_prompt = memory_store.assemble_stable_context(channel=channel)
+    # Build stable context (for reconnect if needed). If a project is
+    # active, its BIBLE.md joins the stable prompt — that way per-project
+    # canon is in front of the LLM for the whole session, not retrieved
+    # piecemeal each turn.
+    stable_prompt = memory_store.assemble_stable_context(
+        channel=channel, bible_path=bible_path
+    )
 
     # Build dynamic context: datetime + capabilities + retrieved fragments
     # Datetime goes here (not in stable prompt) so it doesn't trigger reconnects
@@ -107,6 +129,12 @@ def assemble(
     fragments_text = _format_fragments(search_result.fragments)
     if fragments_text:
         dynamic_parts.append(fragments_text)
+
+    # Length hint goes LAST so it's the most-recent rule the LLM reads —
+    # closest to the user message, hardest to forget while writing.
+    length_hint = _LENGTH_HINTS.get(complexity)
+    if length_hint:
+        dynamic_parts.append(length_hint)
 
     memory_context = "\n\n".join(dynamic_parts)
 

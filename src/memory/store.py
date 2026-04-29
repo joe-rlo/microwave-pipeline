@@ -94,8 +94,18 @@ class MemoryStore:
 
     # --- Stable context assembly ---
 
-    def assemble_stable_context(self, channel: str | None = None) -> str:
+    def assemble_stable_context(
+        self,
+        channel: str | None = None,
+        bible_path=None,
+    ) -> str:
         """Build the stable system prompt from identity + memory + daily notes + channel rules.
+
+        When `bible_path` is provided and points to an existing file, the
+        active project's BIBLE.md is appended as a labeled section. That
+        way per-project canon (characters, world, established facts) is
+        in the system prompt for the whole session — the LLM never
+        contradicts it without retrieval cost.
 
         NOTE: Current datetime is NOT included here — it changes every turn
         and would cause unnecessary reconnects. It goes in dynamic context instead.
@@ -120,13 +130,28 @@ class MemoryStore:
         if daily:
             sections.append(daily)
 
+        if bible_path is not None and bible_path.is_file():
+            try:
+                bible = bible_path.read_text(encoding="utf-8").strip()
+            except Exception:
+                bible = ""
+            if bible:
+                sections.append(
+                    f"[Project bible — {bible_path.parent.name}]\n{bible}"
+                )
+
         return "\n\n---\n\n".join(sections)
 
-    def stable_context_mtime(self, channel: str | None = None) -> float:
+    def stable_context_mtime(
+        self, channel: str | None = None, bible_path=None
+    ) -> float:
         """Return the latest mtime across files that make up stable context.
 
         Used to detect real changes (write-back, day rollover) without
         comparing prompt strings that include volatile data.
+
+        Includes the active project's BIBLE.md when given — that's how
+        `/bible add` updates propagate without an explicit reconnect call.
         """
         mtimes = []
         for path in [self.identity_path, self.memory_path]:
@@ -143,4 +168,7 @@ class MemoryStore:
             day_path = self.daily_path(today - timedelta(days=i))
             if day_path.exists():
                 mtimes.append(day_path.stat().st_mtime)
+        # Project bible
+        if bible_path is not None and bible_path.is_file():
+            mtimes.append(bible_path.stat().st_mtime)
         return max(mtimes) if mtimes else 0.0

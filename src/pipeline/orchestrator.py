@@ -21,6 +21,7 @@ from src.pipeline.assembly import assemble, promote_fragments
 from src.pipeline.reflection import reflect
 from src.pipeline.search import search
 from src.pipeline.triage import triage
+from src.projects import Project, ProjectLoader, ProjectNotFound
 from src.session.engine import SessionEngine
 from src.session.models import PipelineMetadata, Turn
 from src.skills import Skill, SkillLoader, SkillNotFound
@@ -45,6 +46,15 @@ class Orchestrator:
         # per-orchestrator (one active at a time in v1).
         self.skill_loader: SkillLoader | None = None
         self._active_skill: Skill | None = None
+
+        # Projects — same shape as skills. The active project's BIBLE.md
+        # joins the stable prompt; its declared skill auto-activates;
+        # file output routes to its drafts/ directory.
+        self.project_loader: ProjectLoader | None = None
+        self._active_project: Project | None = None
+        # Set when active project changes — process() reconnects on the
+        # next turn so BIBLE.md updates propagate without a sync API.
+        self._project_changed: bool = False
 
     async def start(self, channel: str = "repl") -> None:
         """Initialize all components and connect."""
@@ -79,6 +89,11 @@ class Orchestrator:
         skills_dir.mkdir(parents=True, exist_ok=True)
         self.skill_loader = SkillLoader(skills_dir)
 
+        # Projects — same auto-create pattern
+        projects_dir = self.config.workspace_dir / "projects"
+        projects_dir.mkdir(parents=True, exist_ok=True)
+        self.project_loader = ProjectLoader(projects_dir)
+
         # LLM client — with sandboxed output directory for file creation
         self.llm = LLMClient(
             model=self.config.model_main,
@@ -88,9 +103,16 @@ class Orchestrator:
             output_dir=str(self.config.output_dir),
         )
 
-        # Assemble stable context and connect
-        stable_prompt = self.memory_store.assemble_stable_context(channel=self._channel)
-        self._stable_mtime = self.memory_store.stable_context_mtime(channel=self._channel)
+        # Assemble stable context and connect. Active project's BIBLE.md
+        # (if set) joins the stable prompt — but at start() there's no
+        # active project yet, so this is just identity + memory + channels.
+        bible_path = self._active_bible_path()
+        stable_prompt = self.memory_store.assemble_stable_context(
+            channel=self._channel, bible_path=bible_path
+        )
+        self._stable_mtime = self.memory_store.stable_context_mtime(
+            channel=self._channel, bible_path=bible_path
+        )
         await self.llm.connect(stable_prompt)
 
         # Index workspace files into the memory fragment store
@@ -189,6 +211,7 @@ class Orchestrator:
         search_result = await search(message, triage_result, self.searcher)
 
         # --- Stage 3: Assembly ---
+        bible_path = self._active_bible_path()
         assembly_result = assemble(
             search_result,
             self.memory_store,
@@ -196,14 +219,25 @@ class Orchestrator:
             channel=self._channel,
             output_dir=str(self.config.output_dir),
             active_skill=turn_skill,
+            complexity=triage_result.complexity,
+            bible_path=bible_path,
         )
 
-        # Reconnect only if underlying files actually changed on disk
-        current_mtime = self.memory_store.stable_context_mtime(channel=self._channel)
-        if current_mtime > self._stable_mtime:
-            log.info("Stable context files changed on disk, reconnecting LLM")
+        # Reconnect when (a) project changed since last turn, or (b) any
+        # stable-context file is newer than last reconnect. Project changes
+        # don't go through mtime — the user could switch from a freshly-
+        # edited bible to a stale one — so we track them with a flag.
+        current_mtime = self.memory_store.stable_context_mtime(
+            channel=self._channel, bible_path=bible_path
+        )
+        if self._project_changed or current_mtime > self._stable_mtime:
+            log.info(
+                "Stable context changed (%s), reconnecting LLM",
+                "project switch" if self._project_changed else "files on disk",
+            )
             await self.llm.reconnect(assembly_result.stable_prompt)
             self._stable_mtime = current_mtime
+            self._project_changed = False
 
         # --- LLM Generation ---
         # Snapshot output dir before generation to detect new files
@@ -290,7 +324,21 @@ class Orchestrator:
         if file_blocks:
             log.info(f"Extracted {len(file_blocks)} file(s) from response text")
             for fb in file_blocks:
-                yield {"type": "file", "name": fb.name, "content": fb.content}
+                # When a project is active, drafts/code/HTML go to the
+                # project's drafts/ directory on disk instead of riding
+                # along as an attachment. The channel surfaces a preview
+                # so the user knows where it landed.
+                wrote_to = self._write_to_project_drafts(fb.name, fb.content)
+                if wrote_to is not None:
+                    yield {
+                        "type": "file_written",
+                        "path": str(wrote_to),
+                        "name": wrote_to.name,
+                        "preview": _preview(fb.content),
+                        "word_count": len(fb.content.split()),
+                    }
+                else:
+                    yield {"type": "file", "name": fb.name, "content": fb.content}
             full_response = cleaned_text
             # Tell channels to replace their accumulated text with the cleaned version
             yield {"type": "text_replace", "text": cleaned_text}
@@ -509,6 +557,149 @@ class Orchestrator:
         except Exception as e:
             log.warning(f"History injection failed (non-fatal): {e}")
 
+    # --- Project management (called by channel command handlers) ---
+
+    def _active_bible_path(self):
+        """Return the active project's BIBLE.md Path, or None."""
+        if self._active_project is None:
+            return None
+        return self._active_project.bible_path
+
+    def set_active_project(self, name: str) -> Project:
+        """Activate a writing project. Auto-activates its declared skill,
+        marks the LLM session for reconnect on next turn, and indexes the
+        project's text files into the fragment store so they're retrievable.
+        """
+        if not self.project_loader:
+            raise RuntimeError("Orchestrator not started")
+        project = self.project_loader.load(name)
+        self._active_project = project
+        self._project_changed = True
+
+        # Auto-activate the project's declared skill
+        if project.skill and self.skill_loader:
+            try:
+                self._active_skill = self.skill_loader.load(project.skill)
+                log.info(f"Auto-activated skill {project.skill!r} for project {name!r}")
+            except SkillNotFound:
+                log.warning(
+                    f"Project {name!r} declares skill {project.skill!r} "
+                    f"but it's not on disk; ignoring"
+                )
+
+        # Index project files so retrieval can surface relevant chunks.
+        # Best-effort — don't let an indexing failure block activation.
+        try:
+            self._index_project_files(project)
+        except Exception as e:
+            log.warning(f"Project file indexing failed for {name!r}: {e}")
+
+        log.info(f"Active project set: {name!r} ({project.type})")
+        return project
+
+    def clear_active_project(self) -> None:
+        if self._active_project is not None:
+            log.info(f"Active project cleared (was {self._active_project.name!r})")
+        self._active_project = None
+        self._project_changed = True
+        # Don't auto-clear active_skill — user may want the skill kept on
+        # for a follow-up turn even after leaving the project.
+
+    def get_active_project(self) -> Project | None:
+        return self._active_project
+
+    def list_projects(self) -> list[Project]:
+        if not self.project_loader:
+            return []
+        return self.project_loader.list_all()
+
+    def _write_to_project_drafts(self, suggested_name: str, content: str):
+        """Write a file the LLM produced to the active project's drafts/.
+
+        Returns the Path written to, or None if no project is active.
+        Picks a sensible filename: novels number chapter-NN.md sequentially,
+        screenplays append into the single FOUNTAIN file when it already
+        exists, blogs default to draft.md (overwriting if the LLM wrote
+        the same name).
+        """
+        project = self._active_project
+        if project is None or project.drafts_dir is None:
+            return None
+        project.drafts_dir.mkdir(parents=True, exist_ok=True)
+
+        target = self._pick_draft_filename(project, suggested_name)
+        if project.type == "screenplay" and target.suffix == ".fountain":
+            # Append additional scenes to the same file rather than
+            # creating screenplay-2.fountain etc.
+            existing = ""
+            if target.is_file():
+                existing = target.read_text(encoding="utf-8").rstrip()
+            joined = (existing + "\n\n" + content.strip()) if existing else content.strip()
+            target.write_text(joined + "\n", encoding="utf-8")
+        else:
+            target.write_text(content, encoding="utf-8")
+
+        log.info(f"Wrote {target} ({len(content.split())} words)")
+        # Re-index so the new content is searchable on the next turn
+        try:
+            if self.memory_index and self.config.openai_api_key:
+                self.memory_index.index_file(target, force=True)
+        except Exception as e:
+            log.warning(f"Failed to index new draft {target.name}: {e}")
+        return target
+
+    def _pick_draft_filename(self, project: Project, suggested: str):
+        """Pick a path under project.drafts_dir for new content.
+
+        Honors the LLM's suggested name when it's project-appropriate;
+        otherwise picks a default based on project type.
+        """
+        from pathlib import Path
+        drafts = project.drafts_dir
+        suggested_path = Path(suggested).name  # strip any directory parts
+
+        if project.type == "novel":
+            # Force chapter-NN.md naming. If the LLM suggested chapter-04.md,
+            # honor it; otherwise pick the next sequence number.
+            import re as _re
+            m = _re.match(r"chapter[-_ ]?(\d+)", suggested_path, _re.IGNORECASE)
+            if m:
+                return drafts / f"chapter-{int(m.group(1)):02d}.md"
+            existing = sorted(drafts.glob("chapter-*.md"))
+            next_n = len(existing) + 1
+            return drafts / f"chapter-{next_n:02d}.md"
+
+        if project.type == "screenplay":
+            # Single FOUNTAIN file per screenplay. New scenes append.
+            return drafts / "screenplay.fountain"
+
+        # Blog and anything else: honor the suggested name, default to draft.md.
+        if suggested_path and suggested_path.lower() != "response.md":
+            return drafts / suggested_path
+        return drafts / "draft.md"
+
+    def _index_project_files(self, project: Project) -> None:
+        """Chunk and index the project's drafts, bible, and outline so
+        memory search can surface them when the user references the work."""
+        if not self.memory_index or not self.config.openai_api_key:
+            return
+        files: list = []
+        if project.bible_path and project.bible_path.is_file():
+            files.append(project.bible_path)
+        if project.outline_path and project.outline_path.is_file():
+            files.append(project.outline_path)
+        if project.drafts_dir and project.drafts_dir.is_dir():
+            for p in project.drafts_dir.iterdir():
+                if p.is_file() and p.suffix in (".md", ".fountain", ".txt"):
+                    files.append(p)
+        for path in files:
+            try:
+                n = self.memory_index.index_file(path)
+                if n > 0:
+                    log.info(f"Indexed {n} fragments from {path.name}")
+            except Exception as e:
+                log.warning(f"Failed to index project file {path.name}: {e}")
+
     # --- Skill management (called by channel command handlers) ---
 
     def set_active_skill(self, name: str) -> Skill:
@@ -559,6 +750,14 @@ class Orchestrator:
         if self.session_engine:
             self.session_engine.close()
         log.info("Orchestrator stopped")
+
+
+def _preview(content: str, max_chars: int = 240) -> str:
+    """Short preview of content the LLM wrote, for the channel reply."""
+    text = content.strip()
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 1].rstrip() + "…"
 
 
 def _snapshot_dir(path: Path) -> dict[str, float]:

@@ -12,6 +12,8 @@ from pathlib import Path
 
 from src.channels.base import Channel
 from src.pipeline.orchestrator import Orchestrator
+from src.projects.bible import handle_bible_command
+from src.projects.chat import handle_project_command
 from src.skills.chat import handle_skill_command
 
 log = logging.getLogger(__name__)
@@ -60,10 +62,19 @@ class REPLChannel(Channel):
                     self._print_metadata(self._last_metadata)
                     continue
 
-                # Skill commands short-circuit before the pipeline.
-                skill_reply = handle_skill_command(line, self.orchestrator)
-                if skill_reply is not None:
-                    print(f"\n{skill_reply}")
+                # Skill / project / bible commands short-circuit the pipeline.
+                for handler in (
+                    handle_skill_command,
+                    handle_project_command,
+                    handle_bible_command,
+                ):
+                    reply = handler(line, self.orchestrator)
+                    if reply is not None:
+                        print(f"\n{reply}")
+                        break
+                else:
+                    reply = None
+                if reply is not None:
                     continue
 
                 # Process through pipeline
@@ -79,6 +90,13 @@ class REPLChannel(Channel):
                         out_path.parent.mkdir(parents=True, exist_ok=True)
                         out_path.write_text(chunk["content"])
                         print(f"\n  [wrote {out_path}]", flush=True)
+                    elif chunk["type"] == "file_written":
+                        # Active project — orchestrator already wrote to disk.
+                        print(
+                            f"\n  [✓ wrote {chunk.get('path')} "
+                            f"({chunk.get('word_count', 0):,} words)]",
+                            flush=True,
+                        )
                     elif chunk["type"] == "metadata":
                         self._last_metadata = chunk["pipeline"]
                         if self.show_metadata:

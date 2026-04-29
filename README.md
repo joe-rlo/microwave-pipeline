@@ -112,6 +112,11 @@ python3 src/main.py scheduler run <name>
 python3 src/main.py skills list
 python3 src/main.py skills new <name> --description "..."
 python3 src/main.py skills edit <name>
+
+# Projects management (no daemon required)
+python3 src/main.py projects list
+python3 src/main.py projects new <name> --type blog|novel|screenplay
+python3 src/main.py projects show <name>
 ```
 
 ## Customization
@@ -262,7 +267,74 @@ microwaveos skills edit <name>            # opens in $EDITOR
 microwaveos skills remove <name>          # asks for confirmation
 ```
 
-Seed skills shipped with v1: `substack-writer`, `blog-writing`, `github-tool`.
+Seed skills shipped with v1: `substack-writer`, `blog-writing`, `github-tool`, `novel-writing`, `screenplay-writing`.
+
+**Adaptive activation.** Triage classifies every message and *also* picks a matching skill from your catalog. If you say "draft a Substack about NEAR's Q2 metrics," `substack-writer` auto-activates for that turn — no need to type `/skill`. Auto-match is per-turn and ephemeral; explicit `/skill <name>` always wins as a sticky pin. Triage uses the description field on each skill, so write descriptions that tell the LLM when *not* to match (the seed skills include "skip when X" guards). `/debug` shows whether a skill auto-matched.
+
+### Writing projects — `workspace/projects/`
+
+Projects are per-assignment workspaces for ongoing writing — a blog post, a novel, a screenplay. Where skills define *how* to write (voice, format, anti-patterns), projects define *what* you're working on (characters, outline, prior chapters). Activating a project auto-loads its declared skill, joins its `BIBLE.md` to the system prompt, indexes its drafts into memory, and routes new file output to the project's `drafts/` directory.
+
+**Three project types, each with its own scaffold:**
+
+| Type | Layout | Default skill | File output |
+|------|--------|---------------|-------------|
+| `blog` | `outline.md`, `drafts/draft.md` | `blog-writing` | LLM-suggested name, `drafts/draft.md` default |
+| `novel` | `BIBLE.md`, `outline.md`, `drafts/chapter-NN.md` | `novel-writing` | sequential `chapter-NN.md` |
+| `screenplay` | `BIBLE.md`, `outline.md`, `drafts/screenplay.fountain` | `screenplay-writing` | scenes append into single FOUNTAIN file (Highland-compatible) |
+
+`PROJECT.md` carries the metadata:
+
+```markdown
+---
+name: the-heist
+type: novel
+skill: novel-writing
+status: drafting          # drafting | revising | paused | done | archived
+description: >
+  Sarah pulls one last job before her sister's wedding.
+target_words: 80000
+created: 2026-04-28
+---
+
+## Voice notes
+First-person, present tense. Sarah's POV throughout.
+British spellings ("colour", "realise").
+```
+
+**Activation in chat** (REPL, Telegram, Signal):
+
+```
+/project the-heist           # activate; auto-loads novel-writing skill
+/project status              # word count, draft count, BIBLE/outline status
+/project off                 # deactivate
+/projects                    # list all with status + word counts
+```
+
+**File output flow.** When the bot drafts a chapter, the orchestrator writes it to `drafts/chapter-NN.md` and the channel sends a small confirmation: `✓ wrote chapter-04.md (1,247 words)` plus the opening line as a quote-block preview. No wall of text in chat — open the file in your editor of choice (Highland for screenplays, anything for prose). The new file is also re-indexed immediately, so the next turn's retrieval can reference it.
+
+**BIBLE flow** (novels and screenplays). The novel/screenplay skills tell the LLM to surface "Possibly new for BIBLE" at the end of any draft that introduces named entities. You commit them with:
+
+```
+/bible add Walsh tall, weary, twists his wedding ring when nervous
+/bible add "Detective Walsh" same as above but multi-word names need quotes
+/bible show               # print current BIBLE.md
+```
+
+Bible writes are user-approved on purpose — auto-writing risks polluting canonical state with mid-draft inventions you haven't endorsed. After a `/bible add`, the next turn picks up the change automatically (mtime-based reconnect).
+
+**CLI:**
+
+```bash
+microwaveos projects list
+microwaveos projects new the-heist --type novel --description "Last job"
+microwaveos projects show the-heist          # status, words, drafts list
+microwaveos projects edit the-heist          # opens PROJECT.md in $EDITOR
+microwaveos projects archive blog-q1-recap   # moves under .archived/
+microwaveos projects remove dead-project     # irreversible (asks for confirmation)
+```
+
+**Switching context.** Blogs can run in parallel with each other (research, drafts, multiple posts) but long-form work is one-at-a-time — switching projects forces an LLM reconnect on the next turn so the new bible cleanly replaces the old one. Skills stay attached to their project; deactivating a project doesn't auto-clear the skill (you might want to keep `novel-writing` rules for a follow-up turn even after stepping out of the project).
 
 ### Model selection
 
@@ -339,8 +411,22 @@ ESCALATION_EFFORT=high   # thinking budget
 |---------|-------------|
 | REPL | stdin/stdout, `/debug` shows pipeline metadata |
 | Telegram | Typing indicators, streaming via message edits, HTML-file attachments for tables/charts |
-| Signal | Typing indicators, read receipts, voice-message transcription (Whisper), HTML card-view attachments |
+| Signal | Typing indicators, read receipts, voice-message transcription (Whisper), HTML card-view attachments, debounce + interrupt |
 | HTTP | `POST /chat` returns JSON with response + pipeline stats |
+
+### Conversational behavior
+
+A few features tune how the bot reads and responds across multi-message bursts. They mostly live on the Signal channel today (where messaging is bursty by nature) but the assembly-layer changes apply everywhere.
+
+**Debounce + coalesce (Signal).** Back-to-back messages within a 2.5s window are buffered and combined into one pipeline run. Send "tell me about NEAR" then "specifically the Q2 dev metrics" half a second later → the bot sees both as one input and replies once, coherently. Without this, each message would race the other through the pipeline against the same SDK session and produce two unrelated replies. Tunable via `DEBOUNCE_SECONDS` at the top of `src/channels/signal.py`.
+
+**Typing-indicator awareness (Signal).** When you start typing, the debounce timer pauses — the bot doesn't fire mid-compose. When you stop typing, a fresh debounce window starts. A 60s max-hold timer guarantees a stuck "typing forever" doesn't strand input forever.
+
+**Streaming interrupt (Signal).** A new message arriving while the bot is mid-reply cancels the in-flight LLM call and starts over with the combined input. Already-sent reply chunks stay sent (Signal's REST bridge has no clean delete API), but no further chunks from the stale run land. Closest to how humans actually talk over each other.
+
+**Adaptive response length (all channels).** Triage's `simple` / `moderate` / `complex` classification flows into a length hint at the end of the dynamic context. Simple messages get "match the brevity, ~50 words, no preamble." Complex gets "develop fully, take the space you need." Moderate gets no hint — that's the default. Fixes the "thanks" → 200-word essay problem.
+
+**Skill commands stay instant.** `/skill`, `/project`, `/bible` etc. bypass the debounce buffer entirely so they don't pay the 2.5s penalty. They're meant to feel like UI, not conversation.
 
 ### Signal setup
 
@@ -443,6 +529,13 @@ python3 src/main.py scheduler run substack-notes
 │   │   └── http.md
 │   ├── skills/            # reusable instruction bundles
 │   │   └── <name>/SKILL.md[, fetch.py]
+│   ├── projects/          # writing assignments — blog/novel/screenplay
+│   │   └── <name>/
+│   │       ├── PROJECT.md
+│   │       ├── BIBLE.md         # novels + screenplays
+│   │       ├── outline.md
+│   │       ├── drafts/          # chapter-NN.md or screenplay.fountain
+│   │       └── notes/
 │   ├── memory/            # daily notes
 │   └── output/            # files the LLM writes via SDK tool use
 └── data/
@@ -453,18 +546,24 @@ The `workspace/` directory in the project root is for development. In production
 
 ## Commands
 
-In-chat commands (REPL, Telegram, and Signal all support the skill commands):
+In-chat commands (REPL, Telegram, and Signal all support the skill / project / bible commands):
 
 | Command | Where | Description |
 |---------|-------|-------------|
-| `/debug` | REPL, Telegram | Triage/search/reflection stats for the last message |
+| `/debug` | REPL, Telegram | Triage/search/reflection stats for the last message (includes auto-matched skill) |
 | `/new` | REPL, Telegram | Start a fresh session (wipes conversation context, keeps memory) |
 | `/memory` | Telegram | Show MEMORY.md contents |
 | `/status` | Telegram | Session info, auth mode, model |
-| `/skill <name>` | all | Activate a skill for subsequent turns |
-| `/skill off` | all | Deactivate the current skill (also `none`, `clear`) |
-| `/skill` | all | Show which skill is currently active |
+| `/skill <name>` | all | Activate a skill (sticky pin — overrides auto-match) |
+| `/skill off` | all | Deactivate the pinned skill (also `none`, `clear`) |
+| `/skill` | all | Show which skill is currently pinned |
 | `/skills` | all | List every available skill |
+| `/project <name>` | all | Activate a writing project — auto-loads its skill, joins BIBLE to system prompt |
+| `/project status` | all | Detailed status (word count, drafts, BIBLE) |
+| `/project off` | all | Deactivate the active project |
+| `/projects` | all | List every project with status |
+| `/bible add <name> [description]` | all | Append an entry to the active project's BIBLE.md |
+| `/bible show` | all | Print the active project's BIBLE.md |
 | `exit` / `quit` | REPL | Stop the REPL |
 
 Scheduler CLI (runs without the daemon):
@@ -486,6 +585,17 @@ Skills CLI (runs without the daemon):
 | `skills new <name>` | Scaffold a skill directory with a template SKILL.md |
 | `skills edit <name>` | Open the skill's SKILL.md in `$EDITOR` |
 | `skills remove <name>` | Delete a skill directory (asks for confirmation) |
+
+Projects CLI (runs without the daemon):
+
+| Command | Description |
+|---------|-------------|
+| `projects list` | Show every project with type, status, word count |
+| `projects show <name>` | Detailed view: drafts, BIBLE/outline status, voice notes |
+| `projects new <name> --type blog\|novel\|screenplay` | Scaffold a new project with type-appropriate layout |
+| `projects edit <name>` | Open the project's PROJECT.md in `$EDITOR` |
+| `projects archive <name>` | Move under `.archived/` (reversible by hand) |
+| `projects remove <name>` | Permanently delete a project (asks for confirmation) |
 
 ### Telegram file handling
 
@@ -510,10 +620,13 @@ Microwave can't take actions mid-conversation — no live web search, no code ex
 The one exception is **scheduler pre-fetch**: a skill can ship a `fetch.py` that the scheduler awaits *before* the LLM call, and the result is prepended to the prompt. That's how the seed `github-tool` skill pulls fresh `gh pr list` data for its weekly digests. It's a batch-mode shortcut, not real tool use — the LLM still can't call things during a turn.
 
 ### Single user per channel
-The orchestrator holds one session at a time. If multiple Telegram users message the bot, their conversations share the same LLM session and can bleed into each other. Fine for personal use, not safe for multi-user deployment.
+The orchestrator holds one session at a time. If multiple Telegram users message the bot, their conversations share the same LLM session and can bleed into each other. Fine for personal use, not safe for multi-user deployment. (Signal's debounce buffer is per-sender, so quick bursts coalesce correctly per user — but the underlying SDK session is still one shared instance.)
 
 ### No concurrent requests
-Messages are processed sequentially. If two messages arrive at the same time (e.g. Telegram group chat), the second waits for the first to finish. No request queue or parallelism.
+Messages are processed sequentially. If two messages arrive at the same time, the second waits for the first to finish. The Signal channel cancels in-flight pipeline calls when the same user sends a new message (streaming interrupt), but doesn't run multiple users' turns in parallel.
+
+### Project search isn't tagged
+Active-project drafts are indexed into the same fragment table as global memory. Retrieval doesn't prefer active-project fragments over global ones, so a character named "Sarah" in your novel project might cross-pollinate with a "Sarah" mentioned in a Substack draft. Worth knowing if you have multiple projects with overlapping names.
 
 ### Memory is append-only
 MEMORY.md and daily notes grow but never shrink automatically. There's no garbage collection, no forgetting, no contradiction resolution. If you tell Microwave your dog's name is Biscuit and later say it's Max, both facts persist. Manual editing is the only cleanup path.

@@ -15,6 +15,8 @@ import asyncio
 import base64
 import json
 import logging
+import time
+from dataclasses import dataclass, field
 from urllib.parse import quote
 
 import aiohttp
@@ -22,6 +24,8 @@ import aiohttp
 from src.channels.base import Channel
 from src.channels.signal_format import markdown_to_signal_text
 from src.pipeline.orchestrator import Orchestrator
+from src.projects.bible import handle_bible_command
+from src.projects.chat import handle_project_command
 from src.skills.chat import handle_skill_command
 
 log = logging.getLogger(__name__)
@@ -34,6 +38,32 @@ WS_RECONNECT_SECONDS = 5
 # Signal's typing indicator auto-expires after ~15s; refresh inside that
 # window so it stays visible while the pipeline is working.
 TYPING_REFRESH_SECONDS = 10
+# Wait this long after the user's last activity (message OR typing-stop)
+# before processing. Coalesces back-to-back messages into one pipeline run.
+DEBOUNCE_SECONDS = 2.5
+# Hard ceiling on how long a buffer may sit before we force-process it,
+# so a stuck typing-indicator (network blip, app crash) can't strand input.
+MAX_HOLD_SECONDS = 60.0
+
+
+@dataclass
+class _PendingTurn:
+    """Per-sender input buffer.
+
+    Holds messages and voice-audio that arrived during a debounce window.
+    Flushed to the pipeline as one combined input — that's what makes
+    "user types two messages back to back" produce one coherent reply.
+    """
+    source: str
+    started_at: float
+    last_activity: float
+    messages: list[str] = field(default_factory=list)
+    # Tuples of (audio_bytes, content_type) — transcribed at flush time
+    # so a user who sends voice + correction-text together still gets one turn.
+    voice: list[tuple[bytes, str]] = field(default_factory=list)
+    is_typing: bool = False
+    debounce_task: asyncio.Task | None = None
+    maxhold_task: asyncio.Task | None = None
 
 
 class SignalChannel(Channel):
@@ -57,6 +87,12 @@ class SignalChannel(Channel):
         self._session: aiohttp.ClientSession | None = None
         self._ws_task: asyncio.Task | None = None
         self._stop_event = asyncio.Event()
+        # Per-sender debounce buffers and currently-running pipeline tasks.
+        # The lock guards both — they're touched from receive loop and
+        # debounce-fire callbacks at the same time.
+        self._pending: dict[str, _PendingTurn] = {}
+        self._processing: dict[str, asyncio.Task] = {}
+        self._state_lock = asyncio.Lock()
 
     async def start(self) -> None:
         self._session = aiohttp.ClientSession()
@@ -74,6 +110,18 @@ class SignalChannel(Channel):
                 await self._ws_task
             except (asyncio.CancelledError, Exception):
                 pass
+        # Cancel any still-running pipeline tasks and debounce timers so a
+        # graceful shutdown doesn't hang on dangling work.
+        async with self._state_lock:
+            for pending in self._pending.values():
+                for t in (pending.debounce_task, pending.maxhold_task):
+                    if t and not t.done():
+                        t.cancel()
+            self._pending.clear()
+            for task in list(self._processing.values()):
+                if not task.done():
+                    task.cancel()
+            self._processing.clear()
         if self._session:
             await self._session.close()
 
@@ -110,82 +158,267 @@ class SignalChannel(Channel):
                 await asyncio.sleep(WS_RECONNECT_SECONDS)
 
     async def _handle_incoming(self, event: dict) -> None:
-        """Dispatch one websocket event through the pipeline.
+        """Top-level event router.
 
-        Handles three cases:
-        - plain text: pass through as-is
-        - voice note (audio attachment): transcribe via Whisper, feed transcript
-          into the pipeline with a [voice] marker so the LLM knows it was spoken
-        - voice + text caption: combine both
+        Two event shapes matter:
+        - `dataMessage` — actual user content (text and/or voice). Buffers
+          into `_pending[source]` and arms the debounce timer; the buffer
+          flushes through the pipeline when the user falls silent.
+        - `typingMessage` — heads-up that the user is composing. Pauses the
+          debounce timer so we don't fire mid-sentence; restarts it when
+          they stop typing.
+
+        Anything else (receipts, sync, empty events) is ignored.
         """
         envelope = event.get("envelope") or {}
+        source = envelope.get("sourceNumber") or envelope.get("source") or ""
+        if not source:
+            return
+        if self.allowed_senders and source not in self.allowed_senders:
+            return
+
+        # Typing indicators
+        typing = envelope.get("typingMessage")
+        if typing:
+            action = (typing.get("action") or "").upper()
+            await self._handle_typing(source, action)
+            return
+
+        # Data messages (text + attachments)
         data = envelope.get("dataMessage") or {}
         text = (data.get("message") or "").strip()
         attachments = data.get("attachments") or []
-
         voice_attachments = [a for a in attachments if _is_voice_note(a)]
 
         if not text and not voice_attachments:
-            return  # receipts, typing events, empty syncs — skip
+            return  # receipts, empty syncs, etc.
 
-        source = envelope.get("sourceNumber") or envelope.get("source") or ""
-        if self.allowed_senders and source not in self.allowed_senders:
-            log.info(f"Ignoring Signal message from {source} (not in allowlist)")
-            return
+        # Swipe-to-reply context. Signal's daemon attaches a `quote` block
+        # naming the message being replied to (author UUID/number + the
+        # quoted text). Without this prefix the LLM has no way to know what
+        # "the second one" or "scrap that" refers to.
+        quote = data.get("quote")
+        if quote:
+            quote_prefix = _format_quote_context(quote, self.phone_number)
+            if quote_prefix:
+                text = f"{quote_prefix}\n\n{text}" if text else quote_prefix
 
-        # Mark as read immediately — the user sees blue checkmarks right as
-        # the bot picks the message up, before transcription or pipeline work
-        # begins. Combined with the typing indicator: delivered → read → typing
-        # → response.
+        # Read receipt fires immediately on every message — gives the user
+        # blue checkmarks right away, independent of debounce/pipeline timing.
         msg_ts = data.get("timestamp") or envelope.get("timestamp")
         if msg_ts:
             await self._send_read_receipt(source, int(msg_ts))
 
-        # Skill commands short-circuit before the pipeline. Skip if the user
-        # ALSO sent a voice note in the same message — that's a normal message
-        # with a command-like prefix, not a pure command.
+        # Skill / project / bible commands short-circuit the buffer entirely.
+        # They're meant to land instantly and don't combine meaningfully
+        # with other input. Skip if the user also sent a voice note —
+        # treat that as content, not a command.
         if text and not voice_attachments:
-            skill_reply = handle_skill_command(text, self.orchestrator)
-            if skill_reply is not None:
-                await self._send_text(source, skill_reply)
-                return
+            for handler in (
+                handle_skill_command,
+                handle_project_command,
+                handle_bible_command,
+            ):
+                reply = handler(text, self.orchestrator)
+                if reply is not None:
+                    await self._send_text(source, reply)
+                    return
 
-        # Transcribe any voice notes; each becomes a line in the final message
-        transcripts: list[str] = []
+        # Download voice payloads now (fast — just network), but defer
+        # transcription to flush time so it joins the same buffer window.
+        downloaded_voice: list[tuple[bytes, str]] = []
         for att in voice_attachments:
             try:
                 audio = await self._download_attachment(att["id"])
-                transcript = await self._transcribe(audio, att.get("contentType", "audio/aac"))
-                if transcript:
-                    transcripts.append(transcript)
+                downloaded_voice.append((audio, att.get("contentType", "audio/aac")))
             except Exception as e:
-                log.warning(f"Voice transcription failed: {e}")
+                log.warning(f"Voice download failed: {e}")
                 await self._send_text(
-                    source, f"_⚠️ couldn't transcribe that voice message: {e}_"
+                    source, f"_⚠️ couldn't download that voice message: {e}_"
                 )
-                return
 
-        if transcripts:
-            combined = "\n".join(transcripts)
-            # Show the user what we heard so misrecognitions are obvious;
-            # they can correct in a follow-up instead of getting a confusing reply.
-            preview = f"_heard: \"{combined}\"_"
-            await self._send_text(source, preview)
+        await self._buffer_input(source, text=text, voice=downloaded_voice)
+
+    async def _handle_typing(self, source: str, action: str) -> None:
+        """Pause/resume the debounce timer based on typing state."""
+        async with self._state_lock:
+            pending = self._pending.get(source)
+            if pending is None:
+                # No buffered input yet — nothing to pause. We don't pre-arm
+                # a buffer just because the user is typing; the first
+                # message creates the buffer.
+                return
+            now = time.monotonic()
+            pending.last_activity = now
+            if action == "STARTED":
+                pending.is_typing = True
+                # Cancel debounce so we don't fire mid-compose. Max-hold
+                # timer keeps running as a safety net.
+                if pending.debounce_task and not pending.debounce_task.done():
+                    pending.debounce_task.cancel()
+                pending.debounce_task = None
+            elif action == "STOPPED":
+                pending.is_typing = False
+                # User stopped typing — start a fresh debounce countdown.
+                # Their last keystroke counts as the "last activity."
+                self._arm_debounce(pending)
+
+    async def _buffer_input(
+        self,
+        source: str,
+        text: str = "",
+        voice: list[tuple[bytes, str]] | None = None,
+    ) -> None:
+        """Append to the per-sender buffer and arm the debounce timer.
+
+        If a pipeline run is currently in flight for this sender, it gets
+        cancelled — the user's new message supersedes whatever was being
+        composed. Already-sent reply messages stay sent (Signal doesn't
+        give us a clean delete API to retract them); the in-flight LLM call
+        is aborted.
+        """
+        async with self._state_lock:
+            # Interrupt: cancel any running pipeline for this sender.
+            running = self._processing.get(source)
+            if running and not running.done():
+                running.cancel()
+                log.info(f"Interrupting in-flight pipeline for {source}")
+
+            now = time.monotonic()
+            pending = self._pending.get(source)
+            if pending is None:
+                pending = _PendingTurn(
+                    source=source, started_at=now, last_activity=now
+                )
+                self._pending[source] = pending
+                # Max-hold safety net — set once per buffer.
+                pending.maxhold_task = asyncio.create_task(
+                    self._maxhold(source, pending.started_at)
+                )
+            else:
+                pending.last_activity = now
 
             if text:
-                # User attached both voice and a text caption — include both,
-                # with the voice tagged so the LLM treats it as speech.
-                final = f"[voice] {combined}\n\n[text caption] {text}"
-            else:
-                final = f"[voice] {combined}"
-        else:
-            final = text
+                pending.messages.append(text)
+            if voice:
+                pending.voice.extend(voice)
 
+            # Reset debounce: cancel old timer, start a fresh DEBOUNCE_SECONDS
+            # countdown. Skip if user is actively typing — they'll resume the
+            # timer themselves via the STOPPED event.
+            if pending.debounce_task and not pending.debounce_task.done():
+                pending.debounce_task.cancel()
+            if not pending.is_typing:
+                self._arm_debounce(pending)
+
+    def _arm_debounce(self, pending: _PendingTurn) -> None:
+        """Spawn a fresh debounce timer that fires `_flush_pending`."""
+        pending.debounce_task = asyncio.create_task(
+            self._debounce_then_flush(pending.source)
+        )
+
+    async def _debounce_then_flush(self, source: str) -> None:
         try:
-            await self._process_and_respond(final, source)
+            await asyncio.sleep(DEBOUNCE_SECONDS)
+        except asyncio.CancelledError:
+            return  # newer message reset us; nothing to do
+        await self._flush_pending(source)
+
+    async def _maxhold(self, source: str, started_at: float) -> None:
+        """Force-flush after MAX_HOLD_SECONDS no matter what.
+
+        Guards against pathological cases — typing-indicator stuck on,
+        network blip during STOPPED event, etc. — that would otherwise
+        leave a buffer indefinitely pending.
+        """
+        try:
+            await asyncio.sleep(MAX_HOLD_SECONDS)
+        except asyncio.CancelledError:
+            return
+        async with self._state_lock:
+            pending = self._pending.get(source)
+            if pending is None or pending.started_at != started_at:
+                return  # buffer already drained or replaced
+            log.info(f"Max-hold timer flushing buffer for {source}")
+        await self._flush_pending(source)
+
+    async def _flush_pending(self, source: str) -> None:
+        """Drain the buffer and run the pipeline on the combined input."""
+        async with self._state_lock:
+            pending = self._pending.pop(source, None)
+            if pending is None:
+                return
+            for t in (pending.debounce_task, pending.maxhold_task):
+                if t and not t.done() and t is not asyncio.current_task():
+                    t.cancel()
+
+        if not pending.messages and not pending.voice:
+            return
+
+        # Transcribe voice now — joined into one input so the user gets
+        # one coherent reply that addresses voice + text together.
+        transcripts: list[str] = []
+        for audio, ct in pending.voice:
+            try:
+                t = await self._transcribe(audio, ct)
+                if t:
+                    transcripts.append(t)
+            except Exception as e:
+                log.warning(f"Transcription failed: {e}")
+                await self._send_text(
+                    source, f"_⚠️ couldn't transcribe a voice message: {e}_"
+                )
+
+        # Compose the final input. Voice and text are tagged so the LLM
+        # can tell them apart even when bundled together.
+        if transcripts:
+            voice_combined = "\n".join(transcripts)
+            await self._send_text(source, f'_heard: "{voice_combined}"_')
+
+        parts: list[str] = []
+        if transcripts:
+            parts.append(f"[voice] {chr(10).join(transcripts)}")
+        if pending.messages:
+            joined = "\n\n".join(m for m in pending.messages if m.strip())
+            if joined:
+                if transcripts:
+                    parts.append(f"[text caption] {joined}")
+                else:
+                    parts.append(joined)
+        final = "\n\n".join(parts)
+        if not final.strip():
+            return
+
+        # Spawn the pipeline as a tracked task so a future incoming message
+        # can cancel it (the streaming-interrupt behavior).
+        task = asyncio.create_task(self._safe_process(final, source))
+        async with self._state_lock:
+            self._processing[source] = task
+
+    async def _safe_process(self, text: str, source: str) -> None:
+        """Wrapper around _process_and_respond that handles its lifecycle.
+
+        Catches CancelledError quietly — that's the expected path when an
+        incoming message interrupts. Logs other exceptions and surfaces
+        them to the user.
+        """
+        try:
+            await self._process_and_respond(text, source)
+        except asyncio.CancelledError:
+            log.info(f"Pipeline for {source} cancelled by newer input")
+            raise
         except Exception as e:
             log.exception(f"Signal pipeline failed: {e}")
-            await self._send_text(source, f"⚠️ internal error: {e}")
+            try:
+                await self._send_text(source, f"⚠️ internal error: {e}")
+            except Exception:
+                pass
+        finally:
+            async with self._state_lock:
+                # Only clear the slot if we're still the current task —
+                # otherwise a newer task has already replaced us.
+                if self._processing.get(source) is asyncio.current_task():
+                    del self._processing[source]
 
     async def _process_and_respond(self, text: str, source: str) -> None:
         # Show typing while the pipeline works so the user doesn't stare
@@ -202,6 +435,20 @@ class SignalChannel(Channel):
                     accumulated += chunk.get("text") or chunk.get("chunk", "")
                 elif t == "file":
                     await self._send_attachment(source, chunk["name"], chunk["content"])
+                elif t == "file_written":
+                    # Active-project file landed on disk. Send a small note
+                    # with word count + a teaser of the opening line(s) so
+                    # the user knows what arrived without opening the file.
+                    name = chunk.get("name", "?")
+                    words = chunk.get("word_count", 0)
+                    preview = chunk.get("preview", "")
+                    note = f"_✓ wrote `{name}` ({words:,} words)_"
+                    if preview:
+                        # Indent preview as a quote block so it's visually
+                        # distinct from the rest of the reply.
+                        first_line = preview.split("\n", 1)[0]
+                        note += f"\n\n> {first_line}"
+                    await self._send_text(source, note)
                 elif t == "text_replace":
                     accumulated = chunk["text"]
                 elif t == "compaction":
@@ -408,6 +655,34 @@ class SignalChannel(Channel):
             f"⚠️ Couldn't deliver attachment `{filename}` — Signal push timed out. "
             f"Try asking again in a moment.",
         )
+
+
+_MAX_QUOTE_CHARS = 500
+
+
+def _format_quote_context(quote: dict, bot_number: str) -> str:
+    """Build a `[Replying to ...]` prefix from a Signal quote payload.
+
+    Returns an empty string when the quote has no usable text (e.g. a
+    quote of a sticker or attachment-only message). The author check
+    distinguishes the bot's own previous reply ("your earlier reply")
+    from someone else's message ("an earlier message"), which gives the
+    LLM cleaner attribution.
+    """
+    quoted_text = (quote.get("text") or "").strip()
+    if not quoted_text:
+        return ""
+
+    if len(quoted_text) > _MAX_QUOTE_CHARS:
+        # Trim from the END — the start of the quoted message is usually
+        # the most identifying part (a heading, opening line, etc.).
+        quoted_text = quoted_text[: _MAX_QUOTE_CHARS - 1].rstrip() + "…"
+
+    author = (quote.get("author") or "").strip()
+    is_self = bool(bot_number) and author == bot_number
+    label = "your earlier reply" if is_self else "an earlier message"
+
+    return f"[Replying to {label}]\n> {quoted_text.replace(chr(10), chr(10) + '> ')}"
 
 
 def _is_voice_note(att: dict) -> bool:

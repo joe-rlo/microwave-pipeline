@@ -133,7 +133,7 @@ class TestAssemblyWithSkill:
     def test_skill_block_appears_in_dynamic_context(self, tmp_path, monkeypatch):
         # We need a MemoryStore double — only assemble_stable_context is called.
         class _FakeStore:
-            def assemble_stable_context(self, channel=None): return "STABLE"
+            def assemble_stable_context(self, channel=None, bible_path=None): return "STABLE"
 
         class _FakeIndex:
             def get_promotion_candidates(self, min_retrievals=3): return []
@@ -161,7 +161,7 @@ class TestAssemblyWithSkill:
         channel rules have higher recency in the prompt — that's how we
         enforce 'channel rules win on conflict'."""
         class _FakeStore:
-            def assemble_stable_context(self, channel=None): return ""
+            def assemble_stable_context(self, channel=None, bible_path=None): return ""
         class _FakeIndex:
             def get_promotion_candidates(self, min_retrievals=3): return []
 
@@ -176,7 +176,7 @@ class TestAssemblyWithSkill:
 
     def test_no_skill_means_no_skill_block(self):
         class _FakeStore:
-            def assemble_stable_context(self, channel=None): return ""
+            def assemble_stable_context(self, channel=None, bible_path=None): return ""
         class _FakeIndex:
             def get_promotion_candidates(self, min_retrievals=3): return []
 
