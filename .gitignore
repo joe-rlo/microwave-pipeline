@@ -26,6 +26,16 @@ env/
 # Workspace (user's personal data — not committed)
 workspace/
 
+# Prompts directory — local-only. The skills system (workspace/skills/)
+# is the canonical place for shipped prompt templates; anything in
+# prompts/ is treated as personal scratch.
+prompts/
+
+# Personal essays / drafts that sometimes land at the repo root. Add
+# explicit excludes here for any new ones rather than relying on a
+# blanket pattern that could trap shipped docs (README.md etc.).
+/determinism-and-llms.md
+
 # IDE
 .vscode/
 .idea/
