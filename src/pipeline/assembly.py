@@ -45,6 +45,7 @@ def assemble(
     active_skill: Skill | None = None,
     complexity: str = "moderate",
     bible_path=None,
+    tool_catalog: str = "",
 ) -> AssemblyResult:
     """Assemble stable and dynamic context for this turn."""
     # Build stable context (for reconnect if needed). If a project is
@@ -59,6 +60,15 @@ def assemble(
     # Datetime goes here (not in stable prompt) so it doesn't trigger reconnects
     dynamic_parts = []
     dynamic_parts.append(f"[Current datetime: {datetime.now().isoformat(timespec='minutes')}]")
+
+    # Tool catalog block — only present when at least one tool is wired
+    # in. The Agent SDK already advertises each tool's name + schema to
+    # the model, but those descriptions are terse. The catalog gives the
+    # model strategic guidance ("use this when X, ask before calling if
+    # Y, don't fabricate the result"). Goes near the top of the dynamic
+    # context so it's not buried under retrieval noise.
+    if tool_catalog:
+        dynamic_parts.append(f"[Tools available]\n{tool_catalog.strip()}")
 
     # Active skill block goes BEFORE channel file-output instructions so
     # channel rules appear later in the prompt (higher recency priority).

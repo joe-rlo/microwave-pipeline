@@ -25,6 +25,7 @@ from src.projects import Project, ProjectLoader, ProjectNotFound
 from src.session.engine import SessionEngine
 from src.session.models import PipelineMetadata, Turn
 from src.skills import Skill, SkillLoader, SkillNotFound
+from src.tools import build_tools
 
 log = logging.getLogger(__name__)
 
@@ -55,6 +56,12 @@ class Orchestrator:
         # Set when active project changes — process() reconnects on the
         # next turn so BIBLE.md updates propagate without a sync API.
         self._project_changed: bool = False
+        # Set by `mark_llm_for_reset()` when an outside caller (e.g. the
+        # Signal channel cancelling a pipeline mid-flight for addendum-merge)
+        # has reason to believe the SDK's internal conversation history
+        # diverged from what we've actually committed. The next process()
+        # call rebuilds a clean LLM session before doing any LLM work.
+        self._needs_llm_reset: bool = False
 
     async def start(self, channel: str = "repl") -> None:
         """Initialize all components and connect."""
@@ -94,13 +101,26 @@ class Orchestrator:
         projects_dir.mkdir(parents=True, exist_ok=True)
         self.project_loader = ProjectLoader(projects_dir)
 
+        # Tools — built once at startup. Adding a new tool means setting
+        # its env var and restarting; we don't hot-reload because the
+        # MCP server is wired into the SDK session at connect time.
+        self.tool_bundle = build_tools(self.config)
+        if self.tool_bundle.allowed_tools:
+            log.info(
+                "Registered %d tool(s): %s",
+                len(self.tool_bundle.allowed_tools),
+                ", ".join(self.tool_bundle.allowed_tools),
+            )
+
         # LLM client — with sandboxed output directory for file creation
+        # and (optionally) the MCP tool bundle wired in.
         self.llm = LLMClient(
             model=self.config.model_main,
             auth_mode=self.config.auth_mode,
             api_key=self.config.anthropic_api_key,
             cli_path=self.config.cli_path,
             output_dir=str(self.config.output_dir),
+            tool_bundle=self.tool_bundle,
         )
 
         # Assemble stable context and connect. Active project's BIBLE.md
@@ -145,7 +165,22 @@ class Orchestrator:
         """
         start = time.time()
 
-        # Store user turn
+        # If the previous pipeline was cancelled mid-LLM-call, the SDK's
+        # internal history has phantom messages that don't match what's
+        # committed. Resync before doing any LLM work for this turn.
+        if self._needs_llm_reset:
+            try:
+                await self._reset_llm_after_cancel()
+            except Exception as e:
+                log.warning(f"LLM reset before turn failed: {e}")
+            self._needs_llm_reset = False
+
+        # User turn is built here but NOT persisted yet — we commit it as a
+        # pair with the assistant turn at the end of process(), so a pipeline
+        # that gets cancelled mid-flight (addendum-merge from a Signal-style
+        # follow-up, etc.) never leaves an orphan user row in the session
+        # engine. Triage gets the message directly via the `message` param;
+        # `recent` only needs prior turns.
         user_turn = Turn(
             session_id=self._session_id,
             channel=channel,
@@ -153,7 +188,6 @@ class Orchestrator:
             role="user",
             content=message,
         )
-        self.session_engine.add_turn(user_turn)
 
         # Get recent turns for triage context
         recent = self.session_engine.get_recent_turns(channel, user_id, limit=6)
@@ -221,6 +255,7 @@ class Orchestrator:
             active_skill=turn_skill,
             complexity=triage_result.complexity,
             bible_path=bible_path,
+            tool_catalog=self.tool_bundle.catalog_text if self.tool_bundle else "",
         )
 
         # Reconnect when (a) project changed since last turn, or (b) any
@@ -355,7 +390,12 @@ class Orchestrator:
                 except Exception as e:
                     log.warning(f"Could not read output file {path}: {e}")
 
-        # Store assistant turn
+        # Commit the (user, assistant) turn pair atomically. Writing the user
+        # turn here — instead of at the top of process() — means a cancelled
+        # pipeline leaves no record at all rather than an orphan user row,
+        # preserving the invariant that every persisted user turn has a
+        # matching assistant turn the user actually saw.
+        self.session_engine.add_turn(user_turn)
         assistant_turn = Turn(
             session_id=self._session_id,
             channel=channel,
@@ -556,6 +596,45 @@ class Orchestrator:
                 pass  # consume and discard the response
         except Exception as e:
             log.warning(f"History injection failed (non-fatal): {e}")
+
+    def mark_llm_for_reset(self) -> None:
+        """Flag the LLM session as needing a resync on the next turn.
+
+        Called by channels (Signal in particular) when they cancel an
+        in-flight pipeline for addendum-merge. Cancellation can leave
+        the SDK's internal conversation history with phantom user/
+        assistant turns that don't match what's been committed to the
+        session engine; the next process() call resets before doing
+        any LLM work so the next turn lands in a clean context.
+        """
+        self._needs_llm_reset = True
+
+    async def _reset_llm_after_cancel(self) -> None:
+        """Rebuild a clean LLM session matching committed history.
+
+        Reconnects with the current stable prompt (so identity, memory,
+        channel rules, active bible all stay in effect) and replays the
+        committed turn history into the new SDK session. Any phantom
+        messages from a cancelled `llm.send()` are discarded along with
+        the old session.
+        """
+        if self.llm is None or self.session_engine is None:
+            return
+        bible_path = self._active_bible_path()
+        stable_prompt = self.memory_store.assemble_stable_context(
+            channel=self._channel, bible_path=bible_path
+        )
+        await self.llm.reconnect(stable_prompt)
+        self._stable_mtime = self.memory_store.stable_context_mtime(
+            channel=self._channel, bible_path=bible_path
+        )
+        if self._session_id:
+            try:
+                turns = self.session_engine.get_turns(self._session_id)
+                if turns:
+                    await self._inject_history(turns)
+            except Exception as e:
+                log.warning(f"History re-injection after cancel failed: {e}")
 
     # --- Project management (called by channel command handlers) ---
 

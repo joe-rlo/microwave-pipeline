@@ -5,6 +5,18 @@ Supports two auth paths:
 - API key: Standard Anthropic SDK (pay-as-you-go)
 
 Both expose the same streaming interface to the pipeline.
+
+Tool use (Max auth only). When the orchestrator passes a `tool_bundle`,
+the SDK is configured with in-process MCP tools the model can invoke
+mid-turn. The SDK handles the tool_use → tool_result round-trip
+transparently — we just keep collecting TextBlocks and the model
+weaves the tool's structured result into its reply.
+
+API-key mode currently doesn't wire tools. Adding it would mean
+managing the tool_use loop manually against the Messages API; not
+worth the complexity until someone actually runs MicrowaveOS without
+Max auth. The orchestrator surfaces this gap in the system prompt
+so the model doesn't try to call tools that don't exist.
 """
 
 from __future__ import annotations
@@ -23,12 +35,16 @@ class LLMClient:
     """
 
     def __init__(self, model: str = "sonnet", auth_mode: str = "max", api_key: str = "",
-                 cli_path: str = "", output_dir: str = ""):
+                 cli_path: str = "", output_dir: str = "", tool_bundle=None):
         self.model = model
         self.auth_mode = auth_mode
         self.api_key = api_key
         self.cli_path = cli_path
         self.output_dir = output_dir
+        # ToolBundle from src.tools.build_tools — None means no tools.
+        # Stashed on the instance so reconnect() can rewire after a
+        # stable-context refresh without the orchestrator re-passing it.
+        self.tool_bundle = tool_bundle
         self._client = None
         self._stable_prompt: str | None = None
         self._conversation: list[dict] = []
@@ -48,14 +64,25 @@ class LLMClient:
         try:
             from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions
 
-            # No tools — the model outputs content as text and the pipeline
-            # handles file extraction from code fences automatically.
-            opts = dict(
+            # In-process tools (if any). When tool_bundle is empty/None,
+            # this collapses to the historical no-tool behavior — the
+            # model treats responses as text-only and the pipeline still
+            # extracts files from code fences after the fact.
+            opts: dict = dict(
                 system_prompt=self._stable_prompt,
                 model=self.model,
                 cli_path=self.cli_path or None,
-                allowed_tools=[],
             )
+            bundle = self.tool_bundle
+            if bundle and not bundle.is_empty:
+                opts["mcp_servers"] = bundle.mcp_servers
+                opts["allowed_tools"] = list(bundle.allowed_tools)
+                log.info(
+                    "Tools enabled: %s",
+                    ", ".join(bundle.allowed_tools),
+                )
+            else:
+                opts["allowed_tools"] = []
 
             options = ClaudeAgentOptions(**opts)
             self._client = ClaudeSDKClient(options)
@@ -127,8 +154,23 @@ class LLMClient:
                 yield chunk
 
     async def _send_max(self, message: str) -> AsyncIterator[dict]:
-        """Send via Agent SDK persistent session."""
+        """Send via Agent SDK persistent session.
+
+        Streams TextBlocks as they arrive. When a tool is wired in,
+        the model may emit ToolUseBlocks that the SDK invokes
+        transparently — we surface a `{"type": "tool_use"}` chunk for
+        channel visibility (typing indicator, debug overlay) but the
+        actual tool I/O happens inside the SDK and feeds a fresh
+        AssistantMessage back into the same `receive_response()` stream.
+        """
         from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
+
+        # ToolUseBlock isn't always exported in older SDK builds; pull
+        # it lazily so we don't break clients that don't have it.
+        try:
+            from claude_agent_sdk import ToolUseBlock
+        except ImportError:
+            ToolUseBlock = None  # type: ignore[assignment]
 
         await self._client.query(message)
 
@@ -139,6 +181,20 @@ class LLMClient:
                     if isinstance(block, TextBlock):
                         full_response += block.text
                         yield {"type": "text", "chunk": block.text}
+                    elif ToolUseBlock is not None and isinstance(block, ToolUseBlock):
+                        # Surface tool calls for channels that want to
+                        # render a "running tool…" state. The SDK has
+                        # already started executing — we don't need to
+                        # do anything actionable here.
+                        yield {
+                            "type": "tool_use",
+                            "tool": getattr(block, "name", "unknown"),
+                            "tool_use_id": getattr(block, "id", None),
+                        }
+                    # Other block types (ThinkingBlock, ToolResultBlock
+                    # echoes) are deliberately skipped — they're
+                    # internal to the SDK loop and the user-visible
+                    # response is conveyed via subsequent TextBlocks.
 
             elif isinstance(msg, ResultMessage):
                 yield {

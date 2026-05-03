@@ -43,6 +43,16 @@ class Config(BaseModel):
     # OpenAI (embeddings only)
     openai_api_key: str = ""
 
+    # Instacart Developer Platform — when set, the LLM gains an
+    # `instacart_create_cart` tool that builds a Shop with Instacart
+    # link from a list of items. Without the key the tool isn't
+    # registered, so the model never sees it as an option.
+    instacart_api_key: str = ""
+    # Optional. If set, Instacart sends the user back to this URL after
+    # checkout (a small affordance for partner-style integrations —
+    # personal use can leave it blank).
+    instacart_partner_linkback_url: str = ""
+
     # Embedding
     embedding_model: str = "text-embedding-3-small"
     embedding_dimension: int = 1536
@@ -144,4 +154,6 @@ def load_config() -> Config:
         ),
         scheduler_enabled=os.getenv("SCHEDULER_ENABLED", "").lower() in ("1", "true", "yes", "on"),
         openai_api_key=os.getenv("OPENAI_API_KEY", ""),
+        instacart_api_key=os.getenv("INSTACART_API_KEY", ""),
+        instacart_partner_linkback_url=os.getenv("INSTACART_PARTNER_LINKBACK_URL", ""),
     )

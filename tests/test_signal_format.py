@@ -3,8 +3,10 @@ from src.channels.signal_format import markdown_to_signal_text
 
 
 def test_preserves_native_markdown():
-    # Signal renders these natively — nothing to transform.
-    s = "**bold** and *italic* and ~strike~ and `code`"
+    # Signal renders these natively — bold/italic/code pass through
+    # untouched. `~` is the exception: it's now neutralized with a
+    # zero-width space (see TestStrikethroughNeutralization for why).
+    s = "**bold** and *italic* and `code`"
     assert markdown_to_signal_text(s) == s
 
 
@@ -126,6 +128,63 @@ class TestExtForContentType:
     def test_unknown_defaults_to_m4a(self):
         # Safer default — most Signal voice notes are AAC-in-M4A.
         assert _ext_for_content_type("audio/weird-format") == ".m4a"
+
+
+class TestStrikethroughNeutralization:
+    """Signal's styled-mode parser pairs `~text~` as strikethrough. The LLM
+    routinely uses `~` for approximation and home-dir paths and never wants
+    actual strike, so we neutralize every tilde with a trailing ZWSP."""
+
+    def test_approximation_tildes_no_longer_pair(self):
+        # Classic case: two `~` in the same message would strike everything
+        # between them. After neutralization, the pairing breaks.
+        out = markdown_to_signal_text("spend ~5 minutes, then ~10 minutes more")
+        # Both tildes still visible (with ZWSP after each — invisible in render)
+        assert out.count("~") == 2
+        # The pair `~5 minutes, then ~` is broken: no matching `text~text~`
+        # regex can match across these now.
+        import re
+        assert not re.search(r"~[^~​]+~", out)
+
+    def test_path_tildes_no_longer_pair(self):
+        out = markdown_to_signal_text(
+            "files at ~/.microwaveos and backups at ~/Documents/archive"
+        )
+        assert out.count("~") == 2
+        import re
+        assert not re.search(r"~[^~​]+~", out)
+
+    def test_intentional_strike_also_defused(self):
+        # Trade-off: we currently defuse intentional strike too. The bot
+        # never emits this, but if a user includes `~old~` in their input
+        # it won't survive the conversion. Acceptable for v1; document
+        # via this test so future contributors see the intent.
+        out = markdown_to_signal_text("the ~old~ approach was wrong")
+        import re
+        assert not re.search(r"~[^~​]+~", out)
+
+    def test_zwsp_invisible_to_humans(self):
+        # The neutralizer adds U+200B (zero-width space) — verify that's
+        # what we're using and not some visible char.
+        out = markdown_to_signal_text("path: ~/foo")
+        assert "​" in out
+        # When stripped of ZWSPs, the user-facing text is unchanged.
+        visible = out.replace("​", "")
+        assert visible == "path: ~/foo"
+
+    def test_no_tildes_means_no_zwsps(self):
+        # Don't pollute messages that don't need defusing.
+        out = markdown_to_signal_text("plain old message, nothing to see")
+        assert "​" not in out
+
+    def test_inside_code_block_still_neutralized(self):
+        # We don't try to be clever about preserving inline-code content
+        # untouched — `~` inside `code` would still pair if we left it.
+        # Better to neutralize uniformly.
+        out = markdown_to_signal_text("use `rm ~/tmp` then `rm ~/cache`")
+        import re
+        # Match what's inside the backticks too — no surviving pair
+        assert not re.search(r"~[^~​]+~", out)
 
 
 def test_realistic_bot_response():

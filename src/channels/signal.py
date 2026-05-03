@@ -44,6 +44,17 @@ DEBOUNCE_SECONDS = 2.5
 # Hard ceiling on how long a buffer may sit before we force-process it,
 # so a stuck typing-indicator (network blip, app crash) can't strand input.
 MAX_HOLD_SECONDS = 60.0
+# How long after a pipeline starts a follow-up message is still treated as
+# an addendum (cancel current pipeline, merge inputs). Past this window the
+# follow-up becomes a queued new turn instead, so a user who gave up waiting
+# on a long-running answer doesn't get their later question silently merged
+# into the earlier thought. Generous on purpose — chunked-thinking pauses
+# can be substantial; tune from logs.
+ADDENDUM_WINDOW_SECONDS = 18.0
+# Send a small "_…thinking_" message if the pipeline is still running this
+# many seconds in. Signal has no streaming, so without this nudge a slow
+# turn looks indistinguishable from a stalled bot.
+THINKING_NUDGE_SECONDS = 4.0
 
 
 @dataclass
@@ -53,6 +64,11 @@ class _PendingTurn:
     Holds messages and voice-audio that arrived during a debounce window.
     Flushed to the pipeline as one combined input — that's what makes
     "user types two messages back to back" produce one coherent reply.
+
+    The buffer's lifetime extends through the pipeline run (not just up to
+    flush) so addendum-merge can cancel + re-flush without losing earlier
+    content. On cancel, new input is appended to the same buffer; on
+    successful pipeline completion, the buffer is dropped.
     """
     source: str
     started_at: float
@@ -61,6 +77,10 @@ class _PendingTurn:
     # Tuples of (audio_bytes, content_type) — transcribed at flush time
     # so a user who sends voice + correction-text together still gets one turn.
     voice: list[tuple[bytes, str]] = field(default_factory=list)
+    # Already-transcribed voice text. Populated by _flush_pending when it
+    # consumes `voice`; persists across addendum re-flushes so a cancelled
+    # turn's transcription work isn't redone.
+    transcribed: list[str] = field(default_factory=list)
     is_typing: bool = False
     debounce_task: asyncio.Task | None = None
     maxhold_task: asyncio.Task | None = None
@@ -92,6 +112,15 @@ class SignalChannel(Channel):
         # debounce-fire callbacks at the same time.
         self._pending: dict[str, _PendingTurn] = {}
         self._processing: dict[str, asyncio.Task] = {}
+        # When a follow-up arrives past the addendum window, it parks here
+        # until the active pipeline finishes — then gets promoted to _pending
+        # and run as its own turn. Distinct slot so addendum-merge (cancel +
+        # combine) and queued-new-turn (wait + run separately) don't collide.
+        self._queued: dict[str, _PendingTurn] = {}
+        # Pipeline-start timestamp per sender — used by _buffer_input to
+        # decide addendum-vs-queued based on how far into the pipeline a
+        # follow-up landed.
+        self._pipeline_started_at: dict[str, float] = {}
         self._state_lock = asyncio.Lock()
 
     async def start(self) -> None:
@@ -113,15 +142,17 @@ class SignalChannel(Channel):
         # Cancel any still-running pipeline tasks and debounce timers so a
         # graceful shutdown doesn't hang on dangling work.
         async with self._state_lock:
-            for pending in self._pending.values():
-                for t in (pending.debounce_task, pending.maxhold_task):
-                    if t and not t.done():
-                        t.cancel()
-            self._pending.clear()
+            for bucket in (self._pending, self._queued):
+                for pending in bucket.values():
+                    for t in (pending.debounce_task, pending.maxhold_task):
+                        if t and not t.done():
+                            t.cancel()
+                bucket.clear()
             for task in list(self._processing.values()):
                 if not task.done():
                     task.cancel()
             self._processing.clear()
+            self._pipeline_started_at.clear()
         if self._session:
             await self._session.close()
 
@@ -248,6 +279,13 @@ class SignalChannel(Channel):
                 # a buffer just because the user is typing; the first
                 # message creates the buffer.
                 return
+            running = self._processing.get(source)
+            if running is not None and not running.done():
+                # Pipeline is running this buffer. Typing while it works
+                # doesn't change anything — debounce isn't armed during
+                # pipeline, and the addendum-cancel path is driven by an
+                # actual incoming message, not by typing.
+                return
             now = time.monotonic()
             pending.last_activity = now
             if action == "STARTED":
@@ -269,29 +307,98 @@ class SignalChannel(Channel):
         text: str = "",
         voice: list[tuple[bytes, str]] | None = None,
     ) -> None:
-        """Append to the per-sender buffer and arm the debounce timer.
+        """Append to the per-sender buffer.
 
-        If a pipeline run is currently in flight for this sender, it gets
-        cancelled — the user's new message supersedes whatever was being
-        composed. Already-sent reply messages stay sent (Signal doesn't
-        give us a clean delete API to retract them); the in-flight LLM call
-        is aborted.
+        Three modes depending on what's happening for this sender:
+
+        - **Fresh**: no pipeline running. Standard buffer + debounce.
+          Multiple messages within DEBOUNCE_SECONDS coalesce into one turn.
+
+        - **Addendum**: pipeline running and we're still inside
+          ADDENDUM_WINDOW_SECONDS. The follow-up is treated as a
+          continuation of the same thought (canonical use case: user
+          forgot to add something, or thinks/writes in chunks). Cancel
+          the in-flight pipeline, append to the still-alive buffer, and
+          let debounce fire a fresh pipeline run on the combined input.
+          Already-streamed reply text stays sent — Signal can't retract
+          it — but no streaming on Signal means there's nothing to retract.
+
+        - **Queued**: pipeline running and we're past the addendum window.
+          The user almost certainly thinks the previous turn is done and
+          this is a new question. Park it in `_queued[source]` so the
+          active pipeline finishes cleanly and writes its turn pair, then
+          the queued buffer gets promoted and run as its own turn.
         """
         async with self._state_lock:
-            # Interrupt: cancel any running pipeline for this sender.
-            running = self._processing.get(source)
-            if running and not running.done():
-                running.cancel()
-                log.info(f"Interrupting in-flight pipeline for {source}")
-
             now = time.monotonic()
+            running = self._processing.get(source)
+            running_alive = running is not None and not running.done()
+
+            if running_alive:
+                started_at = self._pipeline_started_at.get(source, now)
+                elapsed = now - started_at
+
+                if elapsed < ADDENDUM_WINDOW_SECONDS:
+                    # Addendum: cancel and merge.
+                    log.info(
+                        f"Addendum (elapsed={elapsed:.1f}s): cancelling "
+                        f"in-flight pipeline for {source}, merging input"
+                    )
+                    running.cancel()
+                    target = self._pending.get(source)
+                    if target is None:
+                        # Defensive: pipeline was running without a live
+                        # buffer (shouldn't happen with the new lifecycle,
+                        # but recover gracefully if it does).
+                        target = _PendingTurn(
+                            source=source, started_at=now, last_activity=now
+                        )
+                        self._pending[source] = target
+                        target.maxhold_task = asyncio.create_task(
+                            self._maxhold(source, target.started_at)
+                        )
+                    target.last_activity = now
+                    if text:
+                        target.messages.append(text)
+                    if voice:
+                        target.voice.extend(voice)
+                    if target.debounce_task and not target.debounce_task.done():
+                        target.debounce_task.cancel()
+                    if not target.is_typing:
+                        self._arm_debounce(target)
+                    return
+
+                # Past addendum window: queue as a new turn.
+                log.info(
+                    f"Queued new turn (elapsed={elapsed:.1f}s): parking "
+                    f"message for {source} until current pipeline finishes"
+                )
+                queued = self._queued.get(source)
+                if queued is None:
+                    queued = _PendingTurn(
+                        source=source, started_at=now, last_activity=now
+                    )
+                    self._queued[source] = queued
+                    # No maxhold on the queued buffer — its lifetime is
+                    # bounded by the active pipeline. Promotion arms a
+                    # fresh maxhold via the standard buffering path.
+                else:
+                    queued.last_activity = now
+                if text:
+                    queued.messages.append(text)
+                if voice:
+                    queued.voice.extend(voice)
+                # No debounce here — promotion in _safe_process's finally
+                # arms it once the active pipeline clears.
+                return
+
+            # Fresh: no pipeline running. Standard buffer + debounce.
             pending = self._pending.get(source)
             if pending is None:
                 pending = _PendingTurn(
                     source=source, started_at=now, last_activity=now
                 )
                 self._pending[source] = pending
-                # Max-hold safety net — set once per buffer.
                 pending.maxhold_task = asyncio.create_task(
                     self._maxhold(source, pending.started_at)
                 )
@@ -339,49 +446,80 @@ class SignalChannel(Channel):
             pending = self._pending.get(source)
             if pending is None or pending.started_at != started_at:
                 return  # buffer already drained or replaced
+            if self._processing.get(source) and not self._processing[source].done():
+                # Pipeline is already running this buffer — nothing to force.
+                return
             log.info(f"Max-hold timer flushing buffer for {source}")
         await self._flush_pending(source)
 
     async def _flush_pending(self, source: str) -> None:
-        """Drain the buffer and run the pipeline on the combined input."""
+        """Snapshot the buffer's content and start a pipeline run.
+
+        The buffer is NOT popped here — it stays alive in `_pending[source]`
+        through the pipeline's lifetime so addendum-merge (a follow-up
+        message during the pipeline's addendum window) can cancel the
+        in-flight task and re-flush the same buffer with the appended
+        content. The buffer is popped by `_safe_process` only on normal
+        completion.
+
+        No-ops if a pipeline is already running for this source — that
+        means the buffer is already in flight. (Can happen via spurious
+        debounce fires during pipeline; the actual addendum-cancel path
+        is in `_buffer_input`.)
+        """
         async with self._state_lock:
-            pending = self._pending.pop(source, None)
+            running = self._processing.get(source)
+            if running is not None and not running.done():
+                log.debug(f"Skipping flush for {source} — pipeline already running")
+                return
+            pending = self._pending.get(source)
             if pending is None:
                 return
+            # Cancel timer tasks. They're already firing; nothing more to do.
             for t in (pending.debounce_task, pending.maxhold_task):
                 if t and not t.done() and t is not asyncio.current_task():
                     t.cancel()
+            pending.debounce_task = None
+            pending.maxhold_task = None
 
-        if not pending.messages and not pending.voice:
+        if not pending.messages and not pending.voice and not pending.transcribed:
             return
 
-        # Transcribe voice now — joined into one input so the user gets
-        # one coherent reply that addresses voice + text together.
-        transcripts: list[str] = []
-        for audio, ct in pending.voice:
-            try:
-                t = await self._transcribe(audio, ct)
-                if t:
-                    transcripts.append(t)
-            except Exception as e:
-                log.warning(f"Transcription failed: {e}")
-                await self._send_text(
-                    source, f"_⚠️ couldn't transcribe a voice message: {e}_"
-                )
+        # Transcribe any voice items we haven't transcribed yet — we drain
+        # `voice` into `transcribed` so a cancelled pipeline's transcription
+        # work is preserved across an addendum re-flush.
+        new_transcripts: list[str] = []
+        if pending.voice:
+            voice_to_process = list(pending.voice)
+            pending.voice.clear()
+            for audio, ct in voice_to_process:
+                try:
+                    t = await self._transcribe(audio, ct)
+                    if t:
+                        new_transcripts.append(t)
+                except Exception as e:
+                    log.warning(f"Transcription failed: {e}")
+                    await self._send_text(
+                        source, f"_⚠️ couldn't transcribe a voice message: {e}_"
+                    )
+            pending.transcribed.extend(new_transcripts)
+
+        # Echo only newly-heard voice — re-echoing already-acknowledged
+        # transcripts on a re-flush would be confusing.
+        if new_transcripts:
+            voice_combined = "\n".join(new_transcripts)
+            await self._send_text(source, f'_heard: "{voice_combined}"_')
 
         # Compose the final input. Voice and text are tagged so the LLM
         # can tell them apart even when bundled together.
-        if transcripts:
-            voice_combined = "\n".join(transcripts)
-            await self._send_text(source, f'_heard: "{voice_combined}"_')
-
+        all_transcripts = list(pending.transcribed)
         parts: list[str] = []
-        if transcripts:
-            parts.append(f"[voice] {chr(10).join(transcripts)}")
+        if all_transcripts:
+            parts.append(f"[voice] {chr(10).join(all_transcripts)}")
         if pending.messages:
             joined = "\n\n".join(m for m in pending.messages if m.strip())
             if joined:
-                if transcripts:
+                if all_transcripts:
                     parts.append(f"[text caption] {joined}")
                 else:
                     parts.append(joined)
@@ -390,22 +528,37 @@ class SignalChannel(Channel):
             return
 
         # Spawn the pipeline as a tracked task so a future incoming message
-        # can cancel it (the streaming-interrupt behavior).
+        # in the addendum window can cancel and merge.
         task = asyncio.create_task(self._safe_process(final, source))
         async with self._state_lock:
             self._processing[source] = task
+            self._pipeline_started_at[source] = time.monotonic()
 
     async def _safe_process(self, text: str, source: str) -> None:
-        """Wrapper around _process_and_respond that handles its lifecycle.
+        """Wrapper around _process_and_respond that owns the buffer lifecycle.
 
-        Catches CancelledError quietly — that's the expected path when an
-        incoming message interrupts. Logs other exceptions and surfaces
-        them to the user.
+        On normal completion (or surfaced error reply), the buffer is
+        consumed: `_pending[source]` is popped, and any `_queued[source]`
+        is promoted to `_pending[source]` with a fresh debounce so the
+        next turn fires after the user's debounce window expires.
+
+        On cancellation (addendum path), `_pending[source]` is left in
+        place — `_buffer_input` already appended the new input to it and
+        re-armed the debounce; the next flush will run on the merged content.
         """
+        completed = False  # True on normal finish OR surfaced error reply
         try:
             await self._process_and_respond(text, source)
+            completed = True
         except asyncio.CancelledError:
-            log.info(f"Pipeline for {source} cancelled by newer input")
+            log.info(f"Pipeline for {source} cancelled (addendum or shutdown)")
+            # The cancelled `llm.send()` may have left phantom messages in
+            # the SDK's internal history. Tell the orchestrator to resync
+            # before its next turn so we don't carry the corruption forward.
+            try:
+                self.orchestrator.mark_llm_for_reset()
+            except Exception as e:
+                log.warning(f"mark_llm_for_reset failed: {e}")
             raise
         except Exception as e:
             log.exception(f"Signal pipeline failed: {e}")
@@ -413,18 +566,52 @@ class SignalChannel(Channel):
                 await self._send_text(source, f"⚠️ internal error: {e}")
             except Exception:
                 pass
+            # An LLM exception can also leave the SDK with a half-committed
+            # user message; same fix as the cancel path.
+            try:
+                self.orchestrator.mark_llm_for_reset()
+            except Exception:
+                pass
+            # Treat as completed: the user got a (failure) reply, so the
+            # buffer's input has been "answered" — don't keep it for a
+            # phantom re-flush.
+            completed = True
         finally:
             async with self._state_lock:
-                # Only clear the slot if we're still the current task —
-                # otherwise a newer task has already replaced us.
+                # Only act if we're still the current task — otherwise a
+                # newer pipeline has already taken our slot.
                 if self._processing.get(source) is asyncio.current_task():
                     del self._processing[source]
+                    self._pipeline_started_at.pop(source, None)
+                    if completed:
+                        # Drain the buffer; promote any queued turn.
+                        consumed = self._pending.pop(source, None)
+                        if consumed is not None:
+                            for t in (consumed.debounce_task, consumed.maxhold_task):
+                                if t and not t.done():
+                                    t.cancel()
+                        queued = self._queued.pop(source, None)
+                        if queued is not None:
+                            queued.last_activity = time.monotonic()
+                            self._pending[source] = queued
+                            # Fresh maxhold for the promoted buffer.
+                            queued.maxhold_task = asyncio.create_task(
+                                self._maxhold(source, queued.started_at)
+                            )
+                            if not queued.is_typing:
+                                self._arm_debounce(queued)
 
     async def _process_and_respond(self, text: str, source: str) -> None:
         # Show typing while the pipeline works so the user doesn't stare
         # at a silent thread. Refreshed periodically — Signal's indicator
         # auto-expires after ~15s.
         typing_task = asyncio.create_task(self._typing_loop(source))
+        # Belt-and-suspenders nudge for slow turns: typing alone isn't
+        # enough signal for users to know whether the bot is working or
+        # stalled. After THINKING_NUDGE_SECONDS we send one short message
+        # so they have a clear "yes, still on it" beat. Cancelled if the
+        # pipeline finishes inside the window — fast turns stay clean.
+        thinking_task = asyncio.create_task(self._thinking_nudge(source))
         accumulated = ""
         try:
             async for chunk in self.orchestrator.process(
@@ -467,6 +654,7 @@ class SignalChannel(Channel):
                     await self._send_text(source, part)
         finally:
             typing_task.cancel()
+            thinking_task.cancel()
             # Explicitly clear so the indicator drops immediately instead of
             # lingering until Signal's 15s auto-expire.
             await self._send_typing(source, active=False)
@@ -548,6 +736,23 @@ class SignalChannel(Channel):
                 await asyncio.sleep(TYPING_REFRESH_SECONDS)
         except asyncio.CancelledError:
             pass
+
+    async def _thinking_nudge(self, recipient: str) -> None:
+        """Send a one-shot "_…thinking_" message after a quiet pause.
+
+        Signal can't stream, so a long-running pipeline looks indistinguishable
+        from a stalled bot. After THINKING_NUDGE_SECONDS we send one small
+        message; if the pipeline finishes inside the window the task is
+        cancelled and nothing is sent.
+        """
+        try:
+            await asyncio.sleep(THINKING_NUDGE_SECONDS)
+        except asyncio.CancelledError:
+            return
+        try:
+            await self._send_text(recipient, "_…thinking_")
+        except Exception as e:
+            log.debug(f"Thinking-nudge send failed: {e}")
 
     async def _send_typing(self, recipient: str, active: bool) -> None:
         """PUT to start the typing indicator, DELETE to clear it.

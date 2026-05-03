@@ -8,6 +8,8 @@ markup, and no HTML.
 This module normalizes LLM output into that subset and, like the Telegram
 formatter, expands markdown tables into inline "card" blocks so tabular
 data stays readable on a phone screen.
+
+`~` is also neutralized — see `_neutralize_strikethrough` for why.
 """
 
 from __future__ import annotations
@@ -28,6 +30,11 @@ _LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)\s]+)\)")
 _HR_RE = re.compile(r"(?m)^\s*(?:-{3,}|\*{3,}|_{3,})\s*$")
 _HTML_TAG_RE = re.compile(r"</?[a-zA-Z][^>]*>")
 
+# Zero-width space inserted after every literal `~` to defuse Signal's
+# styled-mode strikethrough parser. The character is invisible in render
+# but breaks the `~text~` pairing the parser looks for.
+_ZWSP = "​"
+
 
 def _parse_table_row(line: str) -> list[str]:
     line = line.strip()
@@ -36,6 +43,26 @@ def _parse_table_row(line: str) -> list[str]:
     if line.endswith("|"):
         line = line[:-1]
     return [c.strip() for c in line.split("|")]
+
+
+def _neutralize_strikethrough(text: str) -> str:
+    """Defuse stray `~` characters so Signal's styled-mode parser can't
+    pair them as strikethrough markers.
+
+    The LLM constantly emits `~` for approximation ("~5 minutes",
+    "~30%") and home-dir paths ("~/.microwaveos"). Two such tildes
+    anywhere in the same message would cause Signal's styled-mode
+    renderer to strikethrough everything between them. We're not aware
+    of any case where the bot wants intentional strikethrough, so the
+    safest move is to invalidate every tilde as a markdown delimiter
+    by inserting a zero-width space immediately after.
+
+    The ZWSP renders as nothing — visually identical — but breaks the
+    delimiter regex on the daemon side. If we ever DO want to support
+    strikethrough on Signal, we'll need an opt-in mechanism (e.g. only
+    leave `~~text~~` GitHub-style pairs intact and neutralize lone `~`).
+    """
+    return text.replace("~", "~" + _ZWSP)
 
 
 def _table_to_cards_text(md: str) -> str:
@@ -107,4 +134,9 @@ def markdown_to_signal_text(text: str) -> str:
 
     # 7. Collapse excessive blank lines.
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
+
+    # 8. Neutralize stray `~` so they can't pair as strikethrough markers.
+    # Done last, after all other transforms — earlier passes don't generate
+    # `~`, but if any future transform did, it would still get neutralized.
+    text = _neutralize_strikethrough(text)
     return text

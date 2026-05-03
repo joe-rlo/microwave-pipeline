@@ -411,18 +411,24 @@ ESCALATION_EFFORT=high   # thinking budget
 |---------|-------------|
 | REPL | stdin/stdout, `/debug` shows pipeline metadata |
 | Telegram | Typing indicators, streaming via message edits, HTML-file attachments for tables/charts |
-| Signal | Typing indicators, read receipts, voice-message transcription (Whisper), HTML card-view attachments, debounce + interrupt |
+| Signal | Typing indicators, read receipts, voice-message transcription (Whisper), HTML card-view attachments, chunked-input handling (coalesce + addendum-merge + queue) |
 | HTTP | `POST /chat` returns JSON with response + pipeline stats |
 
 ### Conversational behavior
 
 A few features tune how the bot reads and responds across multi-message bursts. They mostly live on the Signal channel today (where messaging is bursty by nature) but the assembly-layer changes apply everywhere.
 
-**Debounce + coalesce (Signal).** Back-to-back messages within a 2.5s window are buffered and combined into one pipeline run. Send "tell me about NEAR" then "specifically the Q2 dev metrics" half a second later → the bot sees both as one input and replies once, coherently. Without this, each message would race the other through the pipeline against the same SDK session and produce two unrelated replies. Tunable via `DEBOUNCE_SECONDS` at the top of `src/channels/signal.py`.
+**Chunked input (Signal).** The Signal channel is built to handle conversation the way people actually use messaging — as a stream of fragments rather than one composed thought per turn. Especially valuable if you think and write in chunks, or just frequently realize "wait, I forgot to add..." right after hitting send. Three layered behaviors make this work, all per-sender:
+
+- **Coalesce.** Back-to-back messages within a 2.5s window are buffered into one pipeline run. Send "tell me about NEAR" then "specifically the Q2 dev metrics" half a second later → the bot sees both as one input and replies once, coherently.
+- **Addendum-merge.** If you send a follow-up *while the bot is already working on the previous input* (within ~18s of pipeline start), the in-flight pipeline is cancelled, the new text is merged into the buffer, and the pipeline restarts on the combined input. Designed for "I forgot to mention…" follow-ups — and for users whose natural rhythm is a few sentences at a time. Already-completed transcription work and committed history are preserved across the restart, so addendums don't pay double for Whisper or land in a corrupted SDK session.
+- **Queued new turn.** Past the addendum window, a follow-up almost certainly means a new question (the user gave up waiting on the previous answer), so it parks until the active pipeline commits its turn pair, then runs as its own turn. Two messages, two replies, no silent merge.
+
+The 2.5s coalesce and 18s addendum windows are tuned generously toward chunked input. Both are constants at the top of `src/channels/signal.py` (`DEBOUNCE_SECONDS`, `ADDENDUM_WINDOW_SECONDS`); tune from real logs if either feels off.
 
 **Typing-indicator awareness (Signal).** When you start typing, the debounce timer pauses — the bot doesn't fire mid-compose. When you stop typing, a fresh debounce window starts. A 60s max-hold timer guarantees a stuck "typing forever" doesn't strand input forever.
 
-**Streaming interrupt (Signal).** A new message arriving while the bot is mid-reply cancels the in-flight LLM call and starts over with the combined input. Already-sent reply chunks stay sent (Signal's REST bridge has no clean delete API), but no further chunks from the stale run land. Closest to how humans actually talk over each other.
+**"Thinking" nudge (Signal).** Signal can't stream replies, so a long-running pipeline looks indistinguishable from a stalled bot. After 4s of pipeline work, a single `_…thinking_` message lands so you know it's still on it. Fast turns send nothing — the nudge cancels itself if the reply arrives first.
 
 **Adaptive response length (all channels).** Triage's `simple` / `moderate` / `complex` classification flows into a length hint at the end of the dynamic context. Simple messages get "match the brevity, ~50 words, no preamble." Complex gets "develop fully, take the space you need." Moderate gets no hint — that's the default. Fixes the "thanks" → 200-word essay problem.
 
@@ -623,7 +629,7 @@ The one exception is **scheduler pre-fetch**: a skill can ship a `fetch.py` that
 The orchestrator holds one session at a time. If multiple Telegram users message the bot, their conversations share the same LLM session and can bleed into each other. Fine for personal use, not safe for multi-user deployment. (Signal's debounce buffer is per-sender, so quick bursts coalesce correctly per user — but the underlying SDK session is still one shared instance.)
 
 ### No concurrent requests
-Messages are processed sequentially. If two messages arrive at the same time, the second waits for the first to finish. The Signal channel cancels in-flight pipeline calls when the same user sends a new message (streaming interrupt), but doesn't run multiple users' turns in parallel.
+Messages are processed sequentially. If two messages arrive at the same time, the second waits for the first to finish. The Signal channel handles same-sender follow-ups intelligently (addendum-merge inside the addendum window, queued-new-turn past it — see *Chunked input* above), but doesn't run multiple users' turns in parallel.
 
 ### Project search isn't tagged
 Active-project drafts are indexed into the same fragment table as global memory. Retrieval doesn't prefer active-project fragments over global ones, so a character named "Sarah" in your novel project might cross-pollinate with a "Sarah" mentioned in a Substack draft. Worth knowing if you have multiple projects with overlapping names.
