@@ -157,8 +157,15 @@ class Orchestrator:
         message: str,
         user_id: str = "default",
         channel: str = "repl",
+        images: list[tuple[bytes, str]] | None = None,
     ) -> AsyncIterator[dict]:
         """Process a user message through the full cognitive pipeline.
+
+        `images`, when provided, is a list of (bytes, content_type) tuples
+        attached by the channel. They flow through to `LLMClient.send`
+        as Anthropic multimodal content blocks. Triage and reflection
+        stay text-only — they only see `message` (the caption) — so
+        Haiku-tier vision isn't burned on routing decisions.
 
         Yields streaming chunks for channel delivery.
         Also yields a final metadata chunk with pipeline stats.
@@ -306,6 +313,7 @@ class Orchestrator:
             async for chunk in self.llm.send(
                 message,
                 memory_context=assembly_result.memory_context or None,
+                images=images,
             ):
                 if chunk["type"] in ("text", "delta"):
                     text = chunk.get("text") or chunk.get("chunk", "")
@@ -350,11 +358,13 @@ class Orchestrator:
                     retry_search, self.memory_store, self.memory_index
                 )
 
-                # Re-generate with better context
+                # Re-generate with better context (and the same image
+                # content if the original turn had any).
                 full_response = ""
                 async for chunk in self.llm.send(
                     message,
                     memory_context=retry_assembly.memory_context or None,
+                    images=images,
                 ):
                     if chunk["type"] in ("text", "delta"):
                         text = chunk.get("text") or chunk.get("chunk", "")

@@ -90,7 +90,7 @@ def fast_channel(monkeypatch):
     ch.process_durations: list[float] = []
     ch.cancelled_count = 0
 
-    async def _fake_process(text: str, source: str) -> None:
+    async def _fake_process(text: str, source: str, images=None) -> None:
         ch.invocations.append((source, text))
         # Simulate a slow pipeline so cancellation tests have something
         # to cancel. Tests that need fast finishing override this.

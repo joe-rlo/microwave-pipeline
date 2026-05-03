@@ -169,20 +169,44 @@ class TelegramChannel(Channel):
             await update.message.reply_text(f"Couldn't read that file: {e}")
 
     async def _on_photo(self, update: Update, context) -> None:
-        """Handle incoming photos."""
+        """Handle incoming photos.
+
+        Downloads the highest-resolution variant Telegram offers and
+        passes it through the pipeline as a multimodal content block.
+        Caption (if any) becomes the text portion; an empty caption
+        gets a small prompt so the model has something to respond to.
+        """
         user_id = str(update.message.from_user.id)
         chat_id = update.message.chat.id
         caption = update.message.caption or ""
 
-        # Photos can't be read as text — note it for context
-        message = (
-            f"[The user sent a photo]\n\n"
-            f"{caption or 'The user sent a photo. Acknowledge it. Note: you cannot see the image contents in this channel.'}"
+        # Telegram exposes photos at multiple resolutions; the last
+        # entry is the largest (also the most useful for vision).
+        try:
+            best = update.message.photo[-1]
+            tg_file = await context.bot.get_file(best.file_id)
+            data = await tg_file.download_as_bytearray()
+            image_bytes = bytes(data)
+        except Exception as e:
+            log.warning(f"Failed to download photo: {e}")
+            await update.message.reply_text(
+                f"Couldn't download that photo: {e}"
+            )
+            return
+
+        text = caption or "What's in this photo?"
+        await self._process_and_respond(
+            text, user_id, chat_id, context,
+            images=[(image_bytes, "image/jpeg")],
         )
-        await self._process_and_respond(message, user_id, chat_id, context)
 
     async def _process_and_respond(
-        self, text: str, user_id: str, chat_id: int, context
+        self,
+        text: str,
+        user_id: str,
+        chat_id: int,
+        context,
+        images: list[tuple[bytes, str]] | None = None,
     ) -> None:
         """Process a message through the pipeline and send the response."""
         typing_task = asyncio.create_task(self._typing_loop(chat_id, context))
@@ -194,7 +218,9 @@ class TelegramChannel(Channel):
             last_rendered = ""
             last_metadata = None
 
-            async for chunk in self.orchestrator.process(text, user_id=user_id, channel="telegram"):
+            async for chunk in self.orchestrator.process(
+                text, user_id=user_id, channel="telegram", images=images,
+            ):
                 if chunk["type"] in ("delta", "text"):
                     new_text = chunk.get("text") or chunk.get("chunk", "")
                     accumulated += new_text

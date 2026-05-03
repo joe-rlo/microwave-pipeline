@@ -134,12 +134,22 @@ class LLMClient:
         self._escalation_effort = None
 
     async def send(
-        self, user_message: str, memory_context: str | None = None
+        self,
+        user_message: str,
+        memory_context: str | None = None,
+        images: list[tuple[bytes, str]] | None = None,
     ) -> AsyncIterator[dict]:
         """Send a message and yield streaming chunks.
 
         Per-turn memory fragments from Stage 2 are prepended to the
         user message, not injected into the system prompt.
+
+        `images` is an optional list of (bytes, content_type) tuples.
+        When present, the message is sent as a multimodal Anthropic
+        content block array via the api_key path. The Agent SDK (max
+        auth) currently has no clean multimodal surface — we log a
+        warning and fall through to text-only there. Users on Max who
+        need vision should switch AUTH_MODE=api_key.
         """
         if memory_context:
             enriched = f"[Relevant memory context]\n{memory_context}\n\n{user_message}"
@@ -147,10 +157,17 @@ class LLMClient:
             enriched = user_message
 
         if self.auth_mode == "max":
+            if images:
+                log.warning(
+                    "LLMClient: %d image(s) received but Max auth path doesn't "
+                    "support multimodal; sending text-only. Switch to "
+                    "AUTH_MODE=api_key for vision.",
+                    len(images),
+                )
             async for chunk in self._send_max(enriched):
                 yield chunk
         else:
-            async for chunk in self._send_api_key(enriched):
+            async for chunk in self._send_api_key(enriched, images=images):
                 yield chunk
 
     async def _send_max(self, message: str) -> AsyncIterator[dict]:
@@ -205,8 +222,21 @@ class LLMClient:
                     "duration_ms": getattr(msg, "duration_ms", None),
                 }
 
-    async def _send_api_key(self, message: str) -> AsyncIterator[dict]:
-        """Send via standard Anthropic Messages API with streaming."""
+    async def _send_api_key(
+        self,
+        message: str,
+        images: list[tuple[bytes, str]] | None = None,
+    ) -> AsyncIterator[dict]:
+        """Send via standard Anthropic Messages API with streaming.
+
+        When `images` is present, the user content becomes a list of
+        content blocks: image blocks first (so the text can refer to
+        "this photo"), then a single text block. The conversation
+        history stores the same shape so subsequent turns inherit the
+        visual context.
+        """
+        import base64 as _base64
+
         MODEL_MAP = {
             "sonnet": "claude-sonnet-4-6-20260411",
             "opus": "claude-opus-4-6-20260411",
@@ -214,7 +244,21 @@ class LLMClient:
         }
         model_id = MODEL_MAP.get(self.model, self.model)
 
-        self._conversation.append({"role": "user", "content": message})
+        if images:
+            content_blocks: list[dict] = []
+            for img_bytes, ct in images:
+                content_blocks.append({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": ct or "image/jpeg",
+                        "data": _base64.b64encode(img_bytes).decode("ascii"),
+                    },
+                })
+            content_blocks.append({"type": "text", "text": message})
+            self._conversation.append({"role": "user", "content": content_blocks})
+        else:
+            self._conversation.append({"role": "user", "content": message})
 
         # Build request kwargs
         effort = getattr(self, "_escalation_effort", None)

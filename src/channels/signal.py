@@ -81,6 +81,10 @@ class _PendingTurn:
     # consumes `voice`; persists across addendum re-flushes so a cancelled
     # turn's transcription work isn't redone.
     transcribed: list[str] = field(default_factory=list)
+    # Tuples of (image_bytes, content_type) for image attachments —
+    # passed through to the pipeline as multimodal content blocks.
+    # Persists across addendum re-flushes so we don't have to re-download.
+    images: list[tuple[bytes, str]] = field(default_factory=list)
     is_typing: bool = False
     debounce_task: asyncio.Task | None = None
     maxhold_task: asyncio.Task | None = None
@@ -220,8 +224,9 @@ class SignalChannel(Channel):
         text = (data.get("message") or "").strip()
         attachments = data.get("attachments") or []
         voice_attachments = [a for a in attachments if _is_voice_note(a)]
+        image_attachments = [a for a in attachments if _is_image(a)]
 
-        if not text and not voice_attachments:
+        if not text and not voice_attachments and not image_attachments:
             return  # receipts, empty syncs, etc.
 
         # Swipe-to-reply context. Signal's daemon attaches a `quote` block
@@ -242,9 +247,9 @@ class SignalChannel(Channel):
 
         # Skill / project / bible commands short-circuit the buffer entirely.
         # They're meant to land instantly and don't combine meaningfully
-        # with other input. Skip if the user also sent a voice note —
-        # treat that as content, not a command.
-        if text and not voice_attachments:
+        # with other input. Skip if the user also sent a voice note OR an
+        # image — treat those as content, not a command.
+        if text and not voice_attachments and not image_attachments:
             for handler in (
                 handle_skill_command,
                 handle_project_command,
@@ -268,7 +273,27 @@ class SignalChannel(Channel):
                     source, f"_⚠️ couldn't download that voice message: {e}_"
                 )
 
-        await self._buffer_input(source, text=text, voice=downloaded_voice)
+        # Download image payloads now too — they're small and async, and
+        # downloading at receive-time means the addendum window can merge
+        # text-then-image (or vice versa) without redoing the download.
+        downloaded_images: list[tuple[bytes, str]] = []
+        for att in image_attachments:
+            try:
+                img = await self._download_attachment(att["id"])
+                ct = (att.get("contentType") or "image/jpeg").lower()
+                downloaded_images.append((img, ct))
+            except Exception as e:
+                log.warning(f"Image download failed: {e}")
+                await self._send_text(
+                    source, f"_⚠️ couldn't download that image: {e}_"
+                )
+
+        await self._buffer_input(
+            source,
+            text=text,
+            voice=downloaded_voice,
+            images=downloaded_images,
+        )
 
     async def _handle_typing(self, source: str, action: str) -> None:
         """Pause/resume the debounce timer based on typing state."""
@@ -306,6 +331,7 @@ class SignalChannel(Channel):
         source: str,
         text: str = "",
         voice: list[tuple[bytes, str]] | None = None,
+        images: list[tuple[bytes, str]] | None = None,
     ) -> None:
         """Append to the per-sender buffer.
 
@@ -362,6 +388,8 @@ class SignalChannel(Channel):
                         target.messages.append(text)
                     if voice:
                         target.voice.extend(voice)
+                    if images:
+                        target.images.extend(images)
                     if target.debounce_task and not target.debounce_task.done():
                         target.debounce_task.cancel()
                     if not target.is_typing:
@@ -388,6 +416,8 @@ class SignalChannel(Channel):
                     queued.messages.append(text)
                 if voice:
                     queued.voice.extend(voice)
+                if images:
+                    queued.images.extend(images)
                 # No debounce here — promotion in _safe_process's finally
                 # arms it once the active pipeline clears.
                 return
@@ -409,6 +439,8 @@ class SignalChannel(Channel):
                 pending.messages.append(text)
             if voice:
                 pending.voice.extend(voice)
+            if images:
+                pending.images.extend(images)
 
             # Reset debounce: cancel old timer, start a fresh DEBOUNCE_SECONDS
             # countdown. Skip if user is actively typing — they'll resume the
@@ -482,7 +514,12 @@ class SignalChannel(Channel):
             pending.debounce_task = None
             pending.maxhold_task = None
 
-        if not pending.messages and not pending.voice and not pending.transcribed:
+        if (
+            not pending.messages
+            and not pending.voice
+            and not pending.transcribed
+            and not pending.images
+        ):
             return
 
         # Transcribe any voice items we haven't transcribed yet — we drain
@@ -524,17 +561,34 @@ class SignalChannel(Channel):
                 else:
                     parts.append(joined)
         final = "\n\n".join(parts)
+        # If only images were sent (no text, no voice), give the model a
+        # generic prompt — Anthropic's API requires at least one text block
+        # in the user content, and "What's in this image?" matches what the
+        # user almost certainly wanted by sending a photo with no caption.
+        if not final.strip() and pending.images:
+            final = "What's in this image?"
         if not final.strip():
             return
 
+        # Snapshot images for the pipeline. Like transcription, we *keep*
+        # them on `pending` so an addendum-cancel re-flush doesn't lose
+        # them — the buffer is the source of truth across re-flushes; only
+        # the success path in _safe_process pops it.
+        snap_images = list(pending.images) if pending.images else None
+
         # Spawn the pipeline as a tracked task so a future incoming message
         # in the addendum window can cancel and merge.
-        task = asyncio.create_task(self._safe_process(final, source))
+        task = asyncio.create_task(self._safe_process(final, source, images=snap_images))
         async with self._state_lock:
             self._processing[source] = task
             self._pipeline_started_at[source] = time.monotonic()
 
-    async def _safe_process(self, text: str, source: str) -> None:
+    async def _safe_process(
+        self,
+        text: str,
+        source: str,
+        images: list[tuple[bytes, str]] | None = None,
+    ) -> None:
         """Wrapper around _process_and_respond that owns the buffer lifecycle.
 
         On normal completion (or surfaced error reply), the buffer is
@@ -548,7 +602,7 @@ class SignalChannel(Channel):
         """
         completed = False  # True on normal finish OR surfaced error reply
         try:
-            await self._process_and_respond(text, source)
+            await self._process_and_respond(text, source, images=images)
             completed = True
         except asyncio.CancelledError:
             log.info(f"Pipeline for {source} cancelled (addendum or shutdown)")
@@ -601,7 +655,12 @@ class SignalChannel(Channel):
                             if not queued.is_typing:
                                 self._arm_debounce(queued)
 
-    async def _process_and_respond(self, text: str, source: str) -> None:
+    async def _process_and_respond(
+        self,
+        text: str,
+        source: str,
+        images: list[tuple[bytes, str]] | None = None,
+    ) -> None:
         # Show typing while the pipeline works so the user doesn't stare
         # at a silent thread. Refreshed periodically — Signal's indicator
         # auto-expires after ~15s.
@@ -615,7 +674,7 @@ class SignalChannel(Channel):
         accumulated = ""
         try:
             async for chunk in self.orchestrator.process(
-                text, user_id=source, channel="signal"
+                text, user_id=source, channel="signal", images=images,
             ):
                 t = chunk["type"]
                 if t in ("delta", "text"):
@@ -897,6 +956,15 @@ def _is_voice_note(att: dict) -> bool:
         return True
     ct = (att.get("contentType") or "").lower()
     return ct.startswith("audio/")
+
+
+def _is_image(att: dict) -> bool:
+    """Match any image content-type. Anthropic's vision API accepts
+    jpeg/png/gif/webp; we forward whatever Signal labels as image/*
+    and let the API reject anything else with a clear error.
+    """
+    ct = (att.get("contentType") or "").lower()
+    return ct.startswith("image/")
 
 
 def _ext_for_content_type(content_type: str) -> str:
