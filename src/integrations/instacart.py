@@ -172,11 +172,13 @@ class InstacartClient:
         # `closed` check guards against tests that pass an already-closed
         # session by accident.
         own_session = self._session is None or self._session.closed
-        session = (
-            aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=self.timeout_sec))
-            if own_session
-            else self._session
-        )
+        if own_session:
+            from src.channels._http import make_session
+            session = make_session(
+                timeout=aiohttp.ClientTimeout(total=self.timeout_sec)
+            )
+        else:
+            session = self._session
 
         try:
             async with session.post(url, json=body, headers=headers) as resp:

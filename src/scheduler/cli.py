@@ -275,7 +275,8 @@ async def _build_channel(target: str, config):
             openai_api_key=config.openai_api_key,
         )
         # We skipped ch.start() but still need an aiohttp session.
-        ch._session = aiohttp.ClientSession()
+        from src.channels._http import make_session
+        ch._session = make_session()
         return ch
 
     if target == "telegram":

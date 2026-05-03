@@ -18,6 +18,8 @@ import logging
 
 import aiohttp
 
+from src.channels._http import make_session
+
 log = logging.getLogger(__name__)
 
 TTS_ENDPOINT = "https://api.openai.com/v1/audio/speech"
@@ -71,7 +73,7 @@ async def synthesize(
     # Per-call session — TTS isn't called frequently enough to justify
     # a long-lived client, and a per-call session avoids leaking state
     # across reply attempts.
-    async with aiohttp.ClientSession() as session:
+    async with make_session() as session:
         async with session.post(
             TTS_ENDPOINT,
             json=payload,

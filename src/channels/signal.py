@@ -22,6 +22,7 @@ from urllib.parse import quote
 import aiohttp
 
 from src.channels.base import Channel
+from src.channels._http import make_session
 from src.channels.signal_format import markdown_to_signal_text
 from src.channels.tts import TTSError, synthesize as tts_synthesize
 from src.pipeline.orchestrator import Orchestrator
@@ -141,7 +142,7 @@ class SignalChannel(Channel):
         self._state_lock = asyncio.Lock()
 
     async def start(self) -> None:
-        self._session = aiohttp.ClientSession()
+        self._session = make_session()
         self._ws_task = asyncio.create_task(self._receive_loop())
         log.info(
             f"Signal channel started for {self.phone_number} via {self.rest_url}"
@@ -827,7 +828,7 @@ class SignalChannel(Channel):
         form.add_field("response_format", "text")
 
         headers = {"Authorization": f"Bearer {self.openai_api_key}"}
-        async with aiohttp.ClientSession() as whisper_session:
+        async with make_session() as whisper_session:
             async with whisper_session.post(
                 "https://api.openai.com/v1/audio/transcriptions",
                 data=form,
