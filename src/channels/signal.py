@@ -23,6 +23,7 @@ import aiohttp
 
 from src.channels.base import Channel
 from src.channels.signal_format import markdown_to_signal_text
+from src.channels.tts import TTSError, synthesize as tts_synthesize
 from src.pipeline.orchestrator import Orchestrator
 from src.projects.bible import handle_bible_command
 from src.projects.chat import handle_project_command
@@ -55,6 +56,18 @@ ADDENDUM_WINDOW_SECONDS = 18.0
 # many seconds in. Signal has no streaming, so without this nudge a slow
 # turn looks indistinguishable from a stalled bot.
 THINKING_NUDGE_SECONDS = 4.0
+# OpenAI TTS voice for voice replies. Configurable via env (TTS_VOICE)
+# but a single value is opinionated by default — voice cloning / per-user
+# voices is a larger feature, not a v1 concern.
+DEFAULT_TTS_VOICE = "alloy"
+
+# Inline override markers. A user can force a reply mode regardless of
+# the input mode by including one of these phrases anywhere in the
+# message; the marker is stripped before the message reaches the LLM
+# so it doesn't pollute the prompt or session memory.
+import re as _re
+_REPLY_BY_VOICE_RE = _re.compile(r"\breply\s+by\s+voice\b", _re.IGNORECASE)
+_REPLY_BY_TEXT_RE = _re.compile(r"\breply\s+by\s+text\b", _re.IGNORECASE)
 
 
 @dataclass
@@ -548,13 +561,17 @@ class SignalChannel(Channel):
             await self._send_text(source, f'_heard: "{voice_combined}"_')
 
         # Compose the final input. Voice and text are tagged so the LLM
-        # can tell them apart even when bundled together.
+        # can tell them apart even when bundled together. Inline override
+        # markers ("reply by voice" / "reply by text") are detected and
+        # stripped before the LLM ever sees them — they're channel-layer
+        # routing hints, not part of the user's message to the agent.
         all_transcripts = list(pending.transcribed)
+        clean_messages, override = _extract_reply_override(pending.messages)
         parts: list[str] = []
         if all_transcripts:
             parts.append(f"[voice] {chr(10).join(all_transcripts)}")
-        if pending.messages:
-            joined = "\n\n".join(m for m in pending.messages if m.strip())
+        if clean_messages:
+            joined = "\n\n".join(m for m in clean_messages if m.strip())
             if joined:
                 if all_transcripts:
                     parts.append(f"[text caption] {joined}")
@@ -576,9 +593,24 @@ class SignalChannel(Channel):
         # the success path in _safe_process pops it.
         snap_images = list(pending.images) if pending.images else None
 
+        # Decide voice-vs-text reply: explicit override wins; otherwise
+        # match the input mode (voice in -> voice out, text in -> text out).
+        if override == "voice":
+            reply_as_voice = True
+        elif override == "text":
+            reply_as_voice = False
+        else:
+            reply_as_voice = bool(all_transcripts)
+
         # Spawn the pipeline as a tracked task so a future incoming message
         # in the addendum window can cancel and merge.
-        task = asyncio.create_task(self._safe_process(final, source, images=snap_images))
+        task = asyncio.create_task(
+            self._safe_process(
+                final, source,
+                images=snap_images,
+                reply_as_voice=reply_as_voice,
+            )
+        )
         async with self._state_lock:
             self._processing[source] = task
             self._pipeline_started_at[source] = time.monotonic()
@@ -588,6 +620,7 @@ class SignalChannel(Channel):
         text: str,
         source: str,
         images: list[tuple[bytes, str]] | None = None,
+        reply_as_voice: bool = False,
     ) -> None:
         """Wrapper around _process_and_respond that owns the buffer lifecycle.
 
@@ -602,7 +635,9 @@ class SignalChannel(Channel):
         """
         completed = False  # True on normal finish OR surfaced error reply
         try:
-            await self._process_and_respond(text, source, images=images)
+            await self._process_and_respond(
+                text, source, images=images, reply_as_voice=reply_as_voice,
+            )
             completed = True
         except asyncio.CancelledError:
             log.info(f"Pipeline for {source} cancelled (addendum or shutdown)")
@@ -660,6 +695,7 @@ class SignalChannel(Channel):
         text: str,
         source: str,
         images: list[tuple[bytes, str]] | None = None,
+        reply_as_voice: bool = False,
     ) -> None:
         # Show typing while the pipeline works so the user doesn't stare
         # at a silent thread. Refreshed periodically — Signal's indicator
@@ -709,8 +745,27 @@ class SignalChannel(Channel):
 
             if accumulated:
                 formatted = markdown_to_signal_text(accumulated)
-                for part in _split_message(formatted):
-                    await self._send_text(source, part)
+                # Voice reply path: synthesize first so we can attach the
+                # audio + a small text transcript. If synthesis fails we
+                # fall through to text-only with a brief note rather than
+                # silently dropping the response.
+                if reply_as_voice and accumulated.strip():
+                    audio_sent = await self._send_voice_reply(source, accumulated)
+                    if audio_sent:
+                        # Send a short text transcript alongside so the
+                        # conversation stays auditable (parallel to the
+                        # `_heard:_` echo on the way in).
+                        for part in _split_message(formatted):
+                            await self._send_text(source, part)
+                    else:
+                        # Synthesis failed — already surfaced by the helper;
+                        # fall through to plain-text reply so the user
+                        # actually gets the answer.
+                        for part in _split_message(formatted):
+                            await self._send_text(source, part)
+                else:
+                    for part in _split_message(formatted):
+                        await self._send_text(source, part)
         finally:
             typing_task.cancel()
             thinking_task.cancel()
@@ -795,6 +850,48 @@ class SignalChannel(Channel):
                 await asyncio.sleep(TYPING_REFRESH_SECONDS)
         except asyncio.CancelledError:
             pass
+
+    async def _send_voice_reply(self, recipient: str, text: str) -> bool:
+        """Synthesize `text` via OpenAI TTS and send as a voice attachment.
+
+        Returns True on success, False on failure (caller falls through
+        to text-only reply). Strips Markdown emphasis before synthesis
+        so the spoken voice doesn't say "underscore underscore"; the
+        text transcript shipped alongside keeps the formatting.
+        """
+        if not self.openai_api_key:
+            log.warning("Voice reply requested but OPENAI_API_KEY not set")
+            await self._send_text(
+                recipient,
+                "_⚠️ couldn't synthesize voice reply (OPENAI_API_KEY missing); "
+                "here's the text:_",
+            )
+            return False
+        try:
+            # Mild cleanup so TTS doesn't read literal markdown punctuation.
+            spoken = _strip_markdown_emphasis(text)
+            audio = await tts_synthesize(
+                spoken,
+                api_key=self.openai_api_key,
+                voice=DEFAULT_TTS_VOICE,
+            )
+        except TTSError as e:
+            log.warning(f"TTS synthesis failed: {e}")
+            await self._send_text(
+                recipient,
+                f"_⚠️ couldn't synthesize voice reply ({e}); here's the text:_",
+            )
+            return False
+        except Exception as e:
+            log.exception(f"Unexpected TTS error: {e}")
+            await self._send_text(
+                recipient,
+                "_⚠️ voice synthesis hit an unexpected error; here's the text:_",
+            )
+            return False
+
+        await self._send_attachment(recipient, "reply.aac", audio)
+        return True
 
     async def _thinking_nudge(self, recipient: str) -> None:
         """Send a one-shot "_…thinking_" message after a quiet pause.
@@ -956,6 +1053,48 @@ def _is_voice_note(att: dict) -> bool:
         return True
     ct = (att.get("contentType") or "").lower()
     return ct.startswith("audio/")
+
+
+def _extract_reply_override(messages: list[str]) -> tuple[list[str], str | None]:
+    """Detect inline `reply by voice` / `reply by text` markers.
+
+    Returns `(cleaned_messages, override)` where override is "voice",
+    "text", or None. Markers are stripped from the messages so the
+    LLM doesn't see them — they're channel routing hints, not part
+    of the user's actual content. If both markers appear (rare; user
+    contradicting themselves), `voice` wins because the user
+    specifically asking for voice is the more deliberate signal.
+    """
+    override: str | None = None
+    cleaned: list[str] = []
+    for m in messages:
+        text = m
+        if _REPLY_BY_VOICE_RE.search(text):
+            override = "voice"
+            text = _REPLY_BY_VOICE_RE.sub("", text).strip()
+        if _REPLY_BY_TEXT_RE.search(text):
+            if override != "voice":
+                override = "text"
+            text = _REPLY_BY_TEXT_RE.sub("", text).strip()
+        # Collapse double-spaces left by the regex strip.
+        text = " ".join(text.split())
+        cleaned.append(text)
+    return cleaned, override
+
+
+def _strip_markdown_emphasis(text: str) -> str:
+    """Strip *bold* / _italic_ / `code` markers so TTS doesn't read
+    the punctuation literally. Headings, list bullets, and other
+    markdown live structurally, not character-by-character — leaving
+    them intact is fine for spoken output.
+    """
+    # Process in order so e.g. `**bold**` becomes `bold`, not `*bold*`.
+    out = text
+    out = _re.sub(r"\*\*(.+?)\*\*", r"\1", out)  # bold (markdown)
+    out = _re.sub(r"\*(.+?)\*", r"\1", out)       # italic *...*
+    out = _re.sub(r"_(.+?)_", r"\1", out)         # italic / Signal-style
+    out = _re.sub(r"`(.+?)`", r"\1", out)         # inline code
+    return out
 
 
 def _is_image(att: dict) -> bool:
