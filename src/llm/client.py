@@ -35,12 +35,20 @@ class LLMClient:
     """
 
     def __init__(self, model: str = "sonnet", auth_mode: str = "max", api_key: str = "",
-                 cli_path: str = "", output_dir: str = "", tool_bundle=None):
+                 cli_path: str = "", output_dir: str = "", workspace_dir: str = "",
+                 tool_bundle=None):
         self.model = model
         self.auth_mode = auth_mode
         self.api_key = api_key
         self.cli_path = cli_path
         self.output_dir = output_dir
+        # Agent SDK cwd. Without this, the SDK runs in whatever directory
+        # the bot process was launched from (typically the source repo),
+        # so when the LLM writes a relative path like
+        # `workspace/skills/foo/SKILL.md` it lands in the source tree
+        # instead of the user's personal workspace. Pinning cwd to the
+        # workspace's parent makes those relative writes resolve correctly.
+        self.workspace_dir = workspace_dir
         # ToolBundle from src.tools.build_tools — None means no tools.
         # Stashed on the instance so reconnect() can rewire after a
         # stable-context refresh without the orchestrator re-passing it.
@@ -73,6 +81,16 @@ class LLMClient:
                 model=self.model,
                 cli_path=self.cli_path or None,
             )
+            # Pin the SDK's working directory to the user's workspace so
+            # relative-path writes from tool calls land in the personal
+            # workspace instead of wherever the bot was launched from.
+            # The "parent" so a path like `workspace/skills/...` resolves
+            # under `<home>/.microwaveos/workspace/skills/...`.
+            if self.workspace_dir:
+                from pathlib import Path as _Path
+                ws = _Path(self.workspace_dir)
+                opts["cwd"] = str(ws.parent)
+                opts["add_dirs"] = [str(ws)]
             bundle = self.tool_bundle
             if bundle and not bundle.is_empty:
                 opts["mcp_servers"] = bundle.mcp_servers
@@ -316,11 +334,18 @@ class SingleTurnClient:
     Uses the query() function for simple one-shot interactions.
     """
 
-    def __init__(self, model: str = "haiku", auth_mode: str = "max", api_key: str = "", cli_path: str = ""):
+    def __init__(self, model: str = "haiku", auth_mode: str = "max", api_key: str = "",
+                 cli_path: str = "", workspace_dir: str = ""):
         self.model = model
         self.auth_mode = auth_mode
         self.api_key = api_key
         self.cli_path = cli_path
+        # Agent SDK cwd hint — same purpose as on LLMClient: pin relative
+        # writes to the user's workspace, not the source repo. SingleTurn
+        # callers (triage, reflection, scheduler one-shots, memory-health)
+        # mostly don't write files, but setting cwd consistently means a
+        # future caller that does will land in the right place.
+        self.workspace_dir = workspace_dir
 
     async def query(self, system_prompt: str, user_message: str) -> str:
         """Single-turn query. Returns the full response text."""
@@ -339,12 +364,18 @@ class SingleTurnClient:
             self.auth_mode = "api_key"
             return await self._query_api_key(system_prompt, user_message)
 
-        options = ClaudeAgentOptions(
+        opts: dict = dict(
             system_prompt=system_prompt,
             allowed_tools=[],
             model=self.model,
             cli_path=self.cli_path or None,
         )
+        if self.workspace_dir:
+            from pathlib import Path as _Path
+            ws = _Path(self.workspace_dir)
+            opts["cwd"] = str(ws.parent)
+            opts["add_dirs"] = [str(ws)]
+        options = ClaudeAgentOptions(**opts)
 
         response = ""
         async for msg in sdk_query(prompt=user_message, options=options):

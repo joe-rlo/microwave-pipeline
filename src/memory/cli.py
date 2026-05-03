@@ -67,6 +67,7 @@ async def _health() -> int:
         auth_mode=config.auth_mode,
         api_key=config.anthropic_api_key,
         cli_path=config.cli_path,
+        workspace_dir=str(config.workspace_dir),
     )
     print(format_for_cli(contradictions), file=sys.stdout)
     return 0

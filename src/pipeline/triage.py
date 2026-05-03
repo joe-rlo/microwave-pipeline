@@ -182,6 +182,7 @@ async def triage(
     api_key: str = "",
     cli_path: str = "",
     skills: list[tuple[str, str]] | None = None,
+    workspace_dir: str = "",
 ) -> TriageResult:
     """Run triage classification on a user message.
 
@@ -192,7 +193,10 @@ async def triage(
     """
     from src.pipeline.json_utils import query_json_with_retry
 
-    client = SingleTurnClient(model=model, auth_mode=auth_mode, api_key=api_key, cli_path=cli_path)
+    client = SingleTurnClient(
+        model=model, auth_mode=auth_mode, api_key=api_key, cli_path=cli_path,
+        workspace_dir=workspace_dir,
+    )
     input_text = _format_triage_input(message, recent_turns)
     prompt = _build_prompt(skills)
     available = {name for name, _ in skills} if skills else None

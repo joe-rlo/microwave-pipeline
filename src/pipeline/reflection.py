@@ -101,11 +101,15 @@ async def reflect(
     auth_mode: str = "max",
     api_key: str = "",
     cli_path: str = "",
+    workspace_dir: str = "",
 ) -> ReflectionResult:
     """Run quality gate on a response. Returns action recommendation."""
     from src.pipeline.json_utils import query_json_with_retry
 
-    client = SingleTurnClient(model=model, auth_mode=auth_mode, api_key=api_key, cli_path=cli_path)
+    client = SingleTurnClient(
+        model=model, auth_mode=auth_mode, api_key=api_key, cli_path=cli_path,
+        workspace_dir=workspace_dir,
+    )
     input_text = _format_reflection_input(response, context)
 
     data = await query_json_with_retry(

@@ -120,6 +120,7 @@ class Orchestrator:
             api_key=self.config.anthropic_api_key,
             cli_path=self.config.cli_path,
             output_dir=str(self.config.output_dir),
+            workspace_dir=str(self.config.workspace_dir),
             tool_bundle=self.tool_bundle,
         )
 
@@ -220,6 +221,7 @@ class Orchestrator:
             api_key=self.config.anthropic_api_key,
             cli_path=self.config.cli_path,
             skills=skill_catalog or None,
+            workspace_dir=str(self.config.workspace_dir),
         )
 
         # Resolve the skill in effect for THIS turn. Explicit pin always wins;
@@ -333,6 +335,7 @@ class Orchestrator:
             auth_mode=self.config.auth_mode,
             api_key=self.config.anthropic_api_key,
             cli_path=self.config.cli_path,
+            workspace_dir=str(self.config.workspace_dir),
         )
 
         # Handle re-search (one retry max)
@@ -566,6 +569,7 @@ class Orchestrator:
             auth_mode=self.config.auth_mode,
             api_key=self.config.anthropic_api_key,
             cli_path=self.config.cli_path,
+            workspace_dir=str(self.config.workspace_dir),
         )
         summary = await compactor.query(
             "Summarize this conversation concisely, preserving key facts, decisions, and context "

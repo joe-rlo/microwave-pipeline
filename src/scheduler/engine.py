@@ -219,6 +219,7 @@ class Scheduler:
             auth_mode=self.config.auth_mode,
             api_key=self.config.anthropic_api_key,
             cli_path=self.config.cli_path,
+            workspace_dir=str(self.config.workspace_dir),
         )
 
         system_prompt, user_message = await self._compose_prompt(job)

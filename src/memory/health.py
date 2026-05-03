@@ -82,6 +82,7 @@ async def detect_contradictions(
     auth_mode: str = "max",
     api_key: str = "",
     cli_path: str = "",
+    workspace_dir: str = "",
 ) -> list[Contradiction]:
     """Scan a memory document for likely contradictions.
 
@@ -98,6 +99,7 @@ async def detect_contradictions(
         auth_mode=auth_mode,
         api_key=api_key,
         cli_path=cli_path,
+        workspace_dir=workspace_dir,
     )
 
     data = await query_json_with_retry(
