@@ -500,22 +500,46 @@ class Orchestrator:
         """
         from src.llm.client import SingleTurnClient
 
-        old_turns, recent_turns = self.session_engine.get_turns_for_compaction(self._session_id)
-        if not old_turns:
+        # Importance-aware split: substantive turns (complex triage or
+        # high reflection confidence) stay verbatim past the rollup
+        # boundary; only conversational chitchat gets summarized.
+        to_summarize, to_keep_verbatim, recent_turns = (
+            self.session_engine.get_turns_for_compaction(self._session_id)
+        )
+        if not to_summarize and not to_keep_verbatim:
             return
 
-        log.info(f"Compacting {len(old_turns)} turns")
+        log.info(
+            f"Compacting {len(to_summarize)} turn(s); "
+            f"keeping {len(to_keep_verbatim)} verbatim past rollup; "
+            f"recent {len(recent_turns)} unchanged"
+        )
+
+        if not to_summarize:
+            # Nothing actually rolls up — every old turn was important.
+            # Skip the summarizer call entirely; the session stays as-is.
+            return
 
         # Memory flush: extract facts before compaction
         facts_text = "\n".join(
-            f"{t.role}: {t.content}" for t in old_turns
+            f"{t.role}: {t.content}" for t in to_summarize
         )
         self.memory_store.append_daily(
             f"[Session {self._session_id} compaction notes]\n"
-            f"Compacted {len(old_turns)} turns at {datetime.now().isoformat()}"
+            f"Compacted {len(to_summarize)} turns at {datetime.now().isoformat()}"
+            + (f"; kept {len(to_keep_verbatim)} important turn(s) verbatim" if to_keep_verbatim else "")
         )
 
-        # Summarize via Sonnet
+        # Summarize via Sonnet. The "kept verbatim" preamble tells the
+        # model that some substantive turns are being preserved alongside
+        # this summary, so it shouldn't try to capture everything — just
+        # the conversational glue between the kept turns.
+        verbatim_note = (
+            "\n\nNote: some important turns from this period are being preserved "
+            "verbatim outside this summary; you don't need to capture them. "
+            "Focus on conversational context that needs compression."
+            if to_keep_verbatim else ""
+        )
         compactor = SingleTurnClient(
             model=self.config.model_compaction,
             auth_mode=self.config.auth_mode,
@@ -525,11 +549,13 @@ class Orchestrator:
         summary = await compactor.query(
             "Summarize this conversation concisely, preserving key facts, decisions, and context "
             "that would be needed to continue the conversation naturally. "
-            "Focus on what was discussed and any conclusions reached.",
+            "Focus on what was discussed and any conclusions reached." + verbatim_note,
             facts_text[:8000],
         )
 
-        old_ids = [t.id for t in old_turns if t.id is not None]
+        # Only the to_summarize turns get replaced; to_keep_verbatim turns
+        # stay in the session table untouched.
+        old_ids = [t.id for t in to_summarize if t.id is not None]
         self.session_engine.replace_with_summary(self._session_id, old_ids, summary)
 
         # Index the summary into the fragment store so it's searchable in the
@@ -562,10 +588,14 @@ class Orchestrator:
             log.warning(f"Post-compaction history injection failed: {e}")
 
         # Tell the channel so it can surface a status message to the user.
+        # `turns_kept` includes both recent turns and any turns preserved
+        # verbatim past the rollup (importance-aware compaction); from the
+        # user's perspective these are all "still in context."
         yield {
             "type": "compaction",
-            "turns_compacted": len(old_turns),
-            "turns_kept": len(recent_turns),
+            "turns_compacted": len(to_summarize),
+            "turns_kept": len(recent_turns) + len(to_keep_verbatim),
+            "turns_kept_important": len(to_keep_verbatim),
         }
 
     async def _inject_history(self, turns: list[Turn]) -> None:

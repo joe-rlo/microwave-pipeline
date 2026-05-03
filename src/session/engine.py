@@ -16,6 +16,35 @@ from src.session.models import Turn
 
 log = logging.getLogger(__name__)
 
+# Compaction exempts old turns whose `reflection_confidence` is above this
+# threshold OR whose `triage_complexity` is "complex". Tunable per-call via
+# `get_turns_for_compaction(..., importance_threshold=...)`. Surfaced in
+# `compaction_stats()` so the user can see whether the cut is right and
+# adjust from real session logs rather than guesses.
+COMPACTION_IMPORTANCE_THRESHOLD = 0.7
+
+
+def _is_important_turn(turn: Turn, threshold: float) -> bool:
+    """Return True if a turn should survive compaction's rollup.
+
+    Two signals, either sufficient: triage flagged the turn as
+    `complex` (multi-step reasoning, real depth) OR reflection rated
+    its confidence above the threshold (the model's own quality
+    signal). Either alone is a strong enough hint that this turn
+    held something worth remembering verbatim.
+    """
+    meta = turn.metadata or {}
+    if meta.get("triage_complexity") == "complex":
+        return True
+    confidence = meta.get("reflection_confidence")
+    if confidence is not None:
+        try:
+            if float(confidence) > threshold:
+                return True
+        except (TypeError, ValueError):
+            pass
+    return False
+
 
 class SessionEngine:
     def __init__(self, db_path: Path, context_limit: int = 200_000, compaction_threshold: float = 0.8):
@@ -197,13 +226,47 @@ class SessionEngine:
         used = self.session_token_count(session_id)
         return used >= self.context_limit * self.compaction_threshold
 
-    def get_turns_for_compaction(self, session_id: str, keep_recent: int = 6) -> tuple[list[Turn], list[Turn]]:
-        """Split turns into old (to compact) and recent (to keep)."""
+    def get_turns_for_compaction(
+        self,
+        session_id: str,
+        keep_recent: int = 6,
+        importance_threshold: float = COMPACTION_IMPORTANCE_THRESHOLD,
+    ) -> tuple[list[Turn], list[Turn], list[Turn]]:
+        """Split turns into three buckets for importance-aware compaction.
+
+        Returns `(to_summarize, to_keep_verbatim, recent)`:
+
+        - `recent`: the last `keep_recent` turns regardless of importance —
+          always preserved verbatim, same as before.
+        - `to_keep_verbatim`: older turns whose stored metadata flags them
+          as substantive (`triage_complexity == "complex"` OR
+          `reflection_confidence > importance_threshold`). Stay verbatim
+          past the rollup boundary so the summary doesn't compress
+          decisions, plans, and deep discussions at the same rate as
+          small talk.
+        - `to_summarize`: everything else among the older turns — the
+          conversational chitchat that's safe to roll up.
+
+        Why importance-aware: today's blunt rollup throws away exactly
+        the kind of conversation that made the relationship feel real
+        (decisions, plans, deep discussions) at the same rate as
+        small talk. Inverting that — keep the substantive, compress the
+        trivial — is what the user actually wants from "memory."
+        """
         all_turns = self.get_turns(session_id)
         if len(all_turns) <= keep_recent:
-            return [], all_turns
+            return [], [], all_turns
         split = len(all_turns) - keep_recent
-        return all_turns[:split], all_turns[split:]
+        old, recent = all_turns[:split], all_turns[split:]
+
+        to_summarize: list[Turn] = []
+        to_keep_verbatim: list[Turn] = []
+        for turn in old:
+            if _is_important_turn(turn, importance_threshold):
+                to_keep_verbatim.append(turn)
+            else:
+                to_summarize.append(turn)
+        return to_summarize, to_keep_verbatim, recent
 
     def replace_with_summary(self, session_id: str, old_turn_ids: list[int], summary: str) -> None:
         """Replace old turns with a compaction summary."""
