@@ -50,26 +50,47 @@ def _format_reflection_input(response: str, context: str) -> str:
     return "\n".join(parts)
 
 
+# Schema hint for the retry prompt — keep in sync with the JSON shape in
+# REFLECTION_PROMPT.
+_REFLECTION_SCHEMA_HINT = (
+    '{"confidence": float, "hedging_detected": bool, '
+    '"action": "deliver|re-search|clarify", '
+    '"memory_gap": string|null}'
+)
+
+
 def _parse_reflection_response(raw: str, original_response: str) -> ReflectionResult:
+    """Single-shot parse with fallback — used by unit tests. Production
+    path in `reflect()` uses `query_json_with_retry` for one corrective
+    re-prompt before falling back."""
     from src.pipeline.json_utils import extract_json
 
     data = extract_json(raw)
     if data is None:
         log.warning(f"Reflection parse failed, defaulting to deliver (response: {raw[:100]!r})")
-        return ReflectionResult(
-            response=original_response,
-            confidence=0.8,
-            hedging_detected=False,
-            action="deliver",
-            memory_gap=None,
-        )
+        return _default_reflection(original_response)
+    return _result_from_data(data, original_response)
 
+
+def _result_from_data(data: dict, original_response: str) -> ReflectionResult:
+    """Project a parsed JSON dict into a ReflectionResult with safe defaults
+    for any missing fields."""
     return ReflectionResult(
         response=original_response,
         confidence=data.get("confidence", 0.8),
         hedging_detected=data.get("hedging_detected", False),
         action=data.get("action", "deliver"),
         memory_gap=data.get("memory_gap"),
+    )
+
+
+def _default_reflection(original_response: str) -> ReflectionResult:
+    return ReflectionResult(
+        response=original_response,
+        confidence=0.8,
+        hedging_detected=False,
+        action="deliver",
+        memory_gap=None,
     )
 
 
@@ -82,23 +103,27 @@ async def reflect(
     cli_path: str = "",
 ) -> ReflectionResult:
     """Run quality gate on a response. Returns action recommendation."""
+    from src.pipeline.json_utils import query_json_with_retry
+
     client = SingleTurnClient(model=model, auth_mode=auth_mode, api_key=api_key, cli_path=cli_path)
     input_text = _format_reflection_input(response, context)
 
-    try:
-        raw = await client.query(REFLECTION_PROMPT, input_text)
-        result = _parse_reflection_response(raw, response)
-        log.info(
-            f"Reflection: confidence={result.confidence:.2f}, "
-            f"action={result.action}, hedging={result.hedging_detected}"
-        )
-        if result.memory_gap:
-            log.info(f"Memory gap: {result.memory_gap}")
-        return result
-    except Exception as e:
-        log.error(f"Reflection failed: {e}")
-        return ReflectionResult(
-            response=response,
-            confidence=0.8,
-            action="deliver",
-        )
+    data = await query_json_with_retry(
+        client.query,
+        REFLECTION_PROMPT,
+        input_text,
+        _REFLECTION_SCHEMA_HINT,
+        label="reflection",
+    )
+    if data is None:
+        log.warning("Reflection falling back to deliver after parse exhausted")
+        return _default_reflection(response)
+
+    result = _result_from_data(data, response)
+    log.info(
+        f"Reflection: confidence={result.confidence:.2f}, "
+        f"action={result.action}, hedging={result.hedging_detected}"
+    )
+    if result.memory_gap:
+        log.info(f"Memory gap: {result.memory_gap}")
+    return result

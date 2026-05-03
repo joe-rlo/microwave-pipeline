@@ -118,22 +118,41 @@ def _default_triage() -> TriageResult:
     )
 
 
+# Schema hint shown to the model on the retry prompt — terse on purpose so
+# the retry call stays cheap. Keep in sync with the JSON shape in
+# TRIAGE_PROMPT_BASE; if you add a field to the prompt, mirror it here.
+_TRIAGE_SCHEMA_HINT = (
+    '{"intent": "recall|preference|task|question|social", '
+    '"complexity": "simple|moderate|complex", '
+    '"needs_memory": true|false, '
+    '"search_params": {"decay_half_life": float, "result_count": int, '
+    '"weight_recency": float, "mmr_lambda": float}, '
+    '"matched_skill": string|null}'
+)
+
+
 def _parse_triage_response(
     response: str, available_skills: set[str] | None = None
 ) -> TriageResult:
-    """Parse JSON response from triage model, with fallback defaults.
-
-    `available_skills` is used to validate matched_skill — if Haiku
-    returns a name that doesn't match any real skill (hallucination or
-    case mismatch), we drop it to None rather than trust it.
-    """
+    """Single-shot parse with fallback to defaults — used by unit tests
+    and as the base projection for the retry helper. The production path
+    in `triage()` goes through `query_json_with_retry`, which calls into
+    `_result_from_data` directly after a successful parse."""
     from src.pipeline.json_utils import extract_json
 
     data = extract_json(response)
     if data is None:
         log.warning(f"Triage parse failed, using defaults (response: {response[:100]!r})")
         return _default_triage()
+    return _result_from_data(data, available_skills=available_skills)
 
+
+def _result_from_data(
+    data: dict, available_skills: set[str] | None
+) -> TriageResult:
+    """Project a parsed JSON dict into a TriageResult with safe defaults
+    for any missing fields. Centralized so the parse path and the retry
+    path share the same coercion logic."""
     matched = data.get("matched_skill")
     if matched is not None:
         matched = str(matched).strip() or None
@@ -171,20 +190,28 @@ async def triage(
     (or null) — enables the adaptive-skill activation feature without
     any second model call.
     """
+    from src.pipeline.json_utils import query_json_with_retry
+
     client = SingleTurnClient(model=model, auth_mode=auth_mode, api_key=api_key, cli_path=cli_path)
     input_text = _format_triage_input(message, recent_turns)
     prompt = _build_prompt(skills)
     available = {name for name, _ in skills} if skills else None
 
-    try:
-        response = await client.query(prompt, input_text)
-        result = _parse_triage_response(response, available_skills=available)
-        skill_note = f", skill={result.matched_skill!r}" if result.matched_skill else ""
-        log.info(
-            f"Triage: intent={result.intent}, complexity={result.complexity}, "
-            f"needs_memory={result.needs_memory}{skill_note}"
-        )
-        return result
-    except Exception as e:
-        log.error(f"Triage failed: {e}")
-        return _parse_triage_response("", available_skills=available)  # returns defaults
+    data = await query_json_with_retry(
+        client.query,
+        prompt,
+        input_text,
+        _TRIAGE_SCHEMA_HINT,
+        label="triage",
+    )
+    if data is None:
+        log.warning("Triage falling back to defaults after parse exhausted")
+        return _default_triage()
+
+    result = _result_from_data(data, available_skills=available)
+    skill_note = f", skill={result.matched_skill!r}" if result.matched_skill else ""
+    log.info(
+        f"Triage: intent={result.intent}, complexity={result.complexity}, "
+        f"needs_memory={result.needs_memory}{skill_note}"
+    )
+    return result
