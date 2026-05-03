@@ -28,6 +28,47 @@ RRF_K = 60  # Reciprocal Rank Fusion constant
 RECENT_TURN_HOURS = 48.0
 RECENT_TURN_LIMIT = 4
 
+# Project-aware retrieval boosts. When a project is active, fragments
+# from THAT project rank higher and fragments from OTHER projects rank
+# lower; everything outside any project (global memory, daily notes,
+# session summaries) stays at 1.0× so the active-project signal doesn't
+# starve general-knowledge recall.
+#
+# Down-weighting (not exclusion) is deliberate: a novel question can
+# still benefit from a tangentially-relevant Substack reference. Let
+# the LLM decide what's relevant after retrieval; don't filter at the
+# search layer.
+ACTIVE_PROJECT_BOOST = 1.5
+OTHER_PROJECT_DOWNWEIGHT = 0.5
+
+
+def _project_for_source(source: str) -> str | None:
+    """Return the project name if `source` is inside a project's tree, else None.
+
+    Project sources look like `.../workspace/projects/<name>/...` —
+    typically `drafts/chapter-NN.md`, `BIBLE.md`, or `outline.md`. The
+    indexer stores the absolute path as `source`, so we just walk for
+    the `projects/` segment.
+
+    Robust to trailing slashes and OS path separators (we work on the
+    string, not Path, since `source` is whatever the indexer stored).
+    """
+    if not source:
+        return None
+    # Use forward slashes for matching — `source` is always a POSIX
+    # str(path) on disk per `index_text(text, source=str(path))`.
+    norm = source.replace("\\", "/")
+    marker = "/projects/"
+    idx = norm.find(marker)
+    if idx == -1:
+        return None
+    tail = norm[idx + len(marker):]
+    # First segment after `projects/` is the project name.
+    first_slash = tail.find("/")
+    if first_slash <= 0:
+        return None
+    return tail[:first_slash]
+
 
 class MemorySearcher:
     def __init__(
@@ -45,8 +86,15 @@ class MemorySearcher:
         query: str,
         triage: TriageResult,
         max_results: int | None = None,
+        active_project: str | None = None,
     ) -> SearchResult:
-        """Run hybrid search shaped by triage parameters."""
+        """Run hybrid search shaped by triage parameters.
+
+        `active_project`, when set, biases retrieval toward fragments
+        from that project's drafts/bible/outline (×1.5) and away from
+        other projects' fragments (×0.5). Global memory and session
+        turns are unaffected.
+        """
         start = time.time()
 
         params = triage.search_params
@@ -68,6 +116,18 @@ class MemorySearcher:
             age_days = (now - frag.timestamp).total_seconds() / 86400
             decay = 0.5 ** (age_days / decay_half_life)
             frag.score = frag.score * (1 - weight_recency) + decay * weight_recency
+
+        # Apply project-aware boost / downweight before sorting so the
+        # active project's fragments naturally rise to the top.
+        if active_project:
+            for frag in merged:
+                proj = _project_for_source(frag.source)
+                if proj is None:
+                    continue  # global memory, daily notes, session summary — leave alone
+                if proj == active_project:
+                    frag.score *= ACTIVE_PROJECT_BOOST
+                else:
+                    frag.score *= OTHER_PROJECT_DOWNWEIGHT
 
         # Sort by adjusted score
         merged.sort(key=lambda f: f.score, reverse=True)

@@ -17,16 +17,20 @@ async def search(
     query: str,
     triage_result: TriageResult,
     searcher: MemorySearcher,
+    active_project: str | None = None,
 ) -> SearchResult:
     """Run memory search shaped by triage parameters.
 
     If triage says no memory needed, returns empty result immediately.
+
+    `active_project` is forwarded to the searcher so retrieval can
+    weight the active project's fragments higher than other projects'.
     """
     if not triage_result.needs_memory:
         log.info("Triage says no memory needed, skipping search")
         return SearchResult(fragments=[], strategy_used="skipped", search_time_ms=0)
 
-    result = await searcher.search(query, triage_result)
+    result = await searcher.search(query, triage_result, active_project=active_project)
     log.info(
         f"Search: {len(result.fragments)} fragments in {result.search_time_ms}ms "
         f"({result.strategy_used})"

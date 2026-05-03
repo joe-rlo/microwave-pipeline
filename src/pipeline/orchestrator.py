@@ -242,7 +242,17 @@ class Orchestrator:
             }
 
         # --- Stage 2: Search ---
-        search_result = await search(message, triage_result, self.searcher)
+        # Pass active project so retrieval can weight that project's
+        # fragments higher and downweight other projects' (preventing
+        # cross-pollination — e.g., a "Sarah" character in a novel
+        # bleeding into Substack drafts about a different Sarah).
+        active_project_name = (
+            self._active_project.name if self._active_project else None
+        )
+        search_result = await search(
+            message, triage_result, self.searcher,
+            active_project=active_project_name,
+        )
 
         # --- Stage 3: Assembly ---
         bible_path = self._active_bible_path()
@@ -331,7 +341,8 @@ class Orchestrator:
             )
 
             retry_search = await search(
-                reflection_result.memory_gap, broader_triage, self.searcher
+                reflection_result.memory_gap, broader_triage, self.searcher,
+                active_project=active_project_name,
             )
 
             if retry_search.fragments:
