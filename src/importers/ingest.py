@@ -18,7 +18,7 @@ from src.memory.store import MemoryStore
 log = logging.getLogger(__name__)
 
 
-def ingest_sessions(
+async def ingest_sessions(
     sessions: list[dict],
     source_name: str,
     memory_index: MemoryIndex,
@@ -55,14 +55,14 @@ def ingest_sessions(
 
         session_id = session.get("session_id", "unknown")
         source = f"{source_name}/session/{session_id}"
-        ids = memory_index.index_text(text, source=source, timestamp=timestamp)
+        ids = await memory_index.index_text(text, source=source, timestamp=timestamp)
         total += len(ids)
 
     log.info(f"Indexed {total} fragments from {len(sessions)} {source_name} sessions")
     return total
 
 
-def ingest_memories(
+async def ingest_memories(
     memories: list[dict],
     source_name: str,
     memory_store: MemoryStore,
@@ -88,7 +88,7 @@ def ingest_memories(
         source = f"{source_name}/memory/{path}"
 
         # Index for search
-        ids = memory_index.index_text(content, source=source)
+        ids = await memory_index.index_text(content, source=source)
         total += len(ids)
 
         # Optionally merge to MEMORY.md
@@ -105,7 +105,7 @@ def ingest_memories(
     return total
 
 
-def ingest_daily_notes(
+async def ingest_daily_notes(
     daily_notes: list[dict],
     source_name: str,
     memory_store: MemoryStore,
@@ -130,7 +130,7 @@ def ingest_daily_notes(
 
         # Index for search
         source = f"{source_name}/daily/{date_str}"
-        ids = memory_index.index_text(content, source=source)
+        ids = await memory_index.index_text(content, source=source)
         total += len(ids)
 
     log.info(f"Indexed {total} fragments from {len(daily_notes)} {source_name} daily notes")

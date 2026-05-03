@@ -85,7 +85,7 @@ class MemoryIndex:
                 log.warning(f"Could not create vec table: {e}")
                 self._has_vec = False
 
-    def index_file(self, path: Path, force: bool = False) -> int:
+    async def index_file(self, path: Path, force: bool = False) -> int:
         """Index a file into fragments, skipping if unchanged since last index.
 
         Compares file mtime against the timestamp of the most recent fragment
@@ -124,7 +124,8 @@ class MemoryIndex:
         if not text.strip():
             return 0
 
-        return len(self.index_text(text, source))
+        ids = await self.index_text(text, source)
+        return len(ids)
 
     def _delete_source(self, source: str) -> None:
         """Remove all fragments and their FTS/vec entries for a given source."""
@@ -145,14 +146,14 @@ class MemoryIndex:
         self.conn.execute("DELETE FROM fragments WHERE source = ?", (source,))
         log.debug(f"Deleted {len(ids)} fragments for source {source!r}")
 
-    def index_text(self, text: str, source: str, timestamp: datetime | None = None) -> list[int]:
+    async def index_text(self, text: str, source: str, timestamp: datetime | None = None) -> list[int]:
         """Chunk text and index each chunk. Returns list of fragment IDs."""
         timestamp = timestamp or datetime.now()
         chunks = self._chunk(text)
         if not chunks:
             return []
 
-        embeddings = self.embedder.embed_batch(chunks)
+        embeddings = await self.embedder.embed_batch(chunks)
         ids = []
 
         for chunk, embedding in zip(chunks, embeddings):

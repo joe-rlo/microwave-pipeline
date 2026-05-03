@@ -26,7 +26,7 @@ async def search(
         log.info("Triage says no memory needed, skipping search")
         return SearchResult(fragments=[], strategy_used="skipped", search_time_ms=0)
 
-    result = searcher.search(query, triage_result)
+    result = await searcher.search(query, triage_result)
     log.info(
         f"Search: {len(result.fragments)} fragments in {result.search_time_ms}ms "
         f"({result.strategy_used})"

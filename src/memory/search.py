@@ -40,7 +40,7 @@ class MemorySearcher:
         self.embedder = embedder
         self.session_engine = session_engine
 
-    def search(
+    async def search(
         self,
         query: str,
         triage: TriageResult,
@@ -56,7 +56,7 @@ class MemorySearcher:
         mmr_lambda = params.get("mmr_lambda", 0.7)
 
         # Run vector and BM25 in parallel (conceptually — SQLite is single-threaded)
-        vec_results = self._vector_search(query, max_results * 3)
+        vec_results = await self._vector_search(query, max_results * 3)
         bm25_results = self._bm25_search(query, max_results * 3)
 
         # Merge via Reciprocal Rank Fusion
@@ -124,10 +124,10 @@ class MemorySearcher:
             )
         return out
 
-    def _vector_search(self, query: str, limit: int) -> list[MemoryFragment]:
+    async def _vector_search(self, query: str, limit: int) -> list[MemoryFragment]:
         """Search by vector similarity using sqlite-vec."""
         try:
-            embedding = self.embedder.embed(query)
+            embedding = await self.embedder.embed(query)
             rows = list(self.index.conn.execute(
                 "SELECT v.id, v.distance, f.content, f.source, f.timestamp, f.retrieval_count "
                 "FROM fragments_vec v "

@@ -250,7 +250,7 @@ class SignalChannel(Channel):
                 handle_project_command,
                 handle_bible_command,
             ):
-                reply = handler(text, self.orchestrator)
+                reply = await handler(text, self.orchestrator)
                 if reply is not None:
                     await self._send_text(source, reply)
                     return

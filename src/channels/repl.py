@@ -68,7 +68,7 @@ class REPLChannel(Channel):
                     handle_project_command,
                     handle_bible_command,
                 ):
-                    reply = handler(line, self.orchestrator)
+                    reply = await handler(line, self.orchestrator)
                     if reply is not None:
                         print(f"\n{reply}")
                         break

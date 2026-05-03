@@ -436,31 +436,31 @@ class TelegramChannel(Channel):
         # Rebuild the full command string so the shared parser sees it
         # in the same shape as REPL/Signal.
         text = f"/skill {arg}".rstrip()
-        reply = handle_skill_command(text, self.orchestrator)
+        reply = await handle_skill_command(text, self.orchestrator)
         if reply:
             await update.message.reply_text(reply)
 
     async def _cmd_skills(self, update: Update, context) -> None:
-        reply = handle_skill_command("/skills", self.orchestrator)
+        reply = await handle_skill_command("/skills", self.orchestrator)
         if reply:
             await update.message.reply_text(reply)
 
     async def _cmd_project(self, update: Update, context) -> None:
         arg = " ".join(context.args) if context.args else ""
         text = f"/project {arg}".rstrip()
-        reply = handle_project_command(text, self.orchestrator)
+        reply = await handle_project_command(text, self.orchestrator)
         if reply:
             await update.message.reply_text(reply)
 
     async def _cmd_projects(self, update: Update, context) -> None:
-        reply = handle_project_command("/projects", self.orchestrator)
+        reply = await handle_project_command("/projects", self.orchestrator)
         if reply:
             await update.message.reply_text(reply)
 
     async def _cmd_bible(self, update: Update, context) -> None:
         arg = " ".join(context.args) if context.args else ""
         text = f"/bible {arg}".rstrip()
-        reply = handle_bible_command(text, self.orchestrator)
+        reply = await handle_bible_command(text, self.orchestrator)
         if reply:
             await update.message.reply_text(reply)
 

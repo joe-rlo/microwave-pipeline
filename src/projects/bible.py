@@ -22,7 +22,7 @@ log = logging.getLogger(__name__)
 _FACTS_HEADING = "## Established facts"
 
 
-def handle_bible_command(text: str, orchestrator) -> str | None:
+async def handle_bible_command(text: str, orchestrator) -> str | None:
     """Return a reply for `/bible*` commands, else None.
 
     Recognized:

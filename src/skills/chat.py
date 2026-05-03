@@ -12,7 +12,7 @@ from __future__ import annotations
 from src.skills.loader import SkillNotFound
 
 
-def handle_skill_command(text: str, orchestrator) -> str | None:
+async def handle_skill_command(text: str, orchestrator) -> str | None:
     """Return a reply string if `text` is a `/skill` / `/skills` command,
     else None.
 

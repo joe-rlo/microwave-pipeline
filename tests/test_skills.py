@@ -217,56 +217,64 @@ class TestChatCommands:
             for n in names
         ])
 
-    def test_non_command_returns_none(self):
+    @pytest.mark.asyncio
+    async def test_non_command_returns_none(self):
         orch = self._orch("a")
-        assert handle_skill_command("hello there", orch) is None
-        assert handle_skill_command("/debug", orch) is None
-        assert handle_skill_command("", orch) is None
+        assert await handle_skill_command("hello there", orch) is None
+        assert await handle_skill_command("/debug", orch) is None
+        assert await handle_skill_command("", orch) is None
 
-    def test_activate(self):
+    @pytest.mark.asyncio
+    async def test_activate(self):
         orch = self._orch("substack-writer", "github-tool")
-        reply = handle_skill_command("/skill substack-writer", orch)
+        reply = await handle_skill_command("/skill substack-writer", orch)
         assert reply and "substack-writer" in reply
         assert orch.get_active_skill().name == "substack-writer"
 
-    def test_activate_unknown(self):
+    @pytest.mark.asyncio
+    async def test_activate_unknown(self):
         orch = self._orch("a")
-        reply = handle_skill_command("/skill nonexistent", orch)
+        reply = await handle_skill_command("/skill nonexistent", orch)
         assert reply and "No skill named" in reply
         assert orch.get_active_skill() is None
 
-    def test_deactivate(self):
+    @pytest.mark.asyncio
+    async def test_deactivate(self):
         orch = self._orch("a")
         orch.set_active_skill("a")
-        reply = handle_skill_command("/skill off", orch)
+        reply = await handle_skill_command("/skill off", orch)
         assert "cleared" in reply.lower()
         assert orch.get_active_skill() is None
 
-    def test_deactivate_aliases(self):
+    @pytest.mark.asyncio
+    async def test_deactivate_aliases(self):
         orch = self._orch("a")
         orch.set_active_skill("a")
-        handle_skill_command("/skill none", orch)
+        await handle_skill_command("/skill none", orch)
         assert orch.get_active_skill() is None
         orch.set_active_skill("a")
-        handle_skill_command("/skill clear", orch)
+        await handle_skill_command("/skill clear", orch)
         assert orch.get_active_skill() is None
 
-    def test_list(self):
+    @pytest.mark.asyncio
+    async def test_list(self):
         orch = self._orch("alpha", "beta")
-        reply = handle_skill_command("/skills", orch)
+        reply = await handle_skill_command("/skills", orch)
         assert "alpha" in reply
         assert "beta" in reply
 
-    def test_list_marks_active(self):
+    @pytest.mark.asyncio
+    async def test_list_marks_active(self):
         orch = self._orch("alpha", "beta")
         orch.set_active_skill("alpha")
-        reply = handle_skill_command("/skills", orch)
+        reply = await handle_skill_command("/skills", orch)
         assert "→ alpha" in reply
         assert "  beta" in reply
 
-    def test_current_when_none(self):
+    @pytest.mark.asyncio
+    async def test_current_when_none(self):
         orch = self._orch("a")
-        reply = handle_skill_command("/skill", orch)
+        reply = await handle_skill_command("/skill", orch)
         assert "No active skill" in reply
 
 

@@ -136,7 +136,7 @@ class Orchestrator:
         await self.llm.connect(stable_prompt)
 
         # Index workspace files into the memory fragment store
-        self._index_workspace()
+        await self._index_workspace()
 
         # Resume last session if one exists, otherwise start fresh
         last_session = self.session_engine.get_last_session_id()
@@ -363,7 +363,7 @@ class Orchestrator:
                 # project's drafts/ directory on disk instead of riding
                 # along as an attachment. The channel surfaces a preview
                 # so the user knows where it landed.
-                wrote_to = self._write_to_project_drafts(fb.name, fb.content)
+                wrote_to = await self._write_to_project_drafts(fb.name, fb.content)
                 if wrote_to is not None:
                     yield {
                         "type": "file_written",
@@ -422,7 +422,7 @@ class Orchestrator:
                 log.info("Write-back promoted fragments, will reconnect on next turn")
                 # Re-index MEMORY.md since write-back just changed it
                 try:
-                    self.memory_index.index_file(self.memory_store.memory_path, force=True)
+                    await self.memory_index.index_file(self.memory_store.memory_path, force=True)
                 except Exception as e:
                     log.warning(f"Memory re-index after write-back failed: {e}")
 
@@ -447,7 +447,7 @@ class Orchestrator:
             ),
         }
 
-    def _index_workspace(self) -> None:
+    async def _index_workspace(self) -> None:
         """Index workspace markdown files into the memory fragment store.
 
         Runs on every startup. Files are skipped if unchanged since last index
@@ -474,7 +474,7 @@ class Orchestrator:
             if not path.exists():
                 continue
             try:
-                n = self.memory_index.index_file(path)
+                n = await self.memory_index.index_file(path)
                 if n > 0:
                     log.info(f"Indexed {n} fragments from {path.name}")
                 total += n
@@ -536,7 +536,7 @@ class Orchestrator:
         # future — even from a different session after a restart.
         if self.memory_index and self.config.openai_api_key:
             try:
-                self.memory_index.index_text(
+                await self.memory_index.index_text(
                     summary,
                     source=f"session:{self._session_id}:summary",
                 )
@@ -644,7 +644,7 @@ class Orchestrator:
             return None
         return self._active_project.bible_path
 
-    def set_active_project(self, name: str) -> Project:
+    async def set_active_project(self, name: str) -> Project:
         """Activate a writing project. Auto-activates its declared skill,
         marks the LLM session for reconnect on next turn, and indexes the
         project's text files into the fragment store so they're retrievable.
@@ -669,7 +669,7 @@ class Orchestrator:
         # Index project files so retrieval can surface relevant chunks.
         # Best-effort — don't let an indexing failure block activation.
         try:
-            self._index_project_files(project)
+            await self._index_project_files(project)
         except Exception as e:
             log.warning(f"Project file indexing failed for {name!r}: {e}")
 
@@ -692,7 +692,7 @@ class Orchestrator:
             return []
         return self.project_loader.list_all()
 
-    def _write_to_project_drafts(self, suggested_name: str, content: str):
+    async def _write_to_project_drafts(self, suggested_name: str, content: str):
         """Write a file the LLM produced to the active project's drafts/.
 
         Returns the Path written to, or None if no project is active.
@@ -722,7 +722,7 @@ class Orchestrator:
         # Re-index so the new content is searchable on the next turn
         try:
             if self.memory_index and self.config.openai_api_key:
-                self.memory_index.index_file(target, force=True)
+                await self.memory_index.index_file(target, force=True)
         except Exception as e:
             log.warning(f"Failed to index new draft {target.name}: {e}")
         return target
@@ -757,7 +757,7 @@ class Orchestrator:
             return drafts / suggested_path
         return drafts / "draft.md"
 
-    def _index_project_files(self, project: Project) -> None:
+    async def _index_project_files(self, project: Project) -> None:
         """Chunk and index the project's drafts, bible, and outline so
         memory search can surface them when the user references the work."""
         if not self.memory_index or not self.config.openai_api_key:
@@ -773,7 +773,7 @@ class Orchestrator:
                     files.append(p)
         for path in files:
             try:
-                n = self.memory_index.index_file(path)
+                n = await self.memory_index.index_file(path)
                 if n > 0:
                     log.info(f"Indexed {n} fragments from {path.name}")
             except Exception as e:

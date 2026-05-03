@@ -25,21 +25,21 @@ class EmbeddingClient:
 
     def _get_client(self):
         if self._client is None:
-            from openai import OpenAI
+            from openai import AsyncOpenAI
 
-            self._client = OpenAI(api_key=self._api_key)
+            self._client = AsyncOpenAI(api_key=self._api_key)
         return self._client
 
-    def embed(self, text: str) -> list[float]:
+    async def embed(self, text: str) -> list[float]:
         """Embed a single text string."""
         client = self._get_client()
-        response = client.embeddings.create(model=self.model, input=text)
+        response = await client.embeddings.create(model=self.model, input=text)
         return response.data[0].embedding
 
-    def embed_batch(self, texts: Sequence[str]) -> list[list[float]]:
+    async def embed_batch(self, texts: Sequence[str]) -> list[list[float]]:
         """Embed multiple texts in a single API call."""
         if not texts:
             return []
         client = self._get_client()
-        response = client.embeddings.create(model=self.model, input=list(texts))
+        response = await client.embeddings.create(model=self.model, input=list(texts))
         return [item.embedding for item in sorted(response.data, key=lambda x: x.index)]

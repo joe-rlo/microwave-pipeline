@@ -153,7 +153,7 @@ class _FakeOrch:
         self._projects = list(projects)
         self._active = None
 
-    def set_active_project(self, name):
+    async def set_active_project(self, name):
         for p in self._projects:
             if p.name == name:
                 self._active = p
@@ -183,41 +183,47 @@ def _proj(name="alpha", **kw):
 
 
 class TestProjectChatCommands:
-    def test_unknown_text_is_passthrough(self):
+    @pytest.mark.asyncio
+    async def test_unknown_text_is_passthrough(self):
         orch = _FakeOrch()
-        assert handle_project_command("hello world", orch) is None
-        assert handle_project_command("", orch) is None
-        assert handle_project_command("/skill foo", orch) is None  # other namespace
+        assert await handle_project_command("hello world", orch) is None
+        assert await handle_project_command("", orch) is None
+        assert await handle_project_command("/skill foo", orch) is None  # other namespace
 
-    def test_activate(self):
+    @pytest.mark.asyncio
+    async def test_activate(self):
         orch = _FakeOrch([_proj("alpha"), _proj("beta", type="novel")])
-        reply = handle_project_command("/project beta", orch)
+        reply = await handle_project_command("/project beta", orch)
         assert reply and "beta" in reply
         assert "novel" in reply  # type is in the activation message
         assert orch.get_active_project().name == "beta"
 
-    def test_activate_unknown(self):
+    @pytest.mark.asyncio
+    async def test_activate_unknown(self):
         orch = _FakeOrch([_proj("alpha")])
-        reply = handle_project_command("/project ghost", orch)
+        reply = await handle_project_command("/project ghost", orch)
         assert "No project named" in reply
         assert orch.get_active_project() is None
 
-    def test_deactivate_aliases(self):
+    @pytest.mark.asyncio
+    async def test_deactivate_aliases(self):
         orch = _FakeOrch([_proj("alpha")])
         for arg in ("off", "none", "clear"):
-            orch.set_active_project("alpha")
-            handle_project_command(f"/project {arg}", orch)
+            await orch.set_active_project("alpha")
+            await handle_project_command(f"/project {arg}", orch)
             assert orch.get_active_project() is None
 
-    def test_status_when_no_project(self):
+    @pytest.mark.asyncio
+    async def test_status_when_no_project(self):
         orch = _FakeOrch()
-        reply = handle_project_command("/project status", orch)
+        reply = await handle_project_command("/project status", orch)
         assert "No active project" in reply
 
-    def test_list_marks_active(self):
+    @pytest.mark.asyncio
+    async def test_list_marks_active(self):
         orch = _FakeOrch([_proj("alpha"), _proj("beta")])
-        orch.set_active_project("alpha")
-        reply = handle_project_command("/projects", orch)
+        await orch.set_active_project("alpha")
+        reply = await handle_project_command("/projects", orch)
         assert "→ alpha" in reply
 
 
@@ -240,12 +246,14 @@ class TestBibleNameSplit:
 
 
 class TestBibleCommand:
-    def test_no_active_project(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_no_active_project(self, tmp_path):
         orch = _FakeOrch()
-        reply = handle_bible_command("/bible add x", orch)
+        reply = await handle_bible_command("/bible add x", orch)
         assert "No active project" in reply
 
-    def test_add_creates_facts_section(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_add_creates_facts_section(self, tmp_path):
         # Real Project with a real bible file on disk
         bible = tmp_path / "BIBLE.md"
         bible.write_text(
@@ -255,49 +263,53 @@ class TestBibleCommand:
         project = _proj("test", type="novel")
         project.bible_path = bible
         orch = _FakeOrch([project])
-        orch.set_active_project("test")
+        await orch.set_active_project("test")
 
-        reply = handle_bible_command("/bible add Walsh tall and weary", orch)
+        reply = await handle_bible_command("/bible add Walsh tall and weary", orch)
         assert "added" in reply.lower()
         text = bible.read_text(encoding="utf-8")
         assert "## Established facts" in text
         assert "### Walsh" in text
         assert "tall and weary" in text
 
-    def test_add_quoted_name(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_add_quoted_name(self, tmp_path):
         bible = tmp_path / "BIBLE.md"
         bible.write_text("# Bible\n\n## Established facts\n", encoding="utf-8")
         project = _proj("test", type="novel")
         project.bible_path = bible
         orch = _FakeOrch([project])
-        orch.set_active_project("test")
+        await orch.set_active_project("test")
 
-        handle_bible_command(
+        await handle_bible_command(
             '/bible add "Detective Walsh" twists his ring when nervous', orch
         )
         text = bible.read_text(encoding="utf-8")
         assert "### Detective Walsh" in text
         assert "twists his ring" in text
 
-    def test_show_returns_bible_text(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_show_returns_bible_text(self, tmp_path):
         bible = tmp_path / "BIBLE.md"
         bible.write_text("# Bible\n\nThe world.\n", encoding="utf-8")
         project = _proj("test", type="novel")
         project.bible_path = bible
         orch = _FakeOrch([project])
-        orch.set_active_project("test")
+        await orch.set_active_project("test")
 
-        reply = handle_bible_command("/bible show", orch)
+        reply = await handle_bible_command("/bible show", orch)
         assert "The world." in reply
 
-    def test_unknown_subcommand_shows_usage(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_unknown_subcommand_shows_usage(self, tmp_path):
         orch = _FakeOrch()
-        reply = handle_bible_command("/bible weird", orch)
+        reply = await handle_bible_command("/bible weird", orch)
         assert "Usage" in reply
 
-    def test_non_bible_text_is_passthrough(self):
+    @pytest.mark.asyncio
+    async def test_non_bible_text_is_passthrough(self):
         orch = _FakeOrch()
-        assert handle_bible_command("hi there", orch) is None
+        assert await handle_bible_command("hi there", orch) is None
 
 
 # ---------- Memory store BIBLE inclusion ----------

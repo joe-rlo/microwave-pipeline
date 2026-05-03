@@ -37,7 +37,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-def import_openclaw(args) -> None:
+async def import_openclaw(args) -> None:
     from src.importers.openclaw import find_openclaw_dir, list_agents, import_sessions, import_memory
 
     if args.path:
@@ -88,21 +88,21 @@ def import_openclaw(args) -> None:
         total = 0
         if not args.memory_only:
             sessions = import_sessions(agent_dir)
-            total += ingest_sessions(sessions, "openclaw", memory_index)
+            total += await ingest_sessions(sessions, "openclaw", memory_index)
 
         if not args.sessions_only:
             memory = import_memory(agent_dir)
             if memory["memory_md"]:
-                total += ingest_memories(
+                total += await ingest_memories(
                     [{"content": memory["memory_md"], "memory_md": True}],
                     "openclaw", memory_store, memory_index,
                 )
             if memory["daily_notes"]:
-                total += ingest_daily_notes(
+                total += await ingest_daily_notes(
                     memory["daily_notes"], "openclaw", memory_store, memory_index,
                 )
             if memory["topic_memories"]:
-                total += ingest_memories(
+                total += await ingest_memories(
                     memory["topic_memories"], "openclaw", memory_store, memory_index,
                     merge_to_memory_md=False,
                 )
@@ -112,7 +112,7 @@ def import_openclaw(args) -> None:
         memory_index.close()
 
 
-def import_hermes(args) -> None:
+async def import_hermes(args) -> None:
     from src.importers.hermes import find_hermes_dir, import_sessions, import_memories
 
     if args.path:
@@ -142,12 +142,12 @@ def import_hermes(args) -> None:
         total = 0
         if not args.memory_only:
             sessions = import_sessions(hermes_dir)
-            total += ingest_sessions(sessions, "hermes", memory_index)
+            total += await ingest_sessions(sessions, "hermes", memory_index)
 
         if not args.sessions_only:
             memories = import_memories(hermes_dir)
             if memories:
-                total += ingest_memories(
+                total += await ingest_memories(
                     memories, "hermes", memory_store, memory_index,
                     merge_to_memory_md=False,
                 )
@@ -157,7 +157,7 @@ def import_hermes(args) -> None:
         memory_index.close()
 
 
-def import_nanoclaw(args) -> None:
+async def import_nanoclaw(args) -> None:
     from src.importers.nanoclaw import find_nanoclaw_dir, import_sessions, import_memories
 
     if args.path:
@@ -187,12 +187,12 @@ def import_nanoclaw(args) -> None:
         total = 0
         if not args.memory_only:
             sessions = import_sessions(nanoclaw_dir)
-            total += ingest_sessions(sessions, "nanoclaw", memory_index)
+            total += await ingest_sessions(sessions, "nanoclaw", memory_index)
 
         if not args.sessions_only:
             memories = import_memories(nanoclaw_dir)
             if memories:
-                total += ingest_memories(
+                total += await ingest_memories(
                     memories, "nanoclaw", memory_store, memory_index,
                     merge_to_memory_md=False,
                 )
@@ -230,12 +230,14 @@ def main():
 
     args = parser.parse_args()
 
+    # CLI is sync; wrap the async import paths at this boundary.
+    import asyncio
     if args.source == "openclaw":
-        import_openclaw(args)
+        asyncio.run(import_openclaw(args))
     elif args.source == "hermes":
-        import_hermes(args)
+        asyncio.run(import_hermes(args))
     elif args.source == "nanoclaw":
-        import_nanoclaw(args)
+        asyncio.run(import_nanoclaw(args))
 
 
 if __name__ == "__main__":

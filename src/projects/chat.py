@@ -10,8 +10,11 @@ from __future__ import annotations
 from src.projects.loader import ProjectNotFound
 
 
-def handle_project_command(text: str, orchestrator) -> str | None:
+async def handle_project_command(text: str, orchestrator) -> str | None:
     """Return a reply string for `/project*` commands, else None.
+
+    Async because `set_active_project` is async (it indexes project files
+    via the async embedding path). Callers should `await` this.
 
     Recognized:
     - `/project <name>`              activate
@@ -40,7 +43,7 @@ def handle_project_command(text: str, orchestrator) -> str | None:
         return "Active project cleared."
 
     try:
-        project = orchestrator.set_active_project(arg)
+        project = await orchestrator.set_active_project(arg)
     except ProjectNotFound:
         return f"No project named '{arg}'. Try `/projects` to list available."
     except Exception as e:
