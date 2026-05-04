@@ -21,6 +21,7 @@ from src.pipeline.assembly import assemble, promote_fragments
 from src.pipeline.reflection import reflect
 from src.pipeline.search import search
 from src.pipeline.triage import triage
+from src.health.audit import HealthAuditRow, HealthAuditWriter
 from src.health.disclaimers import load_health_channel_rules
 from src.health.retrieval.base import EvidenceSource
 from src.health.retrieval.medlineplus import MedlinePlusSource
@@ -113,6 +114,14 @@ class Orchestrator:
         self.health_retrieval = RetrievalOrchestrator(
             sources=_build_health_sources(self.config),
         )
+
+        # Health audit writer — owns its own apsw connection so audit
+        # failures can't take out the session-engine's traffic. Always
+        # constructed but only called on health-routed turns; a bunch
+        # of dead pre-flight when the module is off, but no per-turn
+        # cost.
+        self.health_audit = HealthAuditWriter(self.config.db_path)
+        self.health_audit.connect()
 
         # Tools — built once at startup. Adding a new tool means setting
         # its env var and restarting; we don't hot-reload because the
@@ -287,6 +296,13 @@ class Orchestrator:
                 "reason": h_route.reason,
             }
             yield {"type": "result", "text": DECLINE_PHI_MESSAGE}
+            self.health_audit.write(HealthAuditRow(
+                route="decline_phi",
+                triage_phi_class=triage_result.phi_class,
+                triage_health_topic=triage_result.health_topic,
+                latency_ms=int((time.time() - start) * 1000),
+                # No LLM call → provider/model/tokens are NULL by design.
+            ))
             return
 
         if h_route.is_health:
@@ -518,6 +534,25 @@ class Orchestrator:
             },
         )
         self.session_engine.add_turn(assistant_turn)
+
+        # Health audit — only when the route fired. Captures what the
+        # turn did and how (route, sources, model, latency) but never
+        # the prompt or response content. The spec is explicit on this:
+        # "you reconstruct what happened from the route and source
+        # list, not from a prompt transcript."
+        if h_route.is_health and h_route.path != "decline_phi":
+            self.health_audit.write(HealthAuditRow(
+                route=h_route.path,
+                triage_phi_class=triage_result.phi_class,
+                triage_health_topic=triage_result.health_topic,
+                sources_queried=[s.name for s in self.health_retrieval.sources],
+                sources_returned=_summarize_sources_returned(health_evidence),
+                llm_provider="bedrock" if h_route.use_baa_llm else "anthropic",
+                llm_model=self.config.model_main,
+                latency_ms=int((time.time() - start) * 1000),
+                # token counts not yet wired in this codebase; Phase 4
+                # could pull them from the LLM client's usage events.
+            ))
 
         # Write-back: promote high-retrieval fragments
         if assembly_result.promote_candidates:
@@ -963,7 +998,23 @@ class Orchestrator:
             self.memory_index.close()
         if self.session_engine:
             self.session_engine.close()
+        if getattr(self, "health_audit", None) is not None:
+            self.health_audit.close()
         log.info("Orchestrator stopped")
+
+
+def _summarize_sources_returned(evidence: list) -> list[dict]:
+    """Group evidence by source for the audit row.
+
+    Stored in the audit as JSON: `[{"name": "pubmed", "count": 3}, ...]`.
+    Tells us which sources came back with hits and which were noisy
+    on a given query — useful for tuning retrieval and noticing
+    silently-broken sources.
+    """
+    counts: dict[str, int] = {}
+    for ev in evidence:
+        counts[ev.source] = counts.get(ev.source, 0) + 1
+    return [{"name": name, "count": count} for name, count in counts.items()]
 
 
 def _build_health_sources(config) -> list[EvidenceSource]:
