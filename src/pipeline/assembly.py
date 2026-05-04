@@ -46,8 +46,17 @@ def assemble(
     complexity: str = "moderate",
     bible_path=None,
     tool_catalog: str = "",
+    evidence: list | None = None,
 ) -> AssemblyResult:
-    """Assemble stable and dynamic context for this turn."""
+    """Assemble stable and dynamic context for this turn.
+
+    `evidence`, when non-empty, splices an `[Evidence context]` block
+    into the dynamic context — the same shape used by scheduler
+    pre-fetch output. Each citation gets a number the LLM (and the
+    health-qa skill) reference in the response. The block goes
+    *after* retrieved fragments but *before* the length hint so
+    length stays the most-recent rule the model reads.
+    """
     # Build stable context (for reconnect if needed). If a project is
     # active, its BIBLE.md joins the stable prompt — that way per-project
     # canon is in front of the LLM for the whole session, not retrieved
@@ -140,6 +149,15 @@ def assemble(
     if fragments_text:
         dynamic_parts.append(fragments_text)
 
+    # Health evidence block (when the route fired retrieval). The
+    # health-qa skill's hard rule is "use only the evidence sources
+    # provided" — that contract is enforced by this block existing
+    # and the skill body referencing it by name.
+    if evidence:
+        evidence_text = _format_evidence(evidence)
+        if evidence_text:
+            dynamic_parts.append(evidence_text)
+
     # Length hint goes LAST so it's the most-recent rule the LLM reads —
     # closest to the user message, hardest to forget while writing.
     length_hint = _LENGTH_HINTS.get(complexity)
@@ -217,6 +235,67 @@ def _format_fragments(fragments: list[MemoryFragment]) -> str:
         blocks.append("\n".join(lines))
 
     return "\n\n".join(blocks)
+
+
+def _format_evidence(evidence_list: list) -> str:
+    """Format the [Evidence context] block for the dynamic prompt.
+
+    Spec format — numbered, source-tagged, URL-cited:
+
+        [Evidence context — cite these sources by source name + URL]
+
+        [1] PubMed — "Effect of metformin on cardiovascular outcomes"
+            https://pubmed.ncbi.nlm.nih.gov/12345678/
+            Published 2024-03. Excerpt: ...
+
+        [2] MedlinePlus — Metformin (consumer summary)
+            https://medlineplus.gov/...
+            Excerpt: ...
+
+    The numbering is what the health-qa skill instructs the model to
+    cite ("[1]" or "[2,3]"). Source names match Evidence.source so a
+    reader cross-referencing audit logs can trace which API surfaced
+    the citation.
+    """
+    if not evidence_list:
+        return ""
+
+    lines = [
+        "[Evidence context — cite these sources by number, e.g. [1] or [2,3]. "
+        "Use only what's listed here. If the evidence doesn't address the "
+        "question, say so honestly.]"
+    ]
+    for i, ev in enumerate(evidence_list, 1):
+        # Source name capitalized for readability ("PubMed" not "pubmed");
+        # the lowercase form is preserved on Evidence for audit/dedup.
+        source_label = _SOURCE_DISPLAY_NAMES.get(ev.source, ev.source.title())
+        title = (ev.title or "(untitled)").strip()
+        lines.append(f'[{i}] {source_label} — "{title}"')
+        lines.append(f"    {ev.url}")
+        date_part = ""
+        if ev.published is not None:
+            date_part = f"Published {ev.published.isoformat()}. "
+        snippet = (ev.snippet or "").strip()
+        # Indent snippet so the block reads as a coherent citation,
+        # not a scattershot list of fields.
+        if snippet:
+            lines.append(f"    {date_part}Excerpt: {snippet}")
+        elif date_part:
+            lines.append(f"    {date_part.rstrip()}")
+        lines.append("")  # blank line between citations for legibility
+    return "\n".join(lines).rstrip()
+
+
+# Map raw source names to display strings used in the [Evidence
+# context] block. Title-casing isn't quite right for these (PubMed,
+# openFDA) so we hardcode them.
+_SOURCE_DISPLAY_NAMES = {
+    "pubmed": "PubMed",
+    "openfda": "openFDA",
+    "medlineplus": "MedlinePlus",
+    "cdc": "CDC",
+    "clinicaltrials": "ClinicalTrials.gov",
+}
 
 
 def promote_fragments(
