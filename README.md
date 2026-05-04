@@ -38,6 +38,10 @@ Edit `.env`:
 | `SIGNAL_PHONE_NUMBER` | For Signal | Bot's Signal-registered number (e.g. `+15551234567`) |
 | `SIGNAL_ALLOWED_SENDERS` | For Signal | Comma-separated allowlist; omit to accept anyone |
 | `SCHEDULER_ENABLED` | No | `true` to run the scheduler alongside `--signal` |
+| `INSTACART_API_KEY` | No | Enables the `instacart_create_cart` tool (build Shop with Instacart links). Get a key at developer.instacart.com. |
+| `INSTACART_PARTNER_LINKBACK_URL` | No | Optional. Where Instacart sends the user after checkout. |
+| `HEALTH_MODULE_ENABLED` | No | `true` to turn on the [health module](#health-module--workspaceskillshealth-qa) (privacy-aware health Q&A with cited evidence). Off by default. |
+| `NCBI_API_KEY` | No | Optional. Raises PubMed E-utilities rate limit from ~3 req/s to ~10 req/s. Personal-use volume rarely needs it. |
 | `CLAUDE_CLI_PATH` | No | Auto-detected. Override if needed. |
 
 ### 3. Authenticate Claude Code
@@ -336,6 +340,90 @@ microwaveos projects remove dead-project     # irreversible (asks for confirmati
 
 **Switching context.** Blogs can run in parallel with each other (research, drafts, multiple posts) but long-form work is one-at-a-time — switching projects forces an LLM reconnect on the next turn so the new bible cleanly replaces the old one. Skills stay attached to their project; deactivating a project doesn't auto-clear the skill (you might want to keep `novel-writing` rules for a follow-up turn even after stepping out of the project).
 
+### Health module — `workspace/skills/health-qa/`
+
+Privacy-aware health Q&A. When enabled, triage gains a PHI-classification axis, a parallel evidence-retrieval layer fans out across PubMed and MedlinePlus, and the response is generated under the strict citation rules of the bundled `health-qa` skill. Disabled by default; flipping the flag returns the system to its prior behavior with no health-aware code in any hot path.
+
+**Why a separate module instead of "just ask the model."** Two reasons. First, health questions get better answers when the model is anchored to current authoritative literature rather than its training data — the LLM is told to cite numbered entries from an `[Evidence context]` block and to say "the sources don't address this" rather than fill gaps from memory. Second, the spec carves a privacy lane for personal health data so it never lands on a non-BAA endpoint by accident. Phase 1 implements the routing and the general path; Phase 2 wires the BAA-covered LLM client (Bedrock) for personal queries.
+
+**Enable.** Add to `.env`:
+
+```
+HEALTH_MODULE_ENABLED=true
+```
+
+Then install the bundled skill into your workspace and confirm:
+
+```bash
+python3 src/main.py health install-skill   # copies seed_skills/health-qa/ → workspace/skills/health-qa/
+python3 src/main.py health status          # shows enabled state, sources, skill, audit count
+```
+
+Restart the bot. No API keys are required for Phase 1 — both retrieval sources are open. `NCBI_API_KEY` is optional if you push enough volume to hit PubMed's anonymous rate limit.
+
+**What you get.** Triage classifies every message into one of four `phi_class` buckets:
+
+- `none` — not health-related, runs the existing pipeline unchanged
+- `general` — health concepts in the abstract ("what is metformin", "how does the flu spread")
+- `personal` — references your own body, symptoms, history, medications, or test results
+- `unknown` — classifier wasn't sure (treated as `personal` for safety)
+
+A small router consumes that classification and picks one of three downstream paths:
+
+| Path | When | What happens |
+|------|------|--------------|
+| `skip` | `phi_class=none`, or module disabled | Existing pipeline runs unchanged |
+| `general` | `phi_class=general` | Fan out to PubMed + MedlinePlus, splice an `[Evidence context]` block + the `health-qa` skill body + the disclaimer footer rules into the prompt, run the standard LLM. Response cites sources by `[1]`/`[2,3]`. |
+| `decline_phi` | `phi_class=personal`/`unknown`, no BAA configured | Bot returns a safety message asking you to either rephrase abstractly ("what does X do" instead of "should I take X") or enable a BAA provider. No LLM call. |
+
+The personal path becomes the `phi` route (BAA-covered LLM via Bedrock) once Phase 2 lands; for now it's `decline_phi` whenever `HEALTH_BAA_PROVIDER=none` (the default).
+
+**Project-aware carveout.** When you have an active writing project (`/project <name>`), references to fictional characters' bodies / symptoms / medications inside that project's scope classify as `general`, not `personal` — a novel about a character with diabetes is research, not your own PHI.
+
+**Citation rules** live in `seed_skills/health-qa/SKILL.md`. The hard rules (no diagnosis, no specific dose, no "start/stop this medication", emergency framing for emergencies) are non-negotiable for any health-routed answer. Voice rules (direct, plain-language, lead with the answer) and anti-patterns (no every-possibility lists, no generic disclaimers) live in the same file. To customize, edit `~/.microwaveos/workspace/skills/health-qa/SKILL.md` after the install.
+
+**Audit trail.** Every health-routed turn writes a row to the `health_audit` table in `~/.microwaveos/data/memory.db` capturing route + sources queried + sources returned + LLM provider/model + latency. Deliberately *not* in the audit: prompt or response content. The spec is explicit: "you reconstruct what happened from the route and source list, not from a prompt transcript." Inspect with:
+
+```bash
+python3 src/main.py health audit list --limit 50
+```
+
+**Customize the disclaimer footer.** The default footer ("Information only, not medical advice. For anything urgent, contact a clinician or call emergency services.") is bundled. Drop a `~/.microwaveos/workspace/channels/health.md` to override — same opt-in pattern as the other channel rules. The `seed_skills/health-channel/health.md` file is a starting template you can copy.
+
+**Quick smoke test.**
+
+```bash
+python3 src/main.py health retrieve "metformin and B12 deficiency"
+```
+
+Runs the retrieval orchestrator without invoking the LLM and prints the same evidence the model would see — useful for debugging "why didn't the bot cite X?"
+
+**What this deliberately doesn't do.** Not clinical decision support. Not a replacement for medical care. Not attempting HIPAA covered-entity status. The disclaimers are real, not theatrical — a user asking about chest pain still gets the emergency framing first, before evidence. See `microwave-health-spec.md` for the full architecture and Phase 2/3/4 plans.
+
+### Tools
+
+Tools are real LLM-invokable capabilities — the model decides during a turn whether to call one, the SDK runs the handler, and the result feeds back into the model's reply. Distinct from skills (which only inject prompt text) and from scheduler pre-fetch (which runs *before* the LLM call).
+
+Architecture:
+
+```
+src/integrations/<service>.py   # Pure HTTP/SDK adapter — no Agent SDK imports
+src/tools/<service>.py          # @tool wrapper + MCP-shaped handler
+src/tools/__init__.py           # build_tools(config) — self-registers if env vars present
+```
+
+Tools are wired in at orchestrator startup via `build_tools(config)`. Anything registered shows up to the LLM as `mcp__microwave__<tool-name>`. The model only sees tools whose env vars are configured — failing closed beats advertising a tool that errors on every invocation.
+
+**Adding a new tool** (rough recipe):
+
+1. Drop a pure HTTP/SDK client in `src/integrations/<service>.py`.
+2. Build the SDK wrapper in `src/tools/<service>.py` using `claude_agent_sdk.tool` decorator + a JSON input schema.
+3. Register conditionally in `src/tools/__init__.py` (gate on the env var).
+4. Add a SKILL.md under `workspace/skills/<service>/` that teaches the model when to call it and when to confirm first. Use `triggers:` to get auto-activation on relevant phrasing.
+5. Add the env var to `Config` (`src/config.py`) and document it in `README.md` + `.env.example`.
+
+The seed `instacart_create_cart` tool follows this exact pattern — read it as a reference.
+
 ### Model selection
 
 In `.env`:
@@ -603,6 +691,15 @@ Projects CLI (runs without the daemon):
 | `projects archive <name>` | Move under `.archived/` (reversible by hand) |
 | `projects remove <name>` | Permanently delete a project (asks for confirmation) |
 
+Health module CLI (only relevant when `HEALTH_MODULE_ENABLED=true`):
+
+| Command | Description |
+|---------|-------------|
+| `health status` | Dashboard: enabled state, source toggles, skill installed?, recent audit count + most-recent route |
+| `health install-skill` | Copy `seed_skills/health-qa/` into `workspace/skills/health-qa/` (idempotent — refuses to clobber edits) |
+| `health retrieve <query>` | Run retrieval against `<query>` without invoking the LLM. Prints the same evidence the model would see |
+| `health audit list` | Show recent `health_audit` rows newest-first (route, phi_class, topic, latency, sources). No prompt/response content, by design |
+
 ### Telegram file handling
 
 You can send files (documents, photos, text files) to Microwave in Telegram. It reads the content and includes it in the conversation:
@@ -620,10 +717,14 @@ Things this pipeline can't do yet, or does poorly.
 ### No vision
 Images and photos are received but not seen. The pipeline is text-only — there's no multimodal path to pass images through to the LLM. Photos sent in Telegram are acknowledged but the model has no idea what's in them.
 
-### Limited tool use
-Microwave can't take actions mid-conversation — no live web search, no code execution, no runtime API calls, no file system access inside the turn. The Agent SDK supports `allowed_tools` but the pipeline currently sets it to `[]`.
+### Tool use is opt-in per integration
+Microwave wires real Agent SDK tools through an in-process MCP server (`src/tools/`). Each tool self-registers based on whether its prerequisite env var is set — no key, no tool. Today's roster:
 
-The one exception is **scheduler pre-fetch**: a skill can ship a `fetch.py` that the scheduler awaits *before* the LLM call, and the result is prepended to the prompt. That's how the seed `github-tool` skill pulls fresh `gh pr list` data for its weekly digests. It's a batch-mode shortcut, not real tool use — the LLM still can't call things during a turn.
+- **`instacart_create_cart`** — build a Shop with Instacart cart and return a checkout URL. Activates when `INSTACART_API_KEY` is set. The seed `instacart` skill teaches the model when to call it (and when to ask first).
+
+Tools work in **Max auth mode only**. API-key mode currently falls back to text-only — adding tool-use there means managing the tool_use loop manually against the Messages API and isn't wired in yet.
+
+The pre-existing **scheduler pre-fetch** path (`fetch.py` alongside a SKILL.md) still exists for batch-mode data pulls before scheduled LLM calls — that's how the seed `github-tool` skill pulls fresh `gh pr list` data for weekly digests. Pre-fetch and tool-use solve different problems: pre-fetch is offline data prep, tools are mid-turn capabilities.
 
 ### Single user per channel
 The orchestrator holds one session at a time. If multiple Telegram users message the bot, their conversations share the same LLM session and can bleed into each other. Fine for personal use, not safe for multi-user deployment. (Signal's debounce buffer is per-sender, so quick bursts coalesce correctly per user — but the underlying SDK session is still one shared instance.)
