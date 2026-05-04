@@ -47,6 +47,7 @@ def assemble(
     bible_path=None,
     tool_catalog: str = "",
     evidence: list | None = None,
+    health_disclaimer: str = "",
 ) -> AssemblyResult:
     """Assemble stable and dynamic context for this turn.
 
@@ -157,6 +158,14 @@ def assemble(
         evidence_text = _format_evidence(evidence)
         if evidence_text:
             dynamic_parts.append(evidence_text)
+
+    # Health channel disclaimer goes near the end (just before length)
+    # so the footer rules are fresh in the model's mind when it writes
+    # the response. This is the "Information only, not medical advice…"
+    # block. Comes from the HealthRoute when route.require_disclaimer
+    # is True, with a workspace override taking precedence.
+    if health_disclaimer:
+        dynamic_parts.append(health_disclaimer.strip())
 
     # Length hint goes LAST so it's the most-recent rule the LLM reads —
     # closest to the user message, hardest to forget while writing.

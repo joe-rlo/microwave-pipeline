@@ -21,6 +21,12 @@ from src.pipeline.assembly import assemble, promote_fragments
 from src.pipeline.reflection import reflect
 from src.pipeline.search import search
 from src.pipeline.triage import triage
+from src.health.disclaimers import load_health_channel_rules
+from src.health.retrieval.base import EvidenceSource
+from src.health.retrieval.medlineplus import MedlinePlusSource
+from src.health.retrieval.orchestrator import RetrievalOrchestrator
+from src.health.retrieval.pubmed import PubMedSource
+from src.health.router import DECLINE_PHI_MESSAGE, route as health_route
 from src.projects import Project, ProjectLoader, ProjectNotFound
 from src.session.engine import SessionEngine
 from src.session.models import PipelineMetadata, Turn
@@ -100,6 +106,13 @@ class Orchestrator:
         projects_dir = self.config.workspace_dir / "projects"
         projects_dir.mkdir(parents=True, exist_ok=True)
         self.project_loader = ProjectLoader(projects_dir)
+
+        # Health module retrieval orchestrator — empty source list when
+        # the module is disabled, so route() short-circuits early
+        # regardless. Built once at startup; same pattern as tools.
+        self.health_retrieval = RetrievalOrchestrator(
+            sources=_build_health_sources(self.config),
+        )
 
         # Tools — built once at startup. Adding a new tool means setting
         # its env var and restarting; we don't hot-reload because the
@@ -252,6 +265,69 @@ class Orchestrator:
                 "description": turn_skill.description,
             }
 
+        # --- Health route ---
+        # Consults triage's phi_class + the health config. When the route
+        # is "skip" everything below runs unchanged; otherwise we may
+        # auto-activate the health-qa skill, run evidence retrieval, and
+        # splice the disclaimer block into assembly. The "decline_phi"
+        # path short-circuits the LLM entirely with a safety message.
+        h_route = health_route(triage_result, self.config.health)
+        health_evidence: list = []
+        health_disclaimer_text: str = ""
+
+        if h_route.path == "decline_phi":
+            log.info(
+                f"Health route: decline_phi — {h_route.reason}. "
+                "Returning safety message without LLM call."
+            )
+            yield {"type": "delta", "text": DECLINE_PHI_MESSAGE}
+            yield {
+                "type": "health_route",
+                "path": h_route.path,
+                "reason": h_route.reason,
+            }
+            yield {"type": "result", "text": DECLINE_PHI_MESSAGE}
+            return
+
+        if h_route.is_health:
+            # Auto-activate health-qa for this turn (overrides triage's
+            # match + any explicitly pinned skill — the citation rules
+            # are non-negotiable for any health-routed answer).
+            try:
+                turn_skill = self.skill_loader.load("health-qa")
+            except Exception as e:
+                log.warning(
+                    f"Health route fired but health-qa skill not found: {e}. "
+                    "Run `python3 src/main.py health install-skill` to install."
+                )
+            yield {
+                "type": "health_route",
+                "path": h_route.path,
+                "reason": h_route.reason,
+                "use_baa_llm": h_route.use_baa_llm,
+            }
+
+            if h_route.enable_retrieval:
+                try:
+                    health_evidence = await self.health_retrieval.search(
+                        message,
+                        topic=triage_result.health_topic,
+                    )
+                    log.info(
+                        f"Health retrieval: {len(health_evidence)} evidence "
+                        f"items for topic={triage_result.health_topic!r}"
+                    )
+                except Exception as e:
+                    # Retrieval failure shouldn't kill the turn — the
+                    # health-qa skill will say "no evidence" when the
+                    # block is empty. Better than a 500.
+                    log.warning(f"Health retrieval failed: {e}")
+
+            if h_route.require_disclaimer:
+                health_disclaimer_text = load_health_channel_rules(
+                    self.config.workspace_dir
+                )
+
         # --- Stage 2: Search ---
         # Pass active project so retrieval can weight that project's
         # fragments higher and downweight other projects' (preventing
@@ -277,6 +353,8 @@ class Orchestrator:
             complexity=triage_result.complexity,
             bible_path=bible_path,
             tool_catalog=self.tool_bundle.catalog_text if self.tool_bundle else "",
+            evidence=health_evidence or None,
+            health_disclaimer=health_disclaimer_text,
         )
 
         # Reconnect when (a) project changed since last turn, or (b) any
@@ -886,6 +964,35 @@ class Orchestrator:
         if self.session_engine:
             self.session_engine.close()
         log.info("Orchestrator stopped")
+
+
+def _build_health_sources(config) -> list[EvidenceSource]:
+    """Pick the EvidenceSource implementations for a given config.
+
+    Phase 1 ships PubMed and MedlinePlus only. Toggles for openFDA,
+    CDC, ClinicalTrials are accepted by config but no-op until those
+    sources land in Phase 3 — flipping them on logs at debug level
+    instead of erroring, so .env files written for forward compat
+    don't break.
+
+    Returns an empty list when health is disabled, which makes the
+    retrieval orchestrator a no-op (`search()` returns []).
+    """
+    h = config.health
+    if not h.enabled:
+        return []
+    sources: list[EvidenceSource] = []
+    if h.retrieval_pubmed:
+        sources.append(PubMedSource(api_key=h.ncbi_api_key))
+    if h.retrieval_medlineplus:
+        sources.append(MedlinePlusSource())
+    if h.retrieval_openfda:
+        log.debug("HEALTH_RETRIEVAL_OPENFDA enabled but no source registered yet")
+    if h.retrieval_cdc:
+        log.debug("HEALTH_RETRIEVAL_CDC enabled but no source registered yet")
+    if h.retrieval_clinicaltrials:
+        log.debug("HEALTH_RETRIEVAL_CLINICALTRIALS enabled but no source registered yet")
+    return sources
 
 
 def _preview(content: str, max_chars: int = 240) -> str:
