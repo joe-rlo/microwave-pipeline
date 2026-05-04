@@ -76,21 +76,76 @@ Available skills:
 {catalog}
 """
 
+# Health classification block — appended to the JSON schema and the
+# definitions section when the health module is enabled. Kept tight to
+# avoid token bloat; the bias toward "personal" / "unknown" over "general"
+# is intentional. False positives cost a routing decision; false negatives
+# could route PHI to a non-BAA endpoint.
+_HEALTH_PROMPT_BLOCK = """\
 
-def _build_prompt(skills: list[tuple[str, str]] | None) -> str:
-    """Compose the triage prompt. Skill catalog is appended only when
-    skills are available so a zero-skill install keeps the original prompt
-    shape (and token count)."""
+Health classification (set phi_class):
+- "none" if the message is not about health, medicine, symptoms, or treatments
+- "general" if it asks about health concepts, conditions, drugs, or research
+  in the abstract ("what is metformin", "how does the flu spread")
+- "personal" if it references the user's own body, symptoms, history,
+  medications, or test results ("my A1C", "I take", "should I", "is this
+  rash", "my doctor said")
+- "unknown" if you cannot tell with reasonable confidence
+
+Default to "personal" over "general" when in doubt. Default to "unknown"
+over "general" when in real doubt.
+
+Also set `health_topic` to a short tag like "diabetes", "medication",
+"symptoms", "vaccines", "nutrition" when the message has a clear topic;
+otherwise null.{project_note}
+"""
+
+_HEALTH_PROJECT_NOTE = """
+
+An active writing project named "{project}" is in scope. References to
+fictional characters' bodies, symptoms, medications, or conditions inside
+that project's content classify as "general" (not "personal") — a novel
+about a character with diabetes is research, not the user's own PHI."""
+
+
+def _build_prompt(
+    skills: list[tuple[str, str]] | None,
+    health_enabled: bool = False,
+    active_project: str | None = None,
+) -> str:
+    """Compose the triage prompt.
+
+    Skill catalog and health classification are both opt-in: when off
+    they don't appear in the prompt at all, so a zero-skill / health-off
+    install keeps the original prompt shape and token count.
+    """
+    base = TRIAGE_PROMPT_BASE
     if not skills:
-        # Keep behavior identical to pre-skill triage — same prompt text.
-        # Return the base unmodified so unrelated tests stay stable.
-        return TRIAGE_PROMPT_BASE.replace(
-            ',\n  "matched_skill": <string or null>', ""
+        base = base.replace(',\n  "matched_skill": <string or null>', "")
+
+    if health_enabled:
+        # Inject phi_class + health_topic into the JSON shape and append
+        # the classification rules. We splice into the JSON schema before
+        # the closing brace so the model sees one coherent shape, not
+        # two trailing addenda.
+        health_fields = ',\n  "phi_class": "none" | "general" | "personal" | "unknown",\n  "health_topic": <string or null>'
+        base = base.rstrip()
+        # Find the last `}` in the JSON example and inject before it.
+        last_brace = base.rfind("}")
+        if last_brace != -1:
+            base = base[:last_brace].rstrip() + health_fields + "\n" + base[last_brace:]
+
+        project_note = (
+            _HEALTH_PROJECT_NOTE.format(project=active_project)
+            if active_project
+            else ""
         )
+        base = base + _HEALTH_PROMPT_BLOCK.format(project_note=project_note)
+
+    if not skills:
+        return base
     catalog_lines = [f"- {name}: {desc or '(no description)'}" for name, desc in skills]
-    return TRIAGE_PROMPT_BASE + _SKILLS_PROMPT_TEMPLATE.format(
-        catalog="\n".join(catalog_lines)
-    )
+    return base + _SKILLS_PROMPT_TEMPLATE.format(catalog="\n".join(catalog_lines))
 
 
 def _format_triage_input(message: str, recent_turns: list[Turn]) -> str:
@@ -130,6 +185,19 @@ _TRIAGE_SCHEMA_HINT = (
     '"matched_skill": string|null}'
 )
 
+# Schema hint with health fields appended — used for the retry prompt
+# when the health module is enabled. Same compactness rule applies.
+_TRIAGE_SCHEMA_HINT_HEALTH = (
+    '{"intent": "recall|preference|task|question|social", '
+    '"complexity": "simple|moderate|complex", '
+    '"needs_memory": true|false, '
+    '"search_params": {"decay_half_life": float, "result_count": int, '
+    '"weight_recency": float, "mmr_lambda": float}, '
+    '"matched_skill": string|null, '
+    '"phi_class": "none|general|personal|unknown", '
+    '"health_topic": string|null}'
+)
+
 
 def _parse_triage_response(
     response: str, available_skills: set[str] | None = None
@@ -160,6 +228,16 @@ def _result_from_data(
         log.info(f"Triage returned unknown skill {matched!r}; discarding")
         matched = None
 
+    # Health classification — defaults to safe values when fields are
+    # absent (i.e., health module disabled or model dropped them).
+    phi_class = str(data.get("phi_class", "none") or "none").lower()
+    if phi_class not in ("none", "general", "personal", "unknown"):
+        log.info(f"Triage returned unknown phi_class {phi_class!r}; defaulting to none")
+        phi_class = "none"
+    health_topic = data.get("health_topic")
+    if health_topic is not None:
+        health_topic = str(health_topic).strip() or None
+
     return TriageResult(
         intent=data.get("intent", "question"),
         complexity=data.get("complexity", "moderate"),
@@ -171,6 +249,8 @@ def _result_from_data(
         }),
         needs_memory=data.get("needs_memory", True),
         matched_skill=matched,
+        phi_class=phi_class,
+        health_topic=health_topic,
     )
 
 
@@ -183,6 +263,8 @@ async def triage(
     cli_path: str = "",
     skills: list[tuple[str, str]] | None = None,
     workspace_dir: str = "",
+    health_enabled: bool = False,
+    active_project: str | None = None,
 ) -> TriageResult:
     """Run triage classification on a user message.
 
@@ -190,6 +272,16 @@ async def triage(
     When provided, the prompt asks Haiku to also return a matched_skill
     (or null) — enables the adaptive-skill activation feature without
     any second model call.
+
+    `health_enabled` toggles the PHI classification block in the prompt.
+    When False the prompt's shape is identical to before the health
+    module existed; the parser still tolerates phi_class fields and
+    defaults to "none" so callers don't need branching.
+
+    `active_project` is the user's currently-active writing project (if
+    any). When set, fictional-content references inside that project's
+    scope classify as "general" rather than "personal" — the agreed
+    policy for a novel about a character with diabetes.
     """
     from src.pipeline.json_utils import query_json_with_retry
 
@@ -198,14 +290,19 @@ async def triage(
         workspace_dir=workspace_dir,
     )
     input_text = _format_triage_input(message, recent_turns)
-    prompt = _build_prompt(skills)
+    prompt = _build_prompt(
+        skills,
+        health_enabled=health_enabled,
+        active_project=active_project,
+    )
     available = {name for name, _ in skills} if skills else None
 
+    schema_hint = _TRIAGE_SCHEMA_HINT_HEALTH if health_enabled else _TRIAGE_SCHEMA_HINT
     data = await query_json_with_retry(
         client.query,
         prompt,
         input_text,
-        _TRIAGE_SCHEMA_HINT,
+        schema_hint,
         label="triage",
     )
     if data is None:
@@ -214,8 +311,13 @@ async def triage(
 
     result = _result_from_data(data, available_skills=available)
     skill_note = f", skill={result.matched_skill!r}" if result.matched_skill else ""
+    health_note = (
+        f", phi_class={result.phi_class}"
+        + (f"/{result.health_topic}" if result.health_topic else "")
+        if result.phi_class != "none" else ""
+    )
     log.info(
         f"Triage: intent={result.intent}, complexity={result.complexity}, "
-        f"needs_memory={result.needs_memory}{skill_note}"
+        f"needs_memory={result.needs_memory}{skill_note}{health_note}"
     )
     return result

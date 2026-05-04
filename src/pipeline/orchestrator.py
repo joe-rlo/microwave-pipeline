@@ -222,6 +222,8 @@ class Orchestrator:
             cli_path=self.config.cli_path,
             skills=skill_catalog or None,
             workspace_dir=str(self.config.workspace_dir),
+            health_enabled=self.config.health.enabled,
+            active_project=(self._active_project.name if self._active_project else None),
         )
 
         # Resolve the skill in effect for THIS turn. Explicit pin always wins;

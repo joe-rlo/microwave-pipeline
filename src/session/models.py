@@ -18,6 +18,23 @@ class TriageResult:
     # already pinned. Defaults to None for back-compat with older callers.
     matched_skill: str | None = None
 
+    # --- Health module classification ---
+    # `phi_class` distinguishes non-health input from general health
+    # questions from personal health queries that contain PHI:
+    #   "none"     — not health-related; route to existing pipeline
+    #   "general"  — health concepts in the abstract; standard LLM + retrieval
+    #   "personal" — references the user's own body / symptoms / meds / labs
+    #   "unknown"  — classifier is uncertain; treated as "personal" for safety
+    # The triage prompt biases toward `personal`/`unknown` over `general`
+    # because false positives cost a Bedrock call but false negatives could
+    # leak PHI to a non-BAA endpoint. Defaults to "none" so callers that
+    # don't enable the health module see no behavioral change.
+    phi_class: str = "none"
+    # Short topic tag like "diabetes", "medication", "symptoms" — used by
+    # retrieval to rank source matches and by audit to dedupe similar queries.
+    # Optional; the model returns null when no clear topic applies.
+    health_topic: str | None = None
+
 
 @dataclass
 class MemoryFragment:
