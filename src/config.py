@@ -7,6 +7,8 @@ from pathlib import Path
 
 from pydantic import BaseModel
 
+from src.health.config import HealthConfig, load_health_config
+
 
 class Config(BaseModel):
     # Authentication
@@ -65,6 +67,12 @@ class Config(BaseModel):
     # Search defaults
     default_result_count: int = 5
     default_decay_half_life: float = 30.0  # days
+
+    # Health module — privacy-aware health Q&A pipeline. Disabled by
+    # default; flip HEALTH_MODULE_ENABLED in .env to turn on. The nested
+    # surface keeps the dozens of HEALTH_* env vars from cluttering the
+    # main Config namespace. See src/health/config.py.
+    health: HealthConfig = HealthConfig()
 
     @property
     def identity_path(self) -> Path:
@@ -156,4 +164,5 @@ def load_config() -> Config:
         openai_api_key=os.getenv("OPENAI_API_KEY", ""),
         instacart_api_key=os.getenv("INSTACART_API_KEY", ""),
         instacart_partner_linkback_url=os.getenv("INSTACART_PARTNER_LINKBACK_URL", ""),
+        health=load_health_config(),
     )
