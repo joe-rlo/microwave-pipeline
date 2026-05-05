@@ -40,6 +40,7 @@ Edit `.env`:
 | `SCHEDULER_ENABLED` | No | `true` to run the scheduler alongside `--signal` |
 | `INSTACART_API_KEY` | No | Enables the `instacart_create_cart` tool (build Shop with Instacart links). Get a key at developer.instacart.com. |
 | `INSTACART_PARTNER_LINKBACK_URL` | No | Optional. Where Instacart sends the user after checkout. |
+| `BOT_BUILTIN_TOOLS` | No | Comma-separated list of Agent SDK built-in tools the bot may call (e.g. `WebFetch,WebSearch` or `Read,Write,Edit,Bash,WebFetch,WebSearch`). Empty = no built-ins. See [Built-in tools](#built-in-tools-read-write-bash-webfetch-websearch-) for the permission model. |
 | `HEALTH_MODULE_ENABLED` | No | `true` to turn on the [health module](#health-module--workspaceskillshealth-qa) (privacy-aware health Q&A with cited evidence). Off by default. |
 | `NCBI_API_KEY` | No | Optional. Raises PubMed E-utilities rate limit from ~3 req/s to ~10 req/s. Personal-use volume rarely needs it. |
 | `CLAUDE_CLI_PATH` | No | Auto-detected. Override if needed. |
@@ -423,6 +424,33 @@ Tools are wired in at orchestrator startup via `build_tools(config)`. Anything r
 5. Add the env var to `Config` (`src/config.py`) and document it in `README.md` + `.env.example`.
 
 The seed `instacart_create_cart` tool follows this exact pattern — read it as a reference.
+
+#### Built-in tools (Read, Write, Bash, WebFetch, WebSearch, …)
+
+The Agent SDK ships built-in tools that don't need an `src/tools/` wrapper — they're part of Claude Code's standard surface. They're **not enabled by default**: a stock bot is conversational-only.
+
+To turn them on, list the ones you want in `.env`:
+
+```
+BOT_BUILTIN_TOOLS=WebFetch,WebSearch                          # read-only web
+BOT_BUILTIN_TOOLS=Read,WebFetch,WebSearch                     # + read files
+BOT_BUILTIN_TOOLS=Read,Write,Edit,Bash,WebFetch,WebSearch     # full Claude Code surface
+```
+
+When non-empty, two things happen:
+
+1. The named tools are added to the SDK's `allowed_tools` so the model knows they exist.
+2. The SDK is told to load `setting_sources=["user", "project", "local"]` — meaning your existing `~/.claude/settings.json` and `.claude/settings.local.json` permission patterns gate every actual call. Same source of truth Claude Code uses, so you don't duplicate permission rules in `.env`.
+
+So if your `.claude/settings.local.json` has:
+
+```json
+{ "permissions": { "allow": ["Bash(curl *)", "WebFetch(*)", "Edit(*)"] } }
+```
+
+…those patterns govern what the bot can actually do. `Bash(rm *)` would be denied; `Bash(curl *)` would go through.
+
+**Risk worth naming.** Enabling `Bash`, `Write`, or `Edit` means a clever message *could* convince the model to do something destructive. Your `SIGNAL_ALLOWED_SENDERS` allowlist is the main guard against that — only people on the list can send messages — but the moment the bot has shell access, every turn is a turn where prompt injection from your own messages could fire a destructive command. Permissive entries like `Bash(python3 *)` are effectively unrestricted; audit your `settings.local.json` allowlist before flipping this on.
 
 ### Model selection
 

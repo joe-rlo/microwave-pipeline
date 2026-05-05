@@ -55,6 +55,16 @@ class Config(BaseModel):
     # personal use can leave it blank).
     instacart_partner_linkback_url: str = ""
 
+    # Built-in Agent SDK tools the bot is allowed to call during a turn.
+    # Empty = no built-in tools (default — keeps the bot conversational
+    # only). Non-empty = listed names are added to allowed_tools AND the
+    # SDK is told to load `.claude/settings.local.json` so the user's
+    # existing permission patterns gate actual invocations. Typical
+    # values: "WebFetch,WebSearch" (read-only web access) or the full
+    # set "Read,Write,Edit,Bash,WebFetch,WebSearch" (matches Claude
+    # Code's default surface). See README "Built-in tools" section.
+    bot_builtin_tools: tuple[str, ...] = ()
+
     # Embedding
     embedding_model: str = "text-embedding-3-small"
     embedding_dimension: int = 1536
@@ -164,5 +174,8 @@ def load_config() -> Config:
         openai_api_key=os.getenv("OPENAI_API_KEY", ""),
         instacart_api_key=os.getenv("INSTACART_API_KEY", ""),
         instacart_partner_linkback_url=os.getenv("INSTACART_PARTNER_LINKBACK_URL", ""),
+        bot_builtin_tools=tuple(
+            t.strip() for t in os.getenv("BOT_BUILTIN_TOOLS", "").split(",") if t.strip()
+        ),
         health=load_health_config(),
     )

@@ -144,6 +144,7 @@ class Orchestrator:
             output_dir=str(self.config.output_dir),
             workspace_dir=str(self.config.workspace_dir),
             tool_bundle=self.tool_bundle,
+            builtin_tools=list(self.config.bot_builtin_tools),
         )
 
         # Assemble stable context and connect. Active project's BIBLE.md

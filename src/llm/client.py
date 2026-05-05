@@ -36,7 +36,7 @@ class LLMClient:
 
     def __init__(self, model: str = "sonnet", auth_mode: str = "max", api_key: str = "",
                  cli_path: str = "", output_dir: str = "", workspace_dir: str = "",
-                 tool_bundle=None):
+                 tool_bundle=None, builtin_tools: list[str] | None = None):
         self.model = model
         self.auth_mode = auth_mode
         self.api_key = api_key
@@ -53,6 +53,14 @@ class LLMClient:
         # Stashed on the instance so reconnect() can rewire after a
         # stable-context refresh without the orchestrator re-passing it.
         self.tool_bundle = tool_bundle
+        # Built-in Agent SDK tools (Read, Write, Edit, Bash, WebFetch,
+        # WebSearch, etc.) the bot is permitted to call. Empty list = no
+        # built-ins (conversational-only); non-empty = these names are
+        # advertised to the model AND `setting_sources=["user", "project",
+        # "local"]` is passed so settings.local.json's permission
+        # patterns gate actual invocations. Same source of truth the
+        # user already maintains for Claude Code.
+        self.builtin_tools = list(builtin_tools or [])
         self._client = None
         self._stable_prompt: str | None = None
         self._conversation: list[dict] = []
@@ -92,15 +100,28 @@ class LLMClient:
                 opts["cwd"] = str(ws.parent)
                 opts["add_dirs"] = [str(ws)]
             bundle = self.tool_bundle
+            allowed: list[str] = []
             if bundle and not bundle.is_empty:
                 opts["mcp_servers"] = bundle.mcp_servers
-                opts["allowed_tools"] = list(bundle.allowed_tools)
+                allowed.extend(bundle.allowed_tools)
+            # Built-in Agent SDK tools (Bash, Read, Write, Edit,
+            # WebFetch, WebSearch, etc.). When any are listed we also
+            # enable settings.local.json sourcing so the user's
+            # permission patterns (e.g. `Bash(curl *)`) gate actual
+            # calls — same model Claude Code uses, no permission
+            # config duplicated in env vars.
+            if self.builtin_tools:
+                allowed.extend(self.builtin_tools)
+                opts["setting_sources"] = ["user", "project", "local"]
                 log.info(
-                    "Tools enabled: %s",
-                    ", ".join(bundle.allowed_tools),
+                    "Built-in tools enabled: %s "
+                    "(permissions gated by settings.local.json)",
+                    ", ".join(self.builtin_tools),
                 )
-            else:
-                opts["allowed_tools"] = []
+            opts["allowed_tools"] = allowed
+            if allowed and not self.builtin_tools:
+                # MCP-only path: keep the existing log line shape
+                log.info("Tools enabled: %s", ", ".join(allowed))
 
             options = ClaudeAgentOptions(**opts)
             self._client = ClaudeSDKClient(options)
