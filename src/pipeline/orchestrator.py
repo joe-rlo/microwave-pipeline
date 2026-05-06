@@ -27,6 +27,7 @@ from src.health.retrieval.base import EvidenceSource
 from src.health.retrieval.medlineplus import MedlinePlusSource
 from src.health.retrieval.orchestrator import RetrievalOrchestrator
 from src.health.retrieval.pubmed import PubMedSource
+from src.health.retrieval.query_rewrite import rewrite_query as health_rewrite_query
 from src.health.router import DECLINE_PHI_MESSAGE, route as health_route
 from src.projects import Project, ProjectLoader, ProjectNotFound
 from src.session.engine import SessionEngine
@@ -325,9 +326,29 @@ class Orchestrator:
             }
 
             if h_route.enable_retrieval:
+                # Rewrite the user's natural-language question into a
+                # keyword-style search query before fan-out. PubMed +
+                # MedlinePlus index by clinical concepts; the verbatim
+                # user sentence has poor recall on side-effect /
+                # mechanism / pharmacology questions. Falls back to
+                # `message` verbatim on any failure path.
+                try:
+                    search_query = await health_rewrite_query(
+                        message,
+                        topic=triage_result.health_topic,
+                        model=self.config.model_triage,
+                        auth_mode=self.config.auth_mode,
+                        api_key=self.config.anthropic_api_key,
+                        cli_path=self.config.cli_path,
+                        workspace_dir=str(self.config.workspace_dir),
+                    )
+                except Exception as e:
+                    log.warning(f"Query rewrite raised; using original: {e}")
+                    search_query = message
+
                 try:
                     health_evidence = await self.health_retrieval.search(
-                        message,
+                        search_query,
                         topic=triage_result.health_topic,
                     )
                     log.info(
@@ -336,8 +357,8 @@ class Orchestrator:
                     )
                 except Exception as e:
                     # Retrieval failure shouldn't kill the turn — the
-                    # health-qa skill will say "no evidence" when the
-                    # block is empty. Better than a 500.
+                    # empty-retrieval relaxation block (or the health-qa
+                    # skill's "no evidence" path) handles it cleanly.
                     log.warning(f"Health retrieval failed: {e}")
 
             if h_route.require_disclaimer:
