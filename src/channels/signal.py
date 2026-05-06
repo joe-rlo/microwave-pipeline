@@ -62,10 +62,12 @@ ADDENDUM_WINDOW_SECONDS = 18.0
 THINKING_NUDGE_SECONDS = 4.0
 
 # Microwave-themed phrases the thinking nudge picks from at random.
-# Italicized via Signal's text_mode=styled markdown (`_phrase…_`).
-# Format note: ellipsis goes INSIDE the italic markers and AFTER the
-# phrase — leading-ellipsis-against-underscore (`_…thinking_`) was
-# rendering the underscore literally on some clients.
+# Italicized via Signal's text_mode=styled markdown — `*phrase…*`.
+# IMPORTANT: signal-cli-rest-api's styled mode uses asterisks for
+# italic (`*text*`) and double-asterisks for bold (`**text**`). The
+# underscore form (`_text_`) is NOT recognized by the daemon and
+# renders as a literal underscore — confirmed against the API's own
+# docstring: "Styling Options: *italic text*, **bold text**, ..."
 _THINKING_PHRASES = [
     "heating up…",
     "thawing thoughts…",
@@ -311,7 +313,7 @@ class SignalChannel(Channel):
             except Exception as e:
                 log.warning(f"Voice download failed: {e}")
                 await self._send_text(
-                    source, f"_⚠️ couldn't download that voice message: {e}_"
+                    source, f"*⚠️ couldn't download that voice message: {e}*"
                 )
 
         # Download image payloads now too — they're small and async, and
@@ -326,7 +328,7 @@ class SignalChannel(Channel):
             except Exception as e:
                 log.warning(f"Image download failed: {e}")
                 await self._send_text(
-                    source, f"_⚠️ couldn't download that image: {e}_"
+                    source, f"*⚠️ couldn't download that image: {e}*"
                 )
 
         await self._buffer_input(
@@ -578,7 +580,7 @@ class SignalChannel(Channel):
                 except Exception as e:
                     log.warning(f"Transcription failed: {e}")
                     await self._send_text(
-                        source, f"_⚠️ couldn't transcribe a voice message: {e}_"
+                        source, f"*⚠️ couldn't transcribe a voice message: {e}*"
                     )
             pending.transcribed.extend(new_transcripts)
 
@@ -586,7 +588,7 @@ class SignalChannel(Channel):
         # transcripts on a re-flush would be confusing.
         if new_transcripts:
             voice_combined = "\n".join(new_transcripts)
-            await self._send_text(source, f'_heard: "{voice_combined}"_')
+            await self._send_text(source, f'*heard: "{voice_combined}"*')
 
         # Compose the final input. Voice and text are tagged so the LLM
         # can tell them apart even when bundled together. Inline override
@@ -734,16 +736,10 @@ class SignalChannel(Channel):
         # stalled. After THINKING_NUDGE_SECONDS we send one short
         # rotating microwave-themed message so they have a clear "yes,
         # still on it" beat. Cancelled if the pipeline finishes inside
-        # the window — fast turns stay clean.
-        #
-        # `thinking_ts` is a list (not a scalar) so the nudge task can
-        # mutate it from inside its own coroutine; the finally block
-        # below reads it to remote-delete the placeholder once the real
-        # reply lands.
-        thinking_ts: list[int] = []
-        thinking_task = asyncio.create_task(
-            self._thinking_nudge(source, thinking_ts)
-        )
+        # the window — fast turns stay clean. The placeholder stays in
+        # the chat once sent (no auto-delete) — the deletion tombstones
+        # rendered worse than just leaving the message.
+        thinking_task = asyncio.create_task(self._thinking_nudge(source))
         accumulated = ""
         try:
             async for chunk in self.orchestrator.process(
@@ -761,7 +757,7 @@ class SignalChannel(Channel):
                     name = chunk.get("name", "?")
                     words = chunk.get("word_count", 0)
                     preview = chunk.get("preview", "")
-                    note = f"_✓ wrote `{name}` ({words:,} words)_"
+                    note = f"*✓ wrote `{name}` ({words:,} words)*"
                     if preview:
                         # Indent preview as a quote block so it's visually
                         # distinct from the rest of the reply.
@@ -774,8 +770,8 @@ class SignalChannel(Channel):
                     n = chunk.get("turns_compacted", 0)
                     m = chunk.get("turns_kept", 0)
                     note = (
-                        f"_↻ Archived {n} earlier turn{'s' if n != 1 else ''} "
-                        f"(summary saved, last {m} kept in context)._"
+                        f"*↻ Archived {n} earlier turn{'s' if n != 1 else ''} "
+                        f"(summary saved, last {m} kept in context).*"
                     )
                     await self._send_text(source, note)
                 # metadata: nothing to show on Signal
@@ -806,15 +802,6 @@ class SignalChannel(Channel):
         finally:
             typing_task.cancel()
             thinking_task.cancel()
-            # If the thinking nudge actually got sent (slow turn), the
-            # task stashed its message timestamp in `thinking_ts`.
-            # Remote-delete it now that the real reply has landed —
-            # keeps the chat history clean, since the placeholder has
-            # served its purpose. Best-effort: a delete failure just
-            # leaves the placeholder visible, which is no worse than
-            # the pre-delete behavior.
-            if thinking_ts:
-                await self._remote_delete(source, thinking_ts[0])
             # Explicitly clear so the indicator drops immediately instead of
             # lingering until Signal's 15s auto-expire.
             await self._send_typing(source, active=False)
@@ -909,8 +896,8 @@ class SignalChannel(Channel):
             log.warning("Voice reply requested but OPENAI_API_KEY not set")
             await self._send_text(
                 recipient,
-                "_⚠️ couldn't synthesize voice reply (OPENAI_API_KEY missing); "
-                "here's the text:_",
+                "*⚠️ couldn't synthesize voice reply (OPENAI_API_KEY missing); "
+                "here's the text:*",
             )
             return False
         try:
@@ -925,26 +912,23 @@ class SignalChannel(Channel):
             log.warning(f"TTS synthesis failed: {e}")
             await self._send_text(
                 recipient,
-                f"_⚠️ couldn't synthesize voice reply ({e}); here's the text:_",
+                f"*⚠️ couldn't synthesize voice reply ({e}); here's the text:*",
             )
             return False
         except Exception as e:
             log.exception(f"Unexpected TTS error: {e}")
             await self._send_text(
                 recipient,
-                "_⚠️ voice synthesis hit an unexpected error; here's the text:_",
+                "*⚠️ voice synthesis hit an unexpected error; here's the text:*",
             )
             return False
 
         await self._send_attachment(recipient, "reply.aac", audio)
         return True
 
-    async def _thinking_nudge(
-        self, recipient: str, ts_holder: list[int],
-    ) -> None:
+    async def _thinking_nudge(self, recipient: str) -> None:
         """Send a one-shot rotating microwave-themed "thinking…" message
-        after a quiet pause, and stash its timestamp in `ts_holder` so
-        the caller can remote-delete it once the real reply lands.
+        after a quiet pause.
 
         Signal can't stream, so a long-running pipeline looks
         indistinguishable from a stalled bot. After THINKING_NUDGE_SECONDS
@@ -952,10 +936,11 @@ class SignalChannel(Channel):
         `_THINKING_PHRASES`; if the pipeline finishes inside the window
         the task is cancelled and nothing is sent.
 
-        `ts_holder` is a list because tasks can't return values to their
-        spawner here without an awaited handle, and we want the spawner's
-        `finally` block to be able to read whatever timestamp this task
-        produced (or didn't, if it was cancelled).
+        We previously remote-deleted the message once the real reply
+        landed, but the deletion tombstone in some Signal clients
+        looked worse than just leaving the placeholder visible — so
+        the message stays in the chat as a small breadcrumb of what
+        happened during the wait.
         """
         try:
             await asyncio.sleep(THINKING_NUDGE_SECONDS)
@@ -963,9 +948,7 @@ class SignalChannel(Channel):
             return
         phrase = random.choice(_THINKING_PHRASES)
         try:
-            ts = await self._send_text(recipient, f"_{phrase}_")
-            if ts is not None:
-                ts_holder.append(ts)
+            await self._send_text(recipient, f"*{phrase}*")
         except Exception as e:
             log.debug(f"Thinking-nudge send failed: {e}")
 

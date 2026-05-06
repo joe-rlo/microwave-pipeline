@@ -1,9 +1,11 @@
 """Markdown → Signal-rendered text.
 
 Signal renders a small set of inline styles natively when the message text
-contains the right syntax: `**bold**`, `*italic*` / `_italic_`,
-`~strikethrough~`, and `` `monospace` ``. There is no header/link/code-block
-markup, and no HTML.
+contains the right syntax (and the daemon is configured with
+`text_mode: "styled"`): `**bold**`, `*italic*`, `~strikethrough~`,
+`` `monospace` ``, and `||spoiler||`. The underscore form `_italic_` is
+NOT recognized — signal-cli-rest-api's styled parser only accepts asterisks.
+There is no header/link/code-block markup, and no HTML.
 
 This module normalizes LLM output into that subset and, like the Telegram
 formatter, expands markdown tables into inline "card" blocks so tabular

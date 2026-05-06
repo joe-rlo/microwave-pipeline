@@ -1,10 +1,11 @@
-"""Thinking-nudge tests — phrase rotation, send timestamp capture,
-and remote-delete-after-reply.
+"""Thinking-nudge tests — phrase rotation + Signal italic syntax.
 
-These exercise the public surface of `_thinking_nudge` and
-`_remote_delete` without spinning up the full SignalChannel websocket
-loop. The point is to lock the contract: a phrase fires, its
-timestamp is captured, and the delete request hits the right URL.
+These exercise `_thinking_nudge` and `_remote_delete` without
+spinning up the full SignalChannel websocket loop. The remote-delete
+helper is kept around (forward-compatible) but no longer invoked
+from the reply path — the deletion tombstones rendered worse than
+just leaving the placeholder visible. Tests verify the helper still
+works in case a later caller wants it.
 """
 
 from __future__ import annotations
@@ -71,33 +72,30 @@ class TestThinkingPhrases:
 
 class TestThinkingNudgeSend:
     @pytest.mark.asyncio
-    async def test_nudge_captures_timestamp(self, monkeypatch):
-        """When the nudge fires and _send_text returns a timestamp, the
-        holder list gets populated so the caller can delete later."""
+    async def test_nudge_uses_asterisk_italics(self, monkeypatch):
+        """signal-cli-rest-api's styled mode parses `*text*` as italic;
+        `_text_` renders literally. Pin the wrapper character so a
+        future refactor doesn't silently regress to underscores."""
         ch = _make_channel()
-        # Patch sleep to fire immediately
         monkeypatch.setattr("src.channels.signal.THINKING_NUDGE_SECONDS", 0)
         ch._send_text = AsyncMock(return_value=1234567890123)
 
-        ts_holder: list[int] = []
-        await ch._thinking_nudge("+15559999999", ts_holder)
+        await ch._thinking_nudge("+15559999999")
 
-        assert ts_holder == [1234567890123]
-        # Sent message uses italic wrapper around a microwave phrase
         ch._send_text.assert_awaited_once()
         sent_text = ch._send_text.await_args.args[1]
-        assert sent_text.startswith("_") and sent_text.endswith("_")
-        # Body (without the italic markers) is one of our phrases
+        # Italic wrapper is asterisks, not underscores
+        assert sent_text.startswith("*") and sent_text.endswith("*")
+        assert "_" not in sent_text  # no leftover underscore syntax
+        # Body (without the asterisk markers) is one of our phrases
         assert sent_text[1:-1] in _THINKING_PHRASES
 
     @pytest.mark.asyncio
-    async def test_nudge_cancelled_before_send_no_timestamp(self):
-        """Fast turn cancels the nudge during sleep — no message sent,
-        no timestamp captured."""
+    async def test_nudge_cancelled_before_send_no_message(self):
+        """Fast turn cancels the nudge during sleep — no message sent."""
         ch = _make_channel()
         ch._send_text = AsyncMock(return_value=999)
-        ts_holder: list[int] = []
-        task = asyncio.create_task(ch._thinking_nudge("+1", ts_holder))
+        task = asyncio.create_task(ch._thinking_nudge("+1"))
         # Cancel before the (real) sleep elapses
         await asyncio.sleep(0.01)
         task.cancel()
@@ -105,19 +103,7 @@ class TestThinkingNudgeSend:
             await task
         except asyncio.CancelledError:
             pass
-        assert ts_holder == []
         ch._send_text.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_send_failure_leaves_holder_empty(self, monkeypatch):
-        """_send_text returns None on failure — the holder must stay
-        empty so the caller doesn't try to delete a phantom timestamp."""
-        ch = _make_channel()
-        monkeypatch.setattr("src.channels.signal.THINKING_NUDGE_SECONDS", 0)
-        ch._send_text = AsyncMock(return_value=None)
-        ts_holder: list[int] = []
-        await ch._thinking_nudge("+1", ts_holder)
-        assert ts_holder == []
 
 
 class TestRemoteDelete:
