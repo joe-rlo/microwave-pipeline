@@ -133,8 +133,39 @@ class TestHealthClassification:
         assert "phi_class" in prompt
         assert "health_topic" in prompt
         assert "personal" in prompt and "general" in prompt
-        # The bias toward personal/unknown is load-bearing against PHI leaks
-        assert 'Default to "personal"' in prompt
+        # First-person-marker rule is the load-bearing change vs. the
+        # original "default to personal in doubt" bias — pin it.
+        assert "first-person marker" in prompt or "first-person reference" in prompt
+
+    def test_health_prompt_has_meta_question_carveout(self):
+        """Meta questions about the bot itself ('did you find anything?',
+        'no results from the pipeline?') must classify as 'none' — not
+        as personal just because they came after a health turn."""
+        prompt = _build_prompt(skills=None, health_enabled=True)
+        # Look for the explicit "meta-questions" carve-out language
+        assert "meta-questions" in prompt.lower() or "meta question" in prompt.lower()
+        # And at least one example phrasing the model can pattern-match
+        assert "no results" in prompt.lower() or "did you find" in prompt.lower()
+
+    def test_health_prompt_carries_topic_over_followups(self):
+        """Brief follow-ups without first-person markers should inherit
+        the general classification from the previous turn — locks the
+        rule against the screenshot scenario where 'what about ED
+        medications?' got mis-classified."""
+        prompt = _build_prompt(skills=None, health_enabled=True)
+        assert "carryover" in prompt.lower() or "follow-up" in prompt.lower()
+        # The clarifying example phrasings the prompt uses
+        assert "what about" in prompt.lower() or "and statins" in prompt.lower()
+
+    def test_health_prompt_distinguishes_topic_from_marker(self):
+        """A sensitive TOPIC alone (ED, cancer, mental health) must NOT
+        trigger 'personal' without a first-person marker. The prompt
+        spells this out so Haiku doesn't keyword-match its way into
+        false positives."""
+        prompt = _build_prompt(skills=None, health_enabled=True)
+        # Look for the disambiguating contrast pair the prompt uses
+        assert "What does Cialis do" in prompt
+        assert "safe for me" in prompt
 
     def test_health_enabled_with_skills(self):
         """Both extensions should compose without trampling each other."""

@@ -77,27 +77,54 @@ Available skills:
 """
 
 # Health classification block — appended to the JSON schema and the
-# definitions section when the health module is enabled. Kept tight to
-# avoid token bloat; the bias toward "personal" / "unknown" over "general"
-# is intentional. False positives cost a routing decision; false negatives
-# could route PHI to a non-BAA endpoint.
+# definitions section when the health module is enabled. Tightened
+# in May 2026 after observing real over-triggering on benign generic
+# questions ("what about ED medications?" → personal) and meta
+# questions about the bot itself ("no results from the pipeline?" →
+# personal). The rule is now: "personal" requires an EXPLICIT
+# first-person marker, not just a sensitive topic.
 _HEALTH_PROMPT_BLOCK = """\
 
 Health classification (set phi_class):
-- "none" if the message is not about health, medicine, symptoms, or treatments
-- "general" if it asks about health concepts, conditions, drugs, or research
-  in the abstract ("what is metformin", "how does the flu spread")
-- "personal" if it references the user's own body, symptoms, history,
-  medications, or test results ("my A1C", "I take", "should I", "is this
-  rash", "my doctor said")
-- "unknown" if you cannot tell with reasonable confidence
 
-Default to "personal" over "general" when in doubt. Default to "unknown"
-over "general" when in real doubt.
+- "none" — the message is not about health, medicine, symptoms, or
+  treatments. THIS INCLUDES meta-questions about the bot itself or
+  the conversation, even when the surrounding topic is health
+  ("did you find anything?", "no results?", "can you search again?",
+  "what tools do you have?", "so the pipeline returned nothing?").
+
+- "general" — health concepts, conditions, drugs, or research in
+  the abstract. Includes brief follow-ups that pivot the topic but
+  stay generic ("what about X?", "and statins?", "how about ED
+  medications?", "does Cialis cause heartburn?"). The defining
+  property is the ABSENCE of a first-person reference to the user's
+  body, history, meds, or labs.
+
+- "personal" — REQUIRES an explicit first-person marker referring
+  to the user's own body, symptoms, history, medications, or test
+  results. Look for: "my <body part / lab>", "I'm <symptom>",
+  "I take", "I have", "I had", "should I", "is this <my body part>",
+  "my doctor said", a specific test value the user reported as theirs.
+
+  Brushing a sensitive topic (cancer, ED, mental health, sex,
+  pregnancy, addiction) does NOT make a question "personal" without
+  one of those markers. "What does Cialis do?" is general; "is Cialis
+  safe for me?" is personal. "Do statins cause heartburn?" is general;
+  "am I getting heartburn from my statin?" is personal.
+
+- "unknown" — only when there's a genuine ambiguity about whether
+  the user is asking about themselves vs. a hypothetical / friend /
+  news story. A bare topic mention in isolation is NOT ambiguous;
+  it's general until a first-person marker appears.
+
+Topic carryover from recent conversation: if the previous turn was
+classified general and the current message is a brief follow-up
+with no first-person markers, the follow-up stays "general".
+Conversation context wins over isolated keyword patterns.
 
 Also set `health_topic` to a short tag like "diabetes", "medication",
-"symptoms", "vaccines", "nutrition" when the message has a clear topic;
-otherwise null.{project_note}
+"side-effects", "vaccines", "nutrition" when the message has a clear
+topic; otherwise null.{project_note}
 """
 
 _HEALTH_PROJECT_NOTE = """
