@@ -22,7 +22,7 @@ from src.pipeline.reflection import reflect
 from src.pipeline.search import search
 from src.pipeline.triage import triage
 from src.health.audit import HealthAuditRow, HealthAuditWriter
-from src.health.disclaimers import load_health_channel_rules
+from src.health.disclaimers import EMPTY_RETRIEVAL_RELAXATION, load_health_channel_rules
 from src.health.retrieval.base import EvidenceSource
 from src.health.retrieval.medlineplus import MedlinePlusSource
 from src.health.retrieval.orchestrator import RetrievalOrchestrator
@@ -360,6 +360,25 @@ class Orchestrator:
 
         # --- Stage 3: Assembly ---
         bible_path = self._active_bible_path()
+        # When the general path ran but retrieval came back empty,
+        # splice the relaxation block into assembly so the model can
+        # answer briefly from training on benign questions instead of
+        # the prim "no sources, can't answer" refusal that surprised
+        # users on simple drug-class side-effect questions.
+        # PHI path doesn't get this — empty-retrieval there means the
+        # decline_phi safety message already fired upstream.
+        empty_retrieval_note = ""
+        if (
+            h_route.path == "general"
+            and h_route.enable_retrieval
+            and not health_evidence
+        ):
+            empty_retrieval_note = EMPTY_RETRIEVAL_RELAXATION
+            log.info(
+                "Health route general/empty-retrieval: relaxation block applied "
+                "(model may answer briefly from training)"
+            )
+
         assembly_result = assemble(
             search_result,
             self.memory_store,
@@ -372,6 +391,7 @@ class Orchestrator:
             tool_catalog=self.tool_bundle.catalog_text if self.tool_bundle else "",
             evidence=health_evidence or None,
             health_disclaimer=health_disclaimer_text,
+            health_empty_retrieval_note=empty_retrieval_note,
         )
 
         # Reconnect when (a) project changed since last turn, or (b) any

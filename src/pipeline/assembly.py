@@ -48,6 +48,7 @@ def assemble(
     tool_catalog: str = "",
     evidence: list | None = None,
     health_disclaimer: str = "",
+    health_empty_retrieval_note: str = "",
 ) -> AssemblyResult:
     """Assemble stable and dynamic context for this turn.
 
@@ -158,6 +159,13 @@ def assemble(
         evidence_text = _format_evidence(evidence)
         if evidence_text:
             dynamic_parts.append(evidence_text)
+    elif health_empty_retrieval_note:
+        # Empty-retrieval carve-out: when retrieval came back with
+        # nothing on the general path, the orchestrator passes a
+        # relaxation block here. It explicitly overrides the skill's
+        # "use only evidence" rule for THIS turn while keeping all
+        # safety floors. See src/health/disclaimers.EMPTY_RETRIEVAL_RELAXATION.
+        dynamic_parts.append(health_empty_retrieval_note.strip())
 
     # Health channel disclaimer goes near the end (just before length)
     # so the footer rules are fresh in the model's mind when it writes

@@ -125,3 +125,63 @@ class TestFormatEvidence:
     def test_unknown_title_handled(self):
         out = _format_evidence([_ev(title="", url="https://x/1")])
         assert "(untitled)" in out
+
+
+class TestAssembleHealthEmptyRetrieval:
+    """The relaxation block should appear in the dynamic context when
+    evidence is empty AND the orchestrator passed a relaxation note —
+    NOT when evidence is non-empty (the evidence block takes the slot)."""
+
+    def _basic_inputs(self, tmp_path):
+        """Stand up the minimal MemoryStore + MemoryIndex + SearchResult
+        wiring assemble() needs. Avoids the live DB / embeddings."""
+        from datetime import date as _date
+        from unittest.mock import MagicMock
+        from src.memory.store import MemoryStore
+        from src.session.models import SearchResult
+
+        store = MemoryStore(tmp_path)
+        store.ensure_dirs()
+        index = MagicMock()
+        index.get_promotion_candidates = MagicMock(return_value=[])
+        search_result = SearchResult(fragments=[], strategy_used="x", search_time_ms=0)
+        return store, index, search_result
+
+    def test_relaxation_block_appears_when_evidence_empty(self, tmp_path):
+        from src.pipeline.assembly import assemble
+
+        store, index, search_result = self._basic_inputs(tmp_path)
+        result = assemble(
+            search_result, store, index,
+            evidence=None,
+            health_empty_retrieval_note="[Empty retrieval — relaxed]",
+        )
+        assert "[Empty retrieval — relaxed]" in result.memory_context
+
+    def test_evidence_block_takes_slot_when_present(self, tmp_path):
+        """When real evidence is available, the relaxation block must
+        NOT also fire — that'd contradict the citation rules."""
+        from src.pipeline.assembly import assemble
+
+        store, index, search_result = self._basic_inputs(tmp_path)
+        result = assemble(
+            search_result, store, index,
+            evidence=[_ev(source="pubmed", url="https://x/1", title="t")],
+            health_empty_retrieval_note="[Empty retrieval — relaxed]",
+        )
+        # Evidence block present, relaxation suppressed
+        assert "[1]" in result.memory_context
+        assert "[Empty retrieval — relaxed]" not in result.memory_context
+
+    def test_no_relaxation_when_note_blank(self, tmp_path):
+        """Non-health turns leave the note blank — assembly must not
+        accidentally splice an empty header in."""
+        from src.pipeline.assembly import assemble
+
+        store, index, search_result = self._basic_inputs(tmp_path)
+        result = assemble(
+            search_result, store, index,
+            evidence=None,
+            health_empty_retrieval_note="",
+        )
+        assert "Empty retrieval" not in result.memory_context

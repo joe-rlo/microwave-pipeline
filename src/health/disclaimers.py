@@ -39,6 +39,44 @@ When responding to a health-classified message:
 """
 
 
+# Spliced into the dynamic context when the general path runs but
+# retrieval came back empty — explicitly carves out the health-qa
+# skill's "use only provided evidence" rule for benign generic
+# questions, while keeping the safety floors (no diagnosis, no dose,
+# emergency framing). Without this, the bot's honest "no sources
+# found" reply makes it feel broken on questions every clinician
+# could answer off the cuff ("does drug X cause heartburn?").
+EMPTY_RETRIEVAL_RELAXATION = """\
+[Empty retrieval — relaxed evidence rule for THIS turn ONLY]
+
+The health-qa skill's "use only provided evidence" rule has a
+deliberate carve-out for the case retrieval came back empty on a
+benign general-path question — which is what just happened.
+
+For THIS turn you MAY:
+- Answer briefly from established medical knowledge — 1 to 3
+  sentences. Don't pad.
+- Open with one line acknowledging the gap, e.g. "I didn't get
+  specific sources back, but here's the established read:"
+- Stick to widely-known, low-stakes content: drug classes, common
+  side effects, basic mechanisms, general health concepts a
+  pharmacist or primary-care clinician would recite without looking
+  anything up.
+
+You MUST still:
+- Refuse specific dose recommendations.
+- Refuse to start, stop, or change medications for anyone.
+- Lead with emergency framing for emergencies (chest pain, stroke
+  symptoms, suicidal ideation, anaphylaxis, severe bleeding,
+  pregnancy bleeding). Do not soften an emergency into trivia.
+- Decline to engage if the question is high-stakes (specific
+  contraindications for a real patient, dosing for a real case,
+  definitive diagnosis, mental-health crisis). For those,
+  "no specific sources retrieved; please ask your clinician" remains
+  the correct response — don't extrapolate.
+- Apply the channel disclaimer footer."""
+
+
 def load_health_channel_rules(workspace_dir: Path) -> str:
     """Return the health-channel disclaimer block.
 
