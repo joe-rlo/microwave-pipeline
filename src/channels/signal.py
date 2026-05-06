@@ -15,6 +15,7 @@ import asyncio
 import base64
 import json
 import logging
+import random
 import time
 from dataclasses import dataclass, field
 from urllib.parse import quote
@@ -53,10 +54,36 @@ MAX_HOLD_SECONDS = 60.0
 # into the earlier thought. Generous on purpose — chunked-thinking pauses
 # can be substantial; tune from logs.
 ADDENDUM_WINDOW_SECONDS = 18.0
-# Send a small "_…thinking_" message if the pipeline is still running this
-# many seconds in. Signal has no streaming, so without this nudge a slow
-# turn looks indistinguishable from a stalled bot.
+# Send a small italicized "thinking…" message if the pipeline is still
+# running this many seconds in. Signal has no streaming, so without this
+# nudge a slow turn looks indistinguishable from a stalled bot. The
+# message is remote-deleted once the actual reply lands so it doesn't
+# accumulate in the chat history.
 THINKING_NUDGE_SECONDS = 4.0
+
+# Microwave-themed phrases the thinking nudge picks from at random.
+# Italicized via Signal's text_mode=styled markdown (`_phrase…_`).
+# Format note: ellipsis goes INSIDE the italic markers and AFTER the
+# phrase — leading-ellipsis-against-underscore (`_…thinking_`) was
+# rendering the underscore literally on some clients.
+_THINKING_PHRASES = [
+    "heating up…",
+    "thawing thoughts…",
+    "defrosting…",
+    "spinning the carousel…",
+    "microwaving…",
+    "reheating…",
+    "popcorn mode…",
+    "power level 7…",
+    "30 more seconds…",
+    "stirring it up…",
+    "warming the magnetron…",
+    "one more rotation…",
+    "almost ding-time…",
+    "microwaves bouncing…",
+    "watching the turntable…",
+    "checking the clock…",
+]
 # OpenAI TTS voice for voice replies. Configurable via env (TTS_VOICE)
 # but a single value is opinionated by default — voice cloning / per-user
 # voices is a larger feature, not a v1 concern.
@@ -704,10 +731,19 @@ class SignalChannel(Channel):
         typing_task = asyncio.create_task(self._typing_loop(source))
         # Belt-and-suspenders nudge for slow turns: typing alone isn't
         # enough signal for users to know whether the bot is working or
-        # stalled. After THINKING_NUDGE_SECONDS we send one short message
-        # so they have a clear "yes, still on it" beat. Cancelled if the
-        # pipeline finishes inside the window — fast turns stay clean.
-        thinking_task = asyncio.create_task(self._thinking_nudge(source))
+        # stalled. After THINKING_NUDGE_SECONDS we send one short
+        # rotating microwave-themed message so they have a clear "yes,
+        # still on it" beat. Cancelled if the pipeline finishes inside
+        # the window — fast turns stay clean.
+        #
+        # `thinking_ts` is a list (not a scalar) so the nudge task can
+        # mutate it from inside its own coroutine; the finally block
+        # below reads it to remote-delete the placeholder once the real
+        # reply lands.
+        thinking_ts: list[int] = []
+        thinking_task = asyncio.create_task(
+            self._thinking_nudge(source, thinking_ts)
+        )
         accumulated = ""
         try:
             async for chunk in self.orchestrator.process(
@@ -770,6 +806,15 @@ class SignalChannel(Channel):
         finally:
             typing_task.cancel()
             thinking_task.cancel()
+            # If the thinking nudge actually got sent (slow turn), the
+            # task stashed its message timestamp in `thinking_ts`.
+            # Remote-delete it now that the real reply has landed —
+            # keeps the chat history clean, since the placeholder has
+            # served its purpose. Best-effort: a delete failure just
+            # leaves the placeholder visible, which is no worse than
+            # the pre-delete behavior.
+            if thinking_ts:
+                await self._remote_delete(source, thinking_ts[0])
             # Explicitly clear so the indicator drops immediately instead of
             # lingering until Signal's 15s auto-expire.
             await self._send_typing(source, active=False)
@@ -894,20 +939,33 @@ class SignalChannel(Channel):
         await self._send_attachment(recipient, "reply.aac", audio)
         return True
 
-    async def _thinking_nudge(self, recipient: str) -> None:
-        """Send a one-shot "_…thinking_" message after a quiet pause.
+    async def _thinking_nudge(
+        self, recipient: str, ts_holder: list[int],
+    ) -> None:
+        """Send a one-shot rotating microwave-themed "thinking…" message
+        after a quiet pause, and stash its timestamp in `ts_holder` so
+        the caller can remote-delete it once the real reply lands.
 
-        Signal can't stream, so a long-running pipeline looks indistinguishable
-        from a stalled bot. After THINKING_NUDGE_SECONDS we send one small
-        message; if the pipeline finishes inside the window the task is
-        cancelled and nothing is sent.
+        Signal can't stream, so a long-running pipeline looks
+        indistinguishable from a stalled bot. After THINKING_NUDGE_SECONDS
+        we send one small italicized message picked at random from
+        `_THINKING_PHRASES`; if the pipeline finishes inside the window
+        the task is cancelled and nothing is sent.
+
+        `ts_holder` is a list because tasks can't return values to their
+        spawner here without an awaited handle, and we want the spawner's
+        `finally` block to be able to read whatever timestamp this task
+        produced (or didn't, if it was cancelled).
         """
         try:
             await asyncio.sleep(THINKING_NUDGE_SECONDS)
         except asyncio.CancelledError:
             return
+        phrase = random.choice(_THINKING_PHRASES)
         try:
-            await self._send_text(recipient, "_…thinking_")
+            ts = await self._send_text(recipient, f"_{phrase}_")
+            if ts is not None:
+                ts_holder.append(ts)
         except Exception as e:
             log.debug(f"Thinking-nudge send failed: {e}")
 
@@ -940,9 +998,15 @@ class SignalChannel(Channel):
     ) -> None:
         await self._send_attachment(recipient, filename, content)
 
-    async def _send_text(self, recipient: str, text: str) -> None:
+    async def _send_text(self, recipient: str, text: str) -> int | None:
+        """Send a text message. Returns the message timestamp on success
+        (so callers like the thinking-nudge can later remote-delete it),
+        or None on failure or empty input.
+
+        Existing callers that ignored the return value still work — the
+        timestamp surface is purely additive."""
         if not text:
-            return
+            return None
         payload = {
             "number": self.phone_number,
             "recipients": [recipient],
@@ -956,8 +1020,41 @@ class SignalChannel(Channel):
                 if r.status >= 400:
                     body = await r.text()
                     log.warning(f"Signal send {r.status}: {body}")
+                    return None
+                # /v2/send returns {"timestamp": <int|str>} on success.
+                # Robust parse: accept either shape.
+                try:
+                    data = await r.json()
+                    ts = data.get("timestamp")
+                    return int(ts) if ts is not None else None
+                except Exception:
+                    return None
         except Exception as e:
             log.warning(f"Signal send failed: {e}")
+        return None
+
+    async def _remote_delete(self, recipient: str, timestamp: int) -> bool:
+        """Remote-delete a previously sent message.
+
+        signal-cli-rest-api endpoint: `DELETE /v1/remote-delete/{bot_number}`
+        with `{"recipient": "...", "timestamp": <int>}`. Recipient clients
+        that support remote-delete (modern Signal apps do) drop the message
+        from view; older clients see a tombstone. Best-effort — failure
+        just leaves the original message visible, which is no worse than
+        the pre-delete behavior.
+        """
+        url = f"{self.rest_url}/v1/remote-delete/{quote(self.phone_number)}"
+        payload = {"recipient": recipient, "timestamp": timestamp}
+        try:
+            async with self._session.delete(url, json=payload) as r:
+                if r.status >= 400:
+                    body = await r.text()
+                    log.debug(f"Signal remote-delete {r.status}: {body[:200]}")
+                    return False
+                return True
+        except Exception as e:
+            log.debug(f"Signal remote-delete failed: {e}")
+            return False
 
     async def _send_attachment(
         self, recipient: str, filename: str, content: str | bytes
