@@ -719,6 +719,38 @@ class SignalChannel(Channel):
                             )
                             if not queued.is_typing:
                                 self._arm_debounce(queued)
+                    else:
+                        # Cancelled path (addendum-merge). The buffer is
+                        # still alive and was augmented by _buffer_input,
+                        # which armed a fresh debounce timer at cancel
+                        # time. But cancellation cleanup can take longer
+                        # than the debounce window — if the timer fires
+                        # while we're still here, _flush_pending sees
+                        # `_processing[source]` populated (us) and skips
+                        # with "pipeline already running", stranding the
+                        # buffer with no timer left.
+                        #
+                        # Re-arm now that we're actually done. Idempotent:
+                        # if the original debounce hasn't fired yet, we
+                        # cancel and replace it (same effect, ~0s shift
+                        # in fire time). If it already fired and skipped,
+                        # this restores the timer that would have flushed.
+                        # Also re-arm maxhold — the original was consumed
+                        # by the first flush and we want the safety net
+                        # back for the second turn.
+                        surviving = self._pending.get(source)
+                        if surviving is not None:
+                            if (surviving.debounce_task
+                                    and not surviving.debounce_task.done()):
+                                surviving.debounce_task.cancel()
+                            surviving.debounce_task = None
+                            if (surviving.maxhold_task is None
+                                    or surviving.maxhold_task.done()):
+                                surviving.maxhold_task = asyncio.create_task(
+                                    self._maxhold(source, surviving.started_at)
+                                )
+                            if not surviving.is_typing:
+                                self._arm_debounce(surviving)
 
     async def _process_and_respond(
         self,

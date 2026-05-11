@@ -250,6 +250,67 @@ class TestStreamingInterrupt:
         # _safe_process's finally block should have removed the slot.
         assert "+2" not in fast_channel._processing
 
+    @pytest.mark.asyncio
+    async def test_slow_cancellation_does_not_strand_addendum_buffer(
+        self, fast_channel,
+    ):
+        """Regression: if the cancelled pipeline takes longer to finish
+        its CancelledError cleanup than DEBOUNCE_SECONDS, the new
+        debounce timer fires while `_processing[source]` is still
+        populated, _flush_pending skips with 'pipeline already running',
+        and (before the fix) nothing re-arms — the addendum sits in the
+        buffer forever.
+
+        Observed in prod: 'Addendum cancelling ...' followed by
+        'Pipeline cancelled' 6s later, then silence. The bot never
+        responded to the merged turn.
+
+        Fix: _safe_process's finally re-arms the debounce timer when
+        the buffer is still alive after a cancelled cleanup."""
+        cleanup_delay = 0.20  # > DEBOUNCE_SECONDS = 0.05
+
+        async def _slow_cancel_process(text, source, images=None, reply_as_voice=False):
+            fast_channel.invocations.append((source, text))
+            try:
+                await asyncio.sleep(0.5)
+            except asyncio.CancelledError:
+                fast_channel.cancelled_count += 1
+                # Simulate cleanup work that outlasts the debounce
+                # window — this is what real cancellation does when
+                # finally blocks have to await things.
+                try:
+                    await asyncio.sleep(cleanup_delay)
+                except asyncio.CancelledError:
+                    pass
+                raise
+
+        fast_channel._process_and_respond = _slow_cancel_process
+
+        # Turn 1 begins
+        await fast_channel._handle_incoming(_msg_event("first"))
+        await asyncio.sleep(0.10)  # debounce fires, pipeline starts
+        assert "+2" in fast_channel._processing
+
+        # Addendum arrives mid-turn (within addendum window)
+        await fast_channel._handle_incoming(_msg_event("addendum", ts=2))
+
+        # Wait long enough for: cancel to fire, debounce to fire and
+        # skip, cleanup to finish, re-arm to fire, new pipeline to run.
+        # 0.05 (debounce) + 0.20 (cleanup) + 0.05 (re-armed debounce)
+        # + a margin.
+        await asyncio.sleep(0.60)
+
+        # The addendum input must have been processed by a NEW
+        # pipeline run that picked up the merged buffer.
+        merged_runs = [
+            text for _, text in fast_channel.invocations
+            if "addendum" in text
+        ]
+        assert len(merged_runs) >= 1, (
+            "Addendum was stranded — fix in _safe_process's cancellation "
+            "cleanup path didn't re-arm the debounce timer."
+        )
+
 
 # --- Quote / swipe-to-reply context ---
 
