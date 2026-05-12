@@ -110,12 +110,28 @@ class LLMClient:
             # permission patterns (e.g. `Bash(curl *)`) gate actual
             # calls — same model Claude Code uses, no permission
             # config duplicated in env vars.
+            #
+            # `permission_mode="bypassPermissions"` is the bot-mode
+            # answer to a UX problem: the SDK's default permission
+            # flow asks for interactive approval when a tool call
+            # doesn't match an allowlist pattern. There is no
+            # interactive moment over Signal / Telegram — the bot
+            # would hang on the prompt, and (worse) the LLM
+            # rationalizes weird workarounds like "stage the file
+            # somewhere unprotected, then move it when you're at a
+            # desk." By bypassing, the bot just runs the tool call
+            # if it's in `allowed_tools`. The user opted into this
+            # risk explicitly by setting BOT_BUILTIN_TOOLS; the
+            # SIGNAL_ALLOWED_SENDERS allowlist is the actual guard
+            # against prompt-injection from outsiders.
             if self.builtin_tools:
                 allowed.extend(self.builtin_tools)
                 opts["setting_sources"] = ["user", "project", "local"]
+                opts["permission_mode"] = "bypassPermissions"
                 log.info(
                     "Built-in tools enabled: %s "
-                    "(permissions gated by settings.local.json)",
+                    "(permission_mode=bypassPermissions; "
+                    "settings.local.json loaded for reference)",
                     ", ".join(self.builtin_tools),
                 )
             opts["allowed_tools"] = allowed

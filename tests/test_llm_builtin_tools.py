@@ -52,7 +52,8 @@ def _captured_options(**llm_kwargs):
 
 class TestBuiltinTools:
     def test_default_no_builtins_no_setting_sources(self):
-        """Stock install: empty builtin_tools, no setting_sources passed."""
+        """Stock install: empty builtin_tools, no setting_sources passed,
+        no permission_mode override (SDK default)."""
         opts = _captured_options(model="sonnet", auth_mode="max")
         assert opts.get("allowed_tools") == []
         # setting_sources is intentionally absent — defaults to None,
@@ -60,6 +61,10 @@ class TestBuiltinTools:
         # silently pull the user's settings.local.json without their
         # explicit opt-in via builtin_tools.
         assert "setting_sources" not in opts
+        # permission_mode also unset — SDK uses its default (interactive
+        # approval for tools not on the allowlist). Fine when there are
+        # no tools to approve anyway.
+        assert "permission_mode" not in opts
 
     def test_builtins_listed_in_allowed_tools(self):
         opts = _captured_options(
@@ -69,15 +74,28 @@ class TestBuiltinTools:
         assert opts["allowed_tools"] == ["WebFetch", "WebSearch"]
 
     def test_builtins_enable_settings_sourcing(self):
-        """The whole point: when builtins are enabled, the SDK is told
-        to read settings.local.json so the user's permission patterns
-        gate actual calls. Without this the bot would have unrestricted
-        Bash access regardless of what the user has in their settings."""
+        """When builtins are enabled, the SDK is told to read
+        settings.local.json so the user's permission patterns are
+        loaded (informational; the actual gating shifts to
+        permission_mode below)."""
         opts = _captured_options(
             model="sonnet", auth_mode="max",
             builtin_tools=["Bash"],
         )
         assert opts["setting_sources"] == ["user", "project", "local"]
+
+    def test_builtins_bypass_interactive_permission_prompts(self):
+        """Critical for messaging-channel UX: the bot has no terminal
+        to display a permission prompt. Without bypass, the SDK hangs
+        on any tool call not pre-approved by the allowlist patterns,
+        and the LLM rationalizes confused workarounds. Lock the bypass
+        so a future "tighten this" refactor doesn't quietly break the
+        bot for everyone using BOT_BUILTIN_TOOLS."""
+        opts = _captured_options(
+            model="sonnet", auth_mode="max",
+            builtin_tools=["Write", "Edit", "Bash"],
+        )
+        assert opts["permission_mode"] == "bypassPermissions"
 
     def test_mcp_and_builtins_compose(self):
         """When both an MCP tool bundle (Instacart) and builtins are

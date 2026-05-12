@@ -437,20 +437,15 @@ BOT_BUILTIN_TOOLS=Read,WebFetch,WebSearch                     # + read files
 BOT_BUILTIN_TOOLS=Read,Write,Edit,Bash,WebFetch,WebSearch     # full Claude Code surface
 ```
 
-When non-empty, two things happen:
+When non-empty, three things happen:
 
 1. The named tools are added to the SDK's `allowed_tools` so the model knows they exist.
-2. The SDK is told to load `setting_sources=["user", "project", "local"]` — meaning your existing `~/.claude/settings.json` and `.claude/settings.local.json` permission patterns gate every actual call. Same source of truth Claude Code uses, so you don't duplicate permission rules in `.env`.
+2. The SDK loads `setting_sources=["user", "project", "local"]` — your `~/.claude/settings.json` and `.claude/settings.local.json` are read for reference, but see #3.
+3. **`permission_mode="bypassPermissions"` is set.** Tool calls run without interactive approval prompts. This is non-negotiable for the bot path: messaging channels (Signal, Telegram) have no UI to display a "do you allow this?" dialog, and the SDK's default flow hangs forever waiting for an answer that can't arrive. (Or worse: the LLM rationalizes confused workarounds like "I'll stage the file somewhere unprotected, then you can move it when you're at a desk." Actual production output, before this fix.)
 
-So if your `.claude/settings.local.json` has:
+The real gate is the `BOT_BUILTIN_TOOLS` env var itself: the bot can only call tools you explicitly named. Your `settings.local.json` allowlist no longer enforces *individual call* gating in bot mode (it would just deadlock the bot) — it's purely documentation of what tools you've thought through.
 
-```json
-{ "permissions": { "allow": ["Bash(curl *)", "WebFetch(*)", "Edit(*)"] } }
-```
-
-…those patterns govern what the bot can actually do. `Bash(rm *)` would be denied; `Bash(curl *)` would go through.
-
-**Risk worth naming.** Enabling `Bash`, `Write`, or `Edit` means a clever message *could* convince the model to do something destructive. Your `SIGNAL_ALLOWED_SENDERS` allowlist is the main guard against that — only people on the list can send messages — but the moment the bot has shell access, every turn is a turn where prompt injection from your own messages could fire a destructive command. Permissive entries like `Bash(python3 *)` are effectively unrestricted; audit your `settings.local.json` allowlist before flipping this on.
+**Risk worth naming.** Enabling `Bash`, `Write`, or `Edit` means a clever message *could* convince the model to do something destructive — and in bot mode there is no per-call human approval as a backstop. The `SIGNAL_ALLOWED_SENDERS` allowlist is the actual guard: only senders on that list can talk to the bot, so prompt injection has to come from your own messages. That's the threat model you're accepting when you set `BOT_BUILTIN_TOOLS=...,Bash,...`. Audit each tool name in your env var, not just the settings.local.json patterns.
 
 ### Model selection
 
