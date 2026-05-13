@@ -12,6 +12,7 @@ from pathlib import Path
 
 from src.channels.base import Channel
 from src.pipeline.orchestrator import Orchestrator
+from src.pipeline.why import handle_why_command
 from src.projects.bible import handle_bible_command
 from src.projects.chat import handle_project_command
 from src.skills.chat import handle_skill_command
@@ -62,11 +63,12 @@ class REPLChannel(Channel):
                     self._print_metadata(self._last_metadata)
                     continue
 
-                # Skill / project / bible commands short-circuit the pipeline.
+                # Skill / project / bible / why commands short-circuit the pipeline.
                 for handler in (
                     handle_skill_command,
                     handle_project_command,
                     handle_bible_command,
+                    handle_why_command,
                 ):
                     reply = await handler(line, self.orchestrator)
                     if reply is not None:

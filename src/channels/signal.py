@@ -27,6 +27,7 @@ from src.channels._http import make_session
 from src.channels.signal_format import markdown_to_signal_text
 from src.channels.tts import TTSError, synthesize as tts_synthesize
 from src.pipeline.orchestrator import Orchestrator
+from src.pipeline.why import handle_why_command
 from src.projects.bible import handle_bible_command
 from src.projects.chat import handle_project_command
 from src.skills.chat import handle_skill_command
@@ -297,6 +298,7 @@ class SignalChannel(Channel):
                 handle_skill_command,
                 handle_project_command,
                 handle_bible_command,
+                handle_why_command,
             ):
                 reply = await handler(text, self.orchestrator)
                 if reply is not None:

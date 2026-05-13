@@ -31,7 +31,7 @@ from src.health.retrieval.query_rewrite import rewrite_query as health_rewrite_q
 from src.health.router import DECLINE_PHI_MESSAGE, route as health_route
 from src.projects import Project, ProjectLoader, ProjectNotFound
 from src.session.engine import SessionEngine
-from src.session.models import PipelineMetadata, Turn
+from src.session.models import PipelineMetadata, SearchResult, Turn
 from src.skills import Skill, SkillLoader, SkillNotFound
 from src.tools import build_tools
 
@@ -70,6 +70,15 @@ class Orchestrator:
         # diverged from what we've actually committed. The next process()
         # call rebuilds a clean LLM session before doing any LLM work.
         self._needs_llm_reset: bool = False
+
+        # The most recent SearchResult — populated by process() after
+        # search runs, consumed by `/why` so the user can see what
+        # retrieval fed the last answer. Single-slot intentionally:
+        # personal bot, one operator, "last across any channel" is
+        # the right granularity for the use case. None when the last
+        # turn skipped search (social / meta classification) or no
+        # turn has run yet.
+        self._last_search_result: SearchResult | None = None
 
     async def start(self, channel: str = "repl") -> None:
         """Initialize all components and connect."""
@@ -385,6 +394,12 @@ class Orchestrator:
             message, triage_result, self.searcher,
             active_project=active_project_name,
         )
+        # Cache for /why — overwritten on every turn that runs search.
+        # Turns that skip search (triage `needs_memory=false`) leave
+        # the cache pointing at whatever the previous searched turn
+        # surfaced, which matches what the user expects from "what fed
+        # the LAST substantive answer."
+        self._last_search_result = search_result
 
         # --- Stage 3: Assembly ---
         bible_path = self._active_bible_path()

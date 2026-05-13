@@ -65,6 +65,7 @@ class TelegramChannel(Channel):
         self.app.add_handler(CommandHandler("project", self._cmd_project))
         self.app.add_handler(CommandHandler("projects", self._cmd_projects))
         self.app.add_handler(CommandHandler("bible", self._cmd_bible))
+        self.app.add_handler(CommandHandler("why", self._cmd_why))
 
         # Document handler (files sent as attachments)
         self.app.add_handler(MessageHandler(filters.Document.ALL, self._on_document))
@@ -489,6 +490,20 @@ class TelegramChannel(Channel):
         reply = await handle_bible_command(text, self.orchestrator)
         if reply:
             await update.message.reply_text(reply)
+
+    async def _cmd_why(self, update: Update, context) -> None:
+        """Surface the last turn's retrieval. `/why scores` adds scores."""
+        from src.pipeline.why import handle_why_command
+        arg = " ".join(context.args) if context.args else ""
+        text = f"/why {arg}".rstrip()
+        reply = await handle_why_command(text, self.orchestrator)
+        if reply:
+            # Code block so the formatted lines render cleanly on
+            # mobile rather than getting wrapped / restyled.
+            await update.message.reply_text(
+                f"```\n{reply}\n```",
+                parse_mode="MarkdownV2" if False else None,
+            )
 
 
 _TAG_RE = re.compile(r"<[^>]+>")
