@@ -105,11 +105,7 @@ class LLMClient:
                 opts["mcp_servers"] = bundle.mcp_servers
                 allowed.extend(bundle.allowed_tools)
             # Built-in Agent SDK tools (Bash, Read, Write, Edit,
-            # WebFetch, WebSearch, etc.). When any are listed we also
-            # enable settings.local.json sourcing so the user's
-            # permission patterns (e.g. `Bash(curl *)`) gate actual
-            # calls — same model Claude Code uses, no permission
-            # config duplicated in env vars.
+            # WebFetch, WebSearch, etc.) the model can call mid-turn.
             #
             # `permission_mode="bypassPermissions"` is the bot-mode
             # answer to a UX problem: the SDK's default permission
@@ -124,14 +120,24 @@ class LLMClient:
             # risk explicitly by setting BOT_BUILTIN_TOOLS; the
             # SIGNAL_ALLOWED_SENDERS allowlist is the actual guard
             # against prompt-injection from outsiders.
+            #
+            # `setting_sources=[]` explicitly turns off the SDK's
+            # invisible inheritance from `~/.claude/` and any
+            # project-local `.claude/`. We previously loaded
+            # `["user","project","local"]` to inherit permission
+            # patterns, but since bypassPermissions skips those
+            # patterns anyway, the only effect of loading was a
+            # silent context leak: model preferences, hooks, and
+            # sub-agents in those settings would quietly affect
+            # the bot. Zero is the honest default.
             if self.builtin_tools:
                 allowed.extend(self.builtin_tools)
-                opts["setting_sources"] = ["user", "project", "local"]
+                opts["setting_sources"] = []
                 opts["permission_mode"] = "bypassPermissions"
                 log.info(
                     "Built-in tools enabled: %s "
                     "(permission_mode=bypassPermissions; "
-                    "settings.local.json loaded for reference)",
+                    "setting_sources=[] — no .claude/ inheritance)",
                     ", ".join(self.builtin_tools),
                 )
             opts["allowed_tools"] = allowed

@@ -76,6 +76,13 @@ class Orchestrator:
         self._channel = channel
         self.config.ensure_dirs()
 
+        # Surface workspace identity at boot so cwd/WORKSPACE_DIR drift
+        # is visible loudly rather than two turns into a Signal
+        # conversation. The check also catches first-run installs that
+        # forgot to set up IDENTITY.md (the bot is broken without it —
+        # the system prompt has no voice / persona to anchor replies).
+        _verify_workspace(self.config)
+
         # Memory store (markdown workspace)
         self.memory_store = MemoryStore(self.config.workspace_dir)
         self.memory_store.ensure_dirs()
@@ -1043,6 +1050,51 @@ class Orchestrator:
         if getattr(self, "health_audit", None) is not None:
             self.health_audit.close()
         log.info("Orchestrator stopped")
+
+
+def _verify_workspace(config) -> None:
+    """Boot-time invariant check on the workspace.
+
+    Logs the resolved workspace path + the process cwd so any drift
+    between WORKSPACE_DIR and the bot's actual disk location is
+    obvious in the startup banner (rather than surfacing as a confused
+    "file not found" mid-conversation).
+
+    `IDENTITY.md` is required — without it the system prompt has no
+    voice/persona to anchor replies, and the bot defaults to a generic
+    AI assistant tone that surprises users on a fresh install.
+    `MEMORY.md` is recommended but not strictly required; we warn but
+    don't crash on its absence so a clean install isn't blocked by it.
+    """
+    import os as _os
+    workspace = config.workspace_dir.resolve()
+    cwd = Path(_os.getcwd()).resolve()
+    log.info(f"[startup] workspace = {workspace}")
+    log.info(f"[startup] cwd       = {cwd}")
+    if workspace != cwd and cwd not in workspace.parents:
+        log.info(
+            "[startup] note: bot launched from a different directory than "
+            "WORKSPACE_DIR — relative file writes from the LLM will resolve "
+            "under workspace/, not cwd."
+        )
+
+    identity = config.identity_path
+    if not identity.is_file():
+        # Fatal — IDENTITY.md is the system prompt's spine.
+        raise RuntimeError(
+            f"Required workspace file missing: {identity}\n"
+            f"Create it with a short voice/persona description before "
+            f"starting the bot — see README §Customization → Identity."
+        )
+
+    memory = config.memory_path
+    if not memory.is_file():
+        log.warning(
+            f"[startup] {memory.name} not present at {memory.parent} — "
+            "bot will run, but won't have any long-term facts to anchor on. "
+            "Create it with `touch %s` or write a few starter facts.",
+            memory,
+        )
 
 
 def _summarize_sources_returned(evidence: list) -> list[dict]:

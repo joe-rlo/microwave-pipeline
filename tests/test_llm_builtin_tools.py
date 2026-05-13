@@ -73,16 +73,20 @@ class TestBuiltinTools:
         )
         assert opts["allowed_tools"] == ["WebFetch", "WebSearch"]
 
-    def test_builtins_enable_settings_sourcing(self):
-        """When builtins are enabled, the SDK is told to read
-        settings.local.json so the user's permission patterns are
-        loaded (informational; the actual gating shifts to
-        permission_mode below)."""
+    def test_builtins_disable_settings_inheritance(self):
+        """`setting_sources=[]` shuts off the SDK's invisible inheritance
+        from `~/.claude/` and project-local `.claude/`. Previously we
+        loaded those for the permission patterns, but bypassPermissions
+        skips the patterns anyway — leaving them loaded was just a
+        silent context leak (model prefs, hooks, sub-agents could
+        quietly affect the bot). Pin the lockdown explicitly so a
+        future "tighten settings" refactor can't accidentally
+        re-enable inheritance."""
         opts = _captured_options(
             model="sonnet", auth_mode="max",
             builtin_tools=["Bash"],
         )
-        assert opts["setting_sources"] == ["user", "project", "local"]
+        assert opts["setting_sources"] == []
 
     def test_builtins_bypass_interactive_permission_prompts(self):
         """Critical for messaging-channel UX: the bot has no terminal
@@ -116,8 +120,8 @@ class TestBuiltinTools:
         assert "WebFetch" in opts["allowed_tools"]
         # MCP bundle still drives mcp_servers
         assert "microwave" in opts["mcp_servers"]
-        # Settings are sourced because builtins are present
-        assert opts["setting_sources"] == ["user", "project", "local"]
+        # No silent .claude/ inheritance even though builtins are on
+        assert opts["setting_sources"] == []
 
     def test_mcp_only_no_settings_source(self):
         """Pure MCP-only path (Instacart but no built-ins): we don't
