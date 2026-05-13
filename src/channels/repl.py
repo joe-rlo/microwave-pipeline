@@ -128,7 +128,12 @@ class REPLChannel(Channel):
         if meta.search:
             print(f"  search: {len(meta.search.fragments)} fragments, {meta.search.search_time_ms}ms")
         if meta.reflection:
-            print(f"  reflection: confidence={meta.reflection.confidence:.2f}, action={meta.reflection.action}")
+            print(
+                f"  reflection ({meta.reflection.path}): "
+                f"confidence={meta.reflection.confidence:.2f}, "
+                f"action={meta.reflection.action}, "
+                f"hedging={meta.reflection.hedging_detected}"
+            )
             if meta.reflection.memory_gap:
                 print(f"  memory_gap: {meta.reflection.memory_gap}")
         print(f"  total: {meta.total_time_ms}ms")

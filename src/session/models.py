@@ -72,6 +72,13 @@ class ReflectionResult:
     hedging_detected: bool = False
     action: str = "deliver"  # "deliver", "re-search", "clarify"
     memory_gap: str | None = None
+    # Which reflection lane produced this result — used by /debug and
+    # the audit log to see at a glance whether the model-call path
+    # fired or the regex shortcut did.
+    #   "skipped" — simple-tier turns; regex hedge-check only, no model call
+    #   "normal"  — moderate-tier; standard reflection prompt
+    #   "deep"    — complex-tier; adds unsupported-claim check
+    path: str = "normal"
 
 
 @dataclass

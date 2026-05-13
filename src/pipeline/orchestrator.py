@@ -18,7 +18,7 @@ from src.memory.index import MemoryIndex
 from src.memory.search import MemorySearcher
 from src.memory.store import MemoryStore
 from src.pipeline.assembly import assemble, promote_fragments
-from src.pipeline.reflection import reflect
+from src.pipeline.reflection import reflect, simple_hedge_check
 from src.pipeline.search import search
 from src.pipeline.triage import triage
 from src.health.audit import HealthAuditRow, HealthAuditWriter
@@ -473,15 +473,31 @@ class Orchestrator:
                 await self.llm.de_escalate()
 
         # --- Stage 4: Reflection ---
-        reflection_result = await reflect(
-            full_response,
-            context=assembly_result.memory_context,
-            model=self.config.model_reflection,
-            auth_mode=self.config.auth_mode,
-            api_key=self.config.anthropic_api_key,
-            cli_path=self.config.cli_path,
-            workspace_dir=str(self.config.workspace_dir),
-        )
+        # Route by triage complexity to avoid burning a Haiku round-trip
+        # on every turn:
+        #   simple   → regex-only hedge check (no model call)
+        #   moderate → normal reflection prompt
+        #   complex  → deep variant (adds unsupported-claim check)
+        #
+        # `reflection_result.path` carries the lane info downstream
+        # so /debug and the audit log can show which fired.
+        if triage_result.complexity == "simple":
+            reflection_result = simple_hedge_check(full_response)
+            log.info(
+                f"Reflection (skipped): hedging={reflection_result.hedging_detected}"
+            )
+        else:
+            variant = "deep" if triage_result.complexity == "complex" else "normal"
+            reflection_result = await reflect(
+                full_response,
+                context=assembly_result.memory_context,
+                model=self.config.model_reflection,
+                auth_mode=self.config.auth_mode,
+                api_key=self.config.anthropic_api_key,
+                cli_path=self.config.cli_path,
+                workspace_dir=str(self.config.workspace_dir),
+                variant=variant,
+            )
 
         # Handle re-search (one retry max)
         if reflection_result.action == "re-search" and reflection_result.memory_gap:
@@ -579,6 +595,7 @@ class Orchestrator:
                 "reflection_confidence": reflection_result.confidence,
                 "reflection_action": reflection_result.action,
                 "reflection_hedging_detected": reflection_result.hedging_detected,
+                "reflection_path": reflection_result.path,
                 "escalated": escalated,
             },
         )
