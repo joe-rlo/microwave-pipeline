@@ -8,7 +8,7 @@ from datetime import datetime
 
 @dataclass
 class TriageResult:
-    intent: str  # "recall", "preference", "task", "question", "social"
+    intent: str  # "recall", "preference", "task", "question", "social", "meta"
     complexity: str  # "simple", "moderate", "complex"
     search_params: dict = field(default_factory=dict)
     needs_memory: bool = True

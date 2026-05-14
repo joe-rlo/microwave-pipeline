@@ -20,7 +20,7 @@ Given a user message and recent conversation context, classify the intent and ou
 Respond with ONLY valid JSON, no other text:
 
 {
-  "intent": "recall" | "preference" | "task" | "question" | "social",
+  "intent": "recall" | "preference" | "task" | "question" | "social" | "meta",
   "complexity": "simple" | "moderate" | "complex",
   "needs_memory": true | false,
   "search_params": {
@@ -38,6 +38,13 @@ Intent definitions:
 - "task": user wants help doing something (writing, coding, planning)
 - "question": user is asking a factual or analytical question
 - "social": greeting, small talk, emotional exchange
+- "meta": the user is asking about the assistant itself, the
+  conversation, or the system — NOT about their world. Examples:
+  "are you there", "what can you do", "what model are you", "are
+  you working", "did the last message go through", "why are you
+  slow today". Distinct from "recall" (which is about prior
+  conversational *content*, e.g. "what did we discuss about NEAR")
+  and from "question" (which is about facts in the world).
 
 Complexity definitions:
 - "simple": greetings, yes/no questions, quick factual lookups, one-line answers
@@ -51,7 +58,10 @@ Search parameter guidelines:
 - preference: long decay (90-180 days), low recency (0.1-0.3), more results (7)
 - task: moderate decay (30 days), moderate recency (0.5), fewer results (3)
 - question: moderate decay (30 days), moderate recency (0.5), moderate results (5)
-- social: set needs_memory=false unless referencing something specific\
+- social: set needs_memory=false unless referencing something specific
+- meta: set needs_memory=false. Questions about the bot itself
+  shouldn't trigger memory search — answering "are you there?"
+  doesn't need the user's calendar or past notes\
 """
 
 _SKILLS_PROMPT_TEMPLATE = """\
@@ -204,7 +214,7 @@ def _default_triage() -> TriageResult:
 # the retry call stays cheap. Keep in sync with the JSON shape in
 # TRIAGE_PROMPT_BASE; if you add a field to the prompt, mirror it here.
 _TRIAGE_SCHEMA_HINT = (
-    '{"intent": "recall|preference|task|question|social", '
+    '{"intent": "recall|preference|task|question|social|meta", '
     '"complexity": "simple|moderate|complex", '
     '"needs_memory": true|false, '
     '"search_params": {"decay_half_life": float, "result_count": int, '
@@ -215,7 +225,7 @@ _TRIAGE_SCHEMA_HINT = (
 # Schema hint with health fields appended — used for the retry prompt
 # when the health module is enabled. Same compactness rule applies.
 _TRIAGE_SCHEMA_HINT_HEALTH = (
-    '{"intent": "recall|preference|task|question|social", '
+    '{"intent": "recall|preference|task|question|social|meta", '
     '"complexity": "simple|moderate|complex", '
     '"needs_memory": true|false, '
     '"search_params": {"decay_half_life": float, "result_count": int, '

@@ -41,6 +41,65 @@ class TestTriageParsing:
         assert result.matched_skill is None
 
 
+class TestMetaIntent:
+    """1.2 — `meta` intent for bot-self / conversation-meta questions.
+    Extending `intent` (not adding a separate `register` axis) is the
+    chosen path; gating search via `needs_memory=false` is reused from
+    the social path.
+    """
+
+    def test_meta_in_prompt_enum(self):
+        """The triage prompt enumerates valid intent values — `meta`
+        must be listed so Haiku knows it's available."""
+        prompt = _build_prompt(skills=None)
+        # JSON schema line
+        assert '"meta"' in prompt
+        # Definition section
+        assert '- "meta"' in prompt
+
+    def test_meta_definition_distinguishes_from_recall_and_question(self):
+        """The risk on this classification is `meta` collapsing into
+        `recall` ("did we talk about X?") or `question` ("what's the
+        capital of France?"). The prompt must spell out the boundary."""
+        prompt = _build_prompt(skills=None)
+        meta_section = prompt[prompt.find('- "meta"'):]
+        # Must contrast with recall AND question, or the model will drift
+        assert "recall" in meta_section.lower()
+        assert "question" in meta_section.lower()
+
+    def test_meta_skips_search(self):
+        """Per the spec acceptance: meta-classified turns set
+        needs_memory=false so Stage 2 short-circuits."""
+        prompt = _build_prompt(skills=None)
+        # Search-params guideline must include the meta skip
+        guideline_section = prompt[prompt.find("Search parameter guidelines"):]
+        assert "meta" in guideline_section.lower()
+        assert "needs_memory=false" in guideline_section
+
+    def test_meta_parses_through(self):
+        """A response with intent=meta and needs_memory=false should
+        round-trip — no validation collapses it to a default."""
+        raw = (
+            '{"intent": "meta", "complexity": "simple", '
+            '"needs_memory": false, "search_params": {}}'
+        )
+        result = _parse_triage_response(raw)
+        assert result.intent == "meta"
+        assert result.needs_memory is False
+
+    def test_schema_hint_advertises_meta(self):
+        """The retry schema hint is what the model sees on the JSON
+        recovery turn — `meta` must be in the enum there too, otherwise
+        the retry path would silently push the model back toward the
+        old five values."""
+        from src.pipeline.triage import (
+            _TRIAGE_SCHEMA_HINT,
+            _TRIAGE_SCHEMA_HINT_HEALTH,
+        )
+        assert "meta" in _TRIAGE_SCHEMA_HINT
+        assert "meta" in _TRIAGE_SCHEMA_HINT_HEALTH
+
+
 class TestMatchedSkillParsing:
     def test_valid_skill_preserved(self):
         raw = (
