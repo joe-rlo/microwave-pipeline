@@ -49,6 +49,7 @@ def assemble(
     evidence: list | None = None,
     health_disclaimer: str = "",
     health_empty_retrieval_note: str = "",
+    session_recap: str = "",
 ) -> AssemblyResult:
     """Assemble stable and dynamic context for this turn.
 
@@ -71,6 +72,14 @@ def assemble(
     # Datetime goes here (not in stable prompt) so it doesn't trigger reconnects
     dynamic_parts = []
     dynamic_parts.append(f"[Current datetime: {datetime.now().isoformat(timespec='minutes')}]")
+
+    # Session recap on the first turn of a fresh session — cold-start
+    # continuity from cross-session summaries (pipeline 3.1). Force-
+    # included even when nothing in the user's message topic-matches,
+    # because the most useful framing for "what were we doing?" is the
+    # last few sessions regardless of keyword overlap.
+    if session_recap:
+        dynamic_parts.append(session_recap)
 
     # Tool catalog block — only present when at least one tool is wired
     # in. The Agent SDK already advertises each tool's name + schema to

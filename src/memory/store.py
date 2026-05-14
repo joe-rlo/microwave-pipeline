@@ -9,6 +9,36 @@ from pathlib import Path
 log = logging.getLogger(__name__)
 
 
+def _parse_session_summary(text: str, path: Path) -> dict:
+    """Lenient frontmatter parser for session summary files.
+
+    Not a real YAML parser — frontmatter is a flat string→string map by
+    convention, so a line-by-line split is enough and avoids pulling in
+    PyYAML for this one feature. If the file has no frontmatter, the
+    whole content becomes `body` and metadata fields stay empty.
+    """
+    meta: dict[str, str] = {}
+    body = text
+    if text.startswith("---\n"):
+        end = text.find("\n---\n", 4)
+        if end != -1:
+            header = text[4:end]
+            body = text[end + 5:].strip()
+            for line in header.splitlines():
+                if ":" in line:
+                    k, _, v = line.partition(":")
+                    meta[k.strip()] = v.strip()
+    return {
+        "path": path,
+        "started": meta.get("started", ""),
+        "ended": meta.get("ended", ""),
+        "topic": meta.get("topic", ""),
+        "project": meta.get("project", "") if meta.get("project") not in (None, "null", "") else None,
+        "turns": int(meta["turns"]) if meta.get("turns", "").isdigit() else 0,
+        "body": body,
+    }
+
+
 class MemoryStore:
     def __init__(self, workspace_dir: Path):
         self.workspace_dir = workspace_dir
@@ -20,10 +50,21 @@ class MemoryStore:
     def channels_dir(self) -> Path:
         return self.workspace_dir / "channels"
 
+    @property
+    def sessions_dir(self) -> Path:
+        """Cross-session summaries — one markdown file per closed session.
+
+        Lives under `daily_dir` so the indexer picks it up alongside daily
+        notes without needing a second corpus root. Filenames carry a
+        timestamp + topic slug so listing-by-name doubles as listing-by-time.
+        """
+        return self.daily_dir / "sessions"
+
     def ensure_dirs(self) -> None:
         self.workspace_dir.mkdir(parents=True, exist_ok=True)
         self.daily_dir.mkdir(parents=True, exist_ok=True)
         self.channels_dir.mkdir(parents=True, exist_ok=True)
+        self.sessions_dir.mkdir(parents=True, exist_ok=True)
 
     # --- Identity ---
 
@@ -79,6 +120,81 @@ class MemoryStore:
                 label = "Today" if i == 0 else "Yesterday" if i == 1 else day.isoformat()
                 parts.append(f"[Daily notes — {label} ({day.isoformat()})]\n{content}")
         return "\n\n".join(parts)
+
+    # --- Session summaries ---
+
+    def session_summary_path(
+        self,
+        started_at: datetime,
+        topic_slug: str,
+    ) -> Path:
+        """Build the canonical path for a session summary file.
+
+        Format: `<YYYY-MM-DD-HHMM>-<slug>.md`. Timestamp comes first so
+        `sorted(sessions_dir.iterdir())` yields chronological order
+        without parsing frontmatter.
+        """
+        stamp = started_at.strftime("%Y-%m-%d-%H%M")
+        return self.sessions_dir / f"{stamp}-{topic_slug}.md"
+
+    def save_session_summary(
+        self,
+        body: str,
+        started_at: datetime,
+        ended_at: datetime,
+        topic_slug: str,
+        project: str | None = None,
+        turn_count: int = 0,
+    ) -> Path:
+        """Write a session summary with YAML frontmatter; return its path.
+
+        Frontmatter fields are flat strings so a glance at the file
+        (without a YAML parser) is still readable. `project` is optional
+        — kept null when no project was active.
+        """
+        self.sessions_dir.mkdir(parents=True, exist_ok=True)
+        path = self.session_summary_path(started_at, topic_slug)
+        project_line = f'project: {project}\n' if project else 'project: null\n'
+        frontmatter = (
+            "---\n"
+            f"started: {started_at.isoformat(timespec='seconds')}\n"
+            f"ended: {ended_at.isoformat(timespec='seconds')}\n"
+            f"topic: {topic_slug}\n"
+            f"{project_line}"
+            f"turns: {turn_count}\n"
+            "---\n\n"
+        )
+        path.write_text(frontmatter + body.strip() + "\n", encoding="utf-8")
+        return path
+
+    def load_recent_session_summaries(self, n: int = 3) -> list[dict]:
+        """Return the N most recent session summaries, newest first.
+
+        Each entry: `{path, started, ended, topic, project, turns, body}`.
+        Frontmatter is parsed leniently — missing fields default to ""
+        rather than raising, so a hand-edited or malformed file doesn't
+        break session start.
+
+        Sorted by filename (which is `<timestamp>-<slug>.md`), which is
+        cheaper than reading frontmatter from every file just to sort.
+        Falls back to mtime if filenames don't conform.
+        """
+        if not self.sessions_dir.exists():
+            return []
+        files = sorted(
+            self.sessions_dir.glob("*.md"),
+            key=lambda p: p.name,
+            reverse=True,
+        )[:n]
+        entries: list[dict] = []
+        for path in files:
+            try:
+                text = path.read_text(encoding="utf-8")
+            except Exception as e:
+                log.warning(f"Could not read session summary {path.name}: {e}")
+                continue
+            entries.append(_parse_session_summary(text, path))
+        return entries
 
     # --- Channel-specific rules ---
 

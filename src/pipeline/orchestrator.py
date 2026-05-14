@@ -80,6 +80,16 @@ class Orchestrator:
         # turn has run yet.
         self._last_search_result: SearchResult | None = None
 
+        # Cross-session continuity (pipeline 3.1):
+        # `_session_started_at` records when the current session was
+        # opened so the close hook can write the summary's `started`
+        # frontmatter. `_first_turn_pending` is True until the first
+        # user turn lands; that turn force-includes recent session
+        # summaries in dynamic context so a fresh `/new` doesn't
+        # start cold.
+        self._session_started_at: datetime | None = None
+        self._first_turn_pending: bool = True
+
     async def start(self, channel: str = "repl") -> None:
         """Initialize all components and connect."""
         self._channel = channel
@@ -196,11 +206,20 @@ class Orchestrator:
             if turns:
                 await self._inject_history(turns)
                 log.info(f"Resumed session {self._session_id} ({len(turns)} prior turns)")
+                # Resumed mid-session: skip the cold-start summary injection,
+                # the SDK history already carries the relevant context.
+                self._first_turn_pending = False
             else:
                 log.info(f"Resumed session {self._session_id} (empty)")
         else:
             self._session_id = self.session_engine.new_session_id()
             log.info(f"New session {self._session_id}")
+
+        # Stamp the session start. On `/new` this gets re-stamped; on
+        # resume we still use boot time as "started" for the eventual
+        # summary, which is close enough — the prior session's actual
+        # `started` was lost across the previous shutdown.
+        self._session_started_at = datetime.now()
 
     async def process(
         self,
@@ -431,6 +450,15 @@ class Orchestrator:
                 "(model may answer briefly from training)"
             )
 
+        # Cold-start recap: on the first turn of a fresh session, force-
+        # include the most-recent N session summaries so the bot opens
+        # the conversation with context, even when the user's message
+        # has no keywords for retrieval to match against.
+        session_recap = ""
+        if self._first_turn_pending:
+            session_recap = self._build_session_recap()
+            self._first_turn_pending = False
+
         assembly_result = assemble(
             search_result,
             self.memory_store,
@@ -444,6 +472,7 @@ class Orchestrator:
             evidence=health_evidence or None,
             health_disclaimer=health_disclaimer_text,
             health_empty_retrieval_note=empty_retrieval_note,
+            session_recap=session_recap,
         )
 
         # Reconnect when (a) project changed since last turn, or (b) any
@@ -697,6 +726,13 @@ class Orchestrator:
             daily = self.memory_store.daily_path(today - timedelta(days=i))
             if daily.exists():
                 files_to_index.append(daily)
+
+        # Cross-session summaries (pipeline 3.1). Indexing the whole
+        # directory keeps the topic-match retrieval path automatic —
+        # "do you remember when we discussed pipeline reflection?"
+        # will surface the relevant summary via normal search.
+        if self.memory_store.sessions_dir.exists():
+            files_to_index.extend(self.memory_store.sessions_dir.glob("*.md"))
 
         total = 0
         for path in files_to_index:
@@ -1072,16 +1108,121 @@ class Orchestrator:
 
         Reconnects the LLM so prior conversation state is wiped from the SDK.
         History stays in SQLite — this just stops continuing from it.
+
+        Before resetting, runs the close hook on the outgoing session so
+        a summary lands in `workspace/memory/sessions/`. The summary is
+        what lets the next session retrieve "what we were just doing"
+        without replaying the full transcript.
         """
+        await self._close_session()
+
         self._session_id = self.session_engine.new_session_id()
         stable_prompt = self.memory_store.assemble_stable_context(channel=self._channel)
         await self.llm.reconnect(stable_prompt)
         self._stable_mtime = self.memory_store.stable_context_mtime(channel=self._channel)
+        # Fresh session: re-arm cold-start summary injection and re-stamp
+        # the start time. Next process() call surfaces recent sessions.
+        self._session_started_at = datetime.now()
+        self._first_turn_pending = True
         log.info(f"Fresh session started: {self._session_id}")
         return self._session_id
 
+    def _build_session_recap(self, n: int = 3) -> str:
+        """Format the most recent session summaries as a single block.
+
+        Returns "" when no summaries exist yet (fresh install) — caller
+        skips the block entirely so dynamic context stays clean.
+
+        Each summary is shown with its date and topic header so the
+        model knows it's reading prior-session context, not current-
+        conversation content. Bodies are not truncated — they're 200
+        words by design, so three of them is ~600 words / ~150 tokens
+        of cold-start grounding.
+        """
+        try:
+            entries = self.memory_store.load_recent_session_summaries(n=n)
+        except Exception as e:
+            log.debug(f"Could not load session summaries for recap: {e}")
+            return ""
+        if not entries:
+            return ""
+        parts = ["[Recent session summaries — for continuity, not current task]"]
+        for e in entries:
+            header = f"— {e.get('ended') or e.get('started') or ''} · {e.get('topic') or 'general'}"
+            parts.append(f"{header}\n{e['body'].strip()}")
+        return "\n\n".join(parts)
+
+    async def _close_session(self) -> None:
+        """Generate + persist a summary of the current session.
+
+        Safe to call when no session is active or when the session is
+        too short to summarize — `generate_session_summary` returns None
+        and we exit quietly. Failures don't propagate because the close
+        hook fires from `/new` and `stop()`; a Sonnet error must not
+        block a user's reset or a clean shutdown.
+        """
+        if not self._session_id or not self._session_started_at:
+            return
+        if not self.session_engine:
+            return
+
+        try:
+            turns = self.session_engine.get_turns(self._session_id)
+        except Exception as e:
+            log.warning(f"Close hook could not read turns: {e}")
+            return
+
+        from src.pipeline.session_summary import generate_session_summary
+
+        try:
+            summary = await generate_session_summary(
+                turns,
+                model=self.config.model_compaction,
+                auth_mode=self.config.auth_mode,
+                api_key=self.config.anthropic_api_key,
+                cli_path=self.config.cli_path,
+                workspace_dir=str(self.config.workspace_dir),
+            )
+        except Exception as e:
+            log.warning(f"Session summary generation raised: {e}")
+            return
+
+        if summary is None:
+            return
+
+        ended_at = datetime.now()
+        try:
+            path = self.memory_store.save_session_summary(
+                body=summary.body,
+                started_at=self._session_started_at,
+                ended_at=ended_at,
+                topic_slug=summary.topic_slug,
+                project=(self._active_project.name if self._active_project else None),
+                turn_count=summary.turn_count,
+            )
+        except Exception as e:
+            log.warning(f"Could not save session summary: {e}")
+            return
+
+        log.info(f"Session summary saved: {path.name} ({summary.turn_count} turns)")
+
+        # Index immediately so it's retrievable on the next session start
+        # without waiting for the next workspace-index sweep.
+        if self.memory_index and self.config.openai_api_key:
+            try:
+                await self.memory_index.index_file(path, force=True)
+            except Exception as e:
+                log.debug(f"Could not index fresh session summary: {e}")
+
     async def stop(self) -> None:
         """Shut down all components."""
+        # Close hook: summarize the live session before tearing down.
+        # Wrapped so a Sonnet hiccup at shutdown can't strand the LLM
+        # connection or DB handles open.
+        try:
+            await self._close_session()
+        except Exception as e:
+            log.warning(f"Close-session hook on stop() failed: {e}")
         if self.llm:
             await self.llm.disconnect()
         if self.memory_index:
