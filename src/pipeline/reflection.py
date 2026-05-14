@@ -106,6 +106,26 @@ _HEDGE_PATTERNS = re.compile(
 )
 
 
+def disabled_reflection(response: str) -> ReflectionResult:
+    """No-op reflection — used when a skill sets `pipeline.reflection: off`.
+
+    Returns a ReflectionResult that asserts deliver, confidence 1.0, no
+    hedging, with `path="off"` for /debug visibility. The point: some
+    skills (novel-writing being the canonical case) need the model's
+    output untouched because reflection's "you hedged, soften that"
+    feedback dilutes voice. Skipping the round-trip also reclaims the
+    Haiku latency on creative-mode turns.
+    """
+    return ReflectionResult(
+        response=response,
+        confidence=1.0,
+        hedging_detected=False,
+        action="deliver",
+        memory_gap=None,
+        path="off",
+    )
+
+
 def simple_hedge_check(response: str) -> ReflectionResult:
     """Regex-only stand-in for reflection on simple-tier turns.
 

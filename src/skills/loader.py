@@ -72,6 +72,24 @@ class SkillLoader:
                 f"using directory name for consistency"
             )
 
+        # Pipeline overrides (2.3). Frontmatter is permissive — accept a
+        # nested map, gracefully ignore other shapes. Values are kept as
+        # strings; the orchestrator/triage code that consumes them owns
+        # coercion (because "off" vs 0 vs False matters per-field).
+        raw_pipeline = meta.get("pipeline") or {}
+        if isinstance(raw_pipeline, dict):
+            pipeline_overrides = {
+                str(k).strip(): str(v).strip()
+                for k, v in raw_pipeline.items()
+                if str(k).strip()
+            }
+        else:
+            log.warning(
+                f"Skill {name!r}: `pipeline` frontmatter is not a nested map; "
+                f"ignoring (got {type(raw_pipeline).__name__})"
+            )
+            pipeline_overrides = {}
+
         skill_dir = path.parent
         return Skill(
             name=name,
@@ -80,6 +98,7 @@ class SkillLoader:
             triggers=as_list(meta.get("triggers")),
             directory=skill_dir,
             has_fetch=(skill_dir / "fetch.py").is_file(),
+            pipeline=pipeline_overrides,
         )
 
     # --- mutation (used by the `skills new` / `skills remove` CLI) ---

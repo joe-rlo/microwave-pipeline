@@ -16,6 +16,11 @@ class Skill:
     # True when a fetch.py exists alongside SKILL.md. Scheduler-only for v1
     # (interactive chat doesn't invoke fetch scripts — see the spec).
     has_fetch: bool = False
+    # Pipeline overrides from the optional `pipeline:` frontmatter block
+    # (pipeline 2.3). Keys are open-ended strings; orchestrator consults
+    # specific ones it knows about and ignores the rest, so a misspelled
+    # key is a silent no-op rather than a crash. Empty dict = no overrides.
+    pipeline: dict[str, str] = field(default_factory=dict)
 
     @property
     def fetch_path(self) -> Path | None:

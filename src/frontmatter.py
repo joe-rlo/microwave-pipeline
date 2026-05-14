@@ -5,11 +5,18 @@ small — supports just what those configs need:
 
 - `key: scalar` — string value (auto strips quotes)
 - `key:` followed by `  - item` lines — list of strings
+- `key:` followed by `  subkey: value` lines — one-level nested map
 - `key: >` / `key: |` — folded/literal multiline scalar
 
-Doesn't support nested maps, anchors, or any advanced YAML. We pulled
-in this hand-rolled parser instead of a YAML dep so MicrowaveOS doesn't
-gain a transitive PyYAML installation just for two metadata keys.
+Nested maps are limited to one level deep — that's enough for the
+skill `pipeline:` block (pipeline 2.3) without growing into a full
+YAML implementation. Deeper nesting silently flattens, which is fine
+because no current consumer needs it.
+
+Doesn't support anchors, multi-doc separators, or any advanced YAML.
+We pulled in this hand-rolled parser instead of a YAML dep so
+MicrowaveOS doesn't gain a transitive PyYAML installation just for a
+handful of metadata keys.
 """
 
 from __future__ import annotations
@@ -63,16 +70,56 @@ def _parse_frontmatter(raw: str) -> dict:
             out[key] = joined
             continue
 
-        # List — indented `- item` lines follow
+        # `key:` with no value — could be a list (`  - item`) or a
+        # one-level nested map (`  subkey: value`). Peek at the next
+        # non-blank line to decide; default to empty list when the
+        # block is empty (keeps the old behavior for skills that
+        # declare `triggers:` with nothing under it).
         if value == "":
-            items: list[str] = []
-            i += 1
-            while i < len(lines) and (lines[i].startswith("  -") or lines[i].startswith("- ")):
-                item = lines[i].lstrip()
-                if item.startswith("- "):
-                    items.append(item[2:].strip().strip('"').strip("'"))
+            # Find next non-blank line.
+            j = i + 1
+            while j < len(lines) and not lines[j].strip():
+                j += 1
+            peek = lines[j] if j < len(lines) else ""
+            if peek.lstrip().startswith("- "):
+                items: list[str] = []
                 i += 1
-            out[key] = items
+                while i < len(lines) and (lines[i].startswith("  -") or lines[i].startswith("- ")):
+                    item = lines[i].lstrip()
+                    if item.startswith("- "):
+                        items.append(item[2:].strip().strip('"').strip("'"))
+                    i += 1
+                out[key] = items
+                continue
+            # Nested map. Consume indented `subkey: value` lines.
+            # We deliberately accept only string-shaped values here —
+            # the pipeline block (the only current consumer) takes
+            # values like "off", "high", "4000" and parses them
+            # downstream. Keeping all sub-values as strings keeps the
+            # parser simple and the call sites explicit about coercion.
+            if peek.startswith(("  ", "\t")) and ":" in peek:
+                submap: dict[str, str] = {}
+                i += 1
+                while i < len(lines):
+                    sub = lines[i]
+                    if not sub.strip():
+                        i += 1
+                        continue
+                    if not (sub.startswith("  ") or sub.startswith("\t")):
+                        break
+                    if ":" not in sub:
+                        i += 1
+                        continue
+                    sk, _, sv = sub.strip().partition(":")
+                    submap[sk.strip()] = _strip_quotes(sv.strip())
+                    i += 1
+                out[key] = submap
+                continue
+            # Empty block — preserve the old empty-list default so
+            # callers that did `triggers:` with nothing under it
+            # don't suddenly start getting an empty dict.
+            out[key] = []
+            i += 1
             continue
 
         out[key] = _strip_quotes(value)

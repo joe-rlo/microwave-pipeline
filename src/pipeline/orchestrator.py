@@ -18,7 +18,7 @@ from src.memory.index import MemoryIndex
 from src.memory.search import MemorySearcher
 from src.memory.store import MemoryStore
 from src.pipeline.assembly import assemble, promote_fragments
-from src.pipeline.reflection import reflect, simple_hedge_check
+from src.pipeline.reflection import disabled_reflection, reflect, simple_hedge_check
 from src.pipeline.search import search
 from src.pipeline.triage import triage
 from src.health.audit import HealthAuditRow, HealthAuditWriter
@@ -532,15 +532,47 @@ class Orchestrator:
         #   moderate → normal reflection prompt
         #   complex  → deep variant (adds unsupported-claim check)
         #
+        # Pipeline 2.3: an active skill can override the lane via its
+        # `pipeline.reflection` frontmatter (off | light | normal | deep).
+        # The override wins over triage-derived routing — that's the
+        # whole point (e.g. `novel-writing` sets `off` so reflection's
+        # "you hedged" feedback doesn't dilute the model's voice).
+        #
         # `reflection_result.path` carries the lane info downstream
         # so /debug and the audit log can show which fired.
-        if triage_result.complexity == "simple":
+        reflection_override = (
+            turn_skill.pipeline.get("reflection") if turn_skill else None
+        )
+        # Validate the override here rather than at load time so a
+        # typo lands as a logged warning + safe fallback (skill ships
+        # without a calibrated reflection lane) instead of crashing
+        # the turn. Unknown values fall through to triage-derived
+        # routing — same effect as the override being absent.
+        if reflection_override and reflection_override not in (
+            "off", "light", "normal", "deep"
+        ):
+            log.warning(
+                f"Skill {turn_skill.name!r}: unknown pipeline.reflection "
+                f"value {reflection_override!r}; falling back to default routing"
+            )
+            reflection_override = None
+
+        if reflection_override == "off":
+            reflection_result = disabled_reflection(full_response)
+            log.info("Reflection (off): skill override")
+        elif reflection_override == "light" or (
+            reflection_override is None and triage_result.complexity == "simple"
+        ):
             reflection_result = simple_hedge_check(full_response)
             log.info(
-                f"Reflection (skipped): hedging={reflection_result.hedging_detected}"
+                f"Reflection ({'light override' if reflection_override else 'skipped'}): "
+                f"hedging={reflection_result.hedging_detected}"
             )
         else:
-            variant = "deep" if triage_result.complexity == "complex" else "normal"
+            if reflection_override in ("normal", "deep"):
+                variant = reflection_override
+            else:
+                variant = "deep" if triage_result.complexity == "complex" else "normal"
             reflection_result = await reflect(
                 full_response,
                 context=assembly_result.memory_context,
@@ -702,6 +734,7 @@ class Orchestrator:
                 escalated=escalated,
                 escalated_model=self.config.model_escalation if escalated else "",
                 total_time_ms=elapsed_ms,
+                skill_overrides=dict(turn_skill.pipeline) if turn_skill else {},
             ),
         }
 

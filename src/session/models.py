@@ -103,3 +103,9 @@ class PipelineMetadata:
     escalated_model: str = ""
     total_time_ms: int = 0
     cost_usd: float = 0.0
+    # Skill-driven pipeline overrides applied to this turn (2.3). Empty
+    # when no skill is active or the active skill omits a pipeline block.
+    # Stored on metadata so `/debug` and the audit log can show *which*
+    # overrides actually shaped the turn — important when a misconfigured
+    # skill silently flips behavior the user wasn't expecting.
+    skill_overrides: dict = field(default_factory=dict)
