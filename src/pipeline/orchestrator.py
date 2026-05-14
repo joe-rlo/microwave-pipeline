@@ -174,6 +174,15 @@ class Orchestrator:
         self._stable_mtime = self.memory_store.stable_context_mtime(
             channel=self._channel, bible_path=bible_path
         )
+        # Log stable-prompt size so cache-effectiveness changes from
+        # context-shape work (item 2.1 daily-notes-via-retrieval, 2.2
+        # MEMORY.md-via-retrieval) are visible in the startup banner.
+        # ~4 chars per token is the rough Anthropic guideline; cheap
+        # estimate without burning a tiktoken call here.
+        log.info(
+            f"[startup] stable prompt: {len(stable_prompt):,} chars "
+            f"(~{len(stable_prompt) // 4:,} tokens)"
+        )
         await self.llm.connect(stable_prompt)
 
         # Index workspace files into the memory fragment store

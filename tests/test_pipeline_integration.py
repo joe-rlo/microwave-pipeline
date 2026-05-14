@@ -45,6 +45,34 @@ class TestMemoryStore:
         assert "# Identity" in ctx
         assert "Important fact" in ctx
 
+    def test_stable_context_excludes_daily_notes(self, tmp_path):
+        """Per pipeline-improvements 2.1: daily notes are indexed and
+        retrieved per-turn, NOT concatenated into the stable prompt.
+        Pin this so a refactor can't quietly re-introduce the bloat."""
+        store = MemoryStore(tmp_path)
+        store.ensure_dirs()
+        store.save_identity("# Identity")
+        store.append_daily("Today I worked on the novel chapter 4")
+        ctx = store.assemble_stable_context()
+        assert "# Identity" in ctx
+        assert "novel chapter 4" not in ctx
+        assert "[Daily notes" not in ctx
+
+    def test_stable_mtime_ignores_daily_notes(self, tmp_path):
+        """Since daily notes no longer contribute to the stable prompt,
+        a daily-note write must NOT bump the mtime — otherwise we'd
+        trigger an unnecessary LLM reconnect on every daily-notes
+        update."""
+        import time as _time
+        store = MemoryStore(tmp_path)
+        store.ensure_dirs()
+        store.save_identity("# x")
+        mtime_before = store.stable_context_mtime()
+        _time.sleep(0.01)  # ensure mtime resolution distinguishes
+        store.append_daily("a new daily note")
+        mtime_after = store.stable_context_mtime()
+        assert mtime_before == mtime_after
+
 
 class TestSessionEngine:
     def test_add_and_get_turns(self, tmp_path):

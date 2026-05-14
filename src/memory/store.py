@@ -99,13 +99,21 @@ class MemoryStore:
         channel: str | None = None,
         bible_path=None,
     ) -> str:
-        """Build the stable system prompt from identity + memory + daily notes + channel rules.
+        """Build the stable system prompt from identity + channel rules + memory + bible.
 
         When `bible_path` is provided and points to an existing file, the
         active project's BIBLE.md is appended as a labeled section. That
         way per-project canon (characters, world, established facts) is
         in the system prompt for the whole session — the LLM never
         contradicts it without retrieval cost.
+
+        NOTE: Daily notes are NOT included here — they're indexed and
+        retrieved per-turn via the search pipeline instead. The old
+        blanket-concat approach (today + yesterday into every prompt)
+        bloated the stable prefix with content that's usually
+        irrelevant to the current turn, weakening prompt-cache hits.
+        Today's notes still surface when their content actually matches
+        the query.
 
         NOTE: Current datetime is NOT included here — it changes every turn
         and would cause unnecessary reconnects. It goes in dynamic context instead.
@@ -126,9 +134,10 @@ class MemoryStore:
         if memory:
             sections.append(f"[Long-term memory]\n{memory}")
 
-        daily = self.load_recent_daily()
-        if daily:
-            sections.append(daily)
+        # Daily notes intentionally NOT concatenated here — see
+        # docstring. They're indexed via _index_workspace and surface
+        # through the search pipeline per turn when relevant. Keeps
+        # the stable prefix smaller, prompt cache hits stronger.
 
         if bible_path is not None and bible_path.is_file():
             try:
@@ -147,11 +156,15 @@ class MemoryStore:
     ) -> float:
         """Return the latest mtime across files that make up stable context.
 
-        Used to detect real changes (write-back, day rollover) without
+        Used to detect real changes (write-back, project switch) without
         comparing prompt strings that include volatile data.
 
         Includes the active project's BIBLE.md when given — that's how
         `/bible add` updates propagate without an explicit reconnect call.
+
+        NOTE: Daily notes are NOT tracked here anymore — they no longer
+        contribute to the stable prompt (see `assemble_stable_context`),
+        so a daily-note write shouldn't trigger an LLM reconnect.
         """
         mtimes = []
         for path in [self.identity_path, self.memory_path]:
@@ -162,12 +175,6 @@ class MemoryStore:
             ch_path = self.channel_config_path(channel)
             if ch_path.exists():
                 mtimes.append(ch_path.stat().st_mtime)
-        # Check today's and yesterday's daily notes
-        today = date.today()
-        for i in range(2):
-            day_path = self.daily_path(today - timedelta(days=i))
-            if day_path.exists():
-                mtimes.append(day_path.stat().st_mtime)
         # Project bible
         if bible_path is not None and bible_path.is_file():
             mtimes.append(bible_path.stat().st_mtime)
