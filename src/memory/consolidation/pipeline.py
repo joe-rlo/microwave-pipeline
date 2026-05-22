@@ -155,13 +155,17 @@ def _load_recent_turns(conn: apsw.Connection, *, limit: int) -> list[dict]:
     The Extract stage filters by recency in its own logic (lookback
     window). Pulling 50 turns is cheap and gives the model enough
     context to extract from conversational turns.
+
+    Column note: the real `turns` schema uses `timestamp` (DATETIME),
+    not `created_at`. Earlier rev assumed `created_at` and silently
+    failed in production until smoke-test caught it.
     """
     try:
         rows = list(conn.execute(
             """
-            SELECT role, content, created_at
+            SELECT role, content, timestamp
             FROM turns
-            ORDER BY created_at DESC
+            ORDER BY timestamp DESC
             LIMIT ?
             """,
             (limit,),

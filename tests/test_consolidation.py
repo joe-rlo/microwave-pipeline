@@ -451,12 +451,15 @@ class TestPipeline:
         from src.memory.breadcrumbs import init_tables as init_bc
         init_bc(conn)
         # Seed a turn so Extract has input
+        # Mirror the real schema in src/session/engine.py — `timestamp`,
+        # not `created_at`. The original fake used the wrong column
+        # name and let a production bug slip through to smoke-test.
         conn.execute(
             "CREATE TABLE IF NOT EXISTS turns "
-            "(id INTEGER PRIMARY KEY, role TEXT, content TEXT, created_at TEXT)"
+            "(id INTEGER PRIMARY KEY, role TEXT, content TEXT, timestamp TEXT)"
         )
         conn.execute(
-            "INSERT INTO turns (role, content, created_at) VALUES (?, ?, ?)",
+            "INSERT INTO turns (role, content, timestamp) VALUES (?, ?, ?)",
             ("user", "let's use Bedrock for the BAA path", "2026-05-22"),
         )
 
@@ -513,9 +516,12 @@ class TestPipeline:
     async def test_skips_brief_when_no_path_given(self, conn, monkeypatch, tmp_path):
         from src.memory.breadcrumbs import init_tables as init_bc
         init_bc(conn)
+        # Mirror the real schema in src/session/engine.py — `timestamp`,
+        # not `created_at`. The original fake used the wrong column
+        # name and let a production bug slip through to smoke-test.
         conn.execute(
             "CREATE TABLE IF NOT EXISTS turns "
-            "(id INTEGER PRIMARY KEY, role TEXT, content TEXT, created_at TEXT)"
+            "(id INTEGER PRIMARY KEY, role TEXT, content TEXT, timestamp TEXT)"
         )
 
         def fake_get_stage_callable(stage, **kw):

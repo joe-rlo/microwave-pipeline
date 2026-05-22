@@ -133,7 +133,7 @@ class TestRunCatchupIfDue:
         # turns table for Extract's recent-turn read
         c.execute(
             "CREATE TABLE IF NOT EXISTS turns "
-            "(id INTEGER PRIMARY KEY, role TEXT, content TEXT, created_at TEXT)"
+            "(id INTEGER PRIMARY KEY, role TEXT, content TEXT, timestamp TEXT)"
         )
         return c
 
