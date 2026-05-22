@@ -161,18 +161,11 @@ class Orchestrator:
                 ", ".join(self.tool_bundle.allowed_tools),
             )
 
-        # LLM client — with sandboxed output directory for file creation
-        # and (optionally) the MCP tool bundle wired in.
-        self.llm = LLMClient(
-            model=self.config.model_main,
-            auth_mode=self.config.auth_mode,
-            api_key=self.config.anthropic_api_key,
-            cli_path=self.config.cli_path,
-            output_dir=str(self.config.output_dir),
-            workspace_dir=str(self.config.workspace_dir),
-            tool_bundle=self.tool_bundle,
-            builtin_tools=list(self.config.bot_builtin_tools),
-        )
+        # LLM client — factory picks LLMClient (legacy / Agent SDK) or
+        # LLMSession (Phase C provider path) based on LLM_STAGE_MAIN env.
+        # Both expose the same surface; orchestrator stays oblivious.
+        from src.llm.factory import build_main_llm
+        self.llm = build_main_llm(self.config)
 
         # Assemble stable context and connect. Active project's BIBLE.md
         # (if set) joins the stable prompt — but at start() there's no
