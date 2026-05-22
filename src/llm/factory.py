@@ -80,6 +80,53 @@ def _build_legacy_client(config: Any):
     )
 
 
+def build_private_tee_llm(config: Any, *, complexity: str = "moderate"):
+    """Construct the Private-TEE LLM for the general_private_tee route.
+
+    Returns an `LLMSession` backed by `NEARProvider` against one of
+    NEAR's nearai-hosted open-weight models running in TEE-attested
+    isolation. Returns None when NEAR_API_KEY isn't set — the router
+    will have already selected this path based on a user pref, so the
+    caller falls back gracefully (orchestrator downgrades to the
+    standard `general` path with a log warning).
+
+    Model picks per spec §5:
+      - simple/moderate → Qwen/Qwen3.5-122B-A10B  (cheap, 131K ctx)
+      - complex         → openai/gpt-oss-120b      (best open-weight)
+
+    No tools wired on this path (same reasoning as BAA — health
+    responses are evidence-grounded). Per-turn lifecycle owned by the
+    orchestrator.
+    """
+    api_key = os.environ.get("NEAR_API_KEY", "").strip()
+    if not api_key:
+        log.warning(
+            "Private-TEE route requested but NEAR_API_KEY unset; "
+            "orchestrator will fall back to standard general path"
+        )
+        return None
+    base_url = (
+        os.environ.get("NEAR_BASE_URL", "").strip()
+        or "https://cloud-api.near.ai/v1"
+    )
+
+    from src.llm.providers.near import NEARProvider
+    from src.llm.session import LLMSession
+
+    if complexity == "complex":
+        model = "openai/gpt-oss-120b"
+    else:
+        model = "Qwen/Qwen3.5-122B-A10B"
+
+    provider = NEARProvider(api_key=api_key, base_url=base_url)
+    return LLMSession(
+        model=model,
+        provider=provider,
+        tools=[],
+        tool_handlers={},
+    )
+
+
 def build_baa_llm(config: Any):
     """Construct the BAA LLM for the health PHI route, or return None.
 

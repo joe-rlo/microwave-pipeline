@@ -58,6 +58,30 @@ def health_cli(argv: list[str]) -> int:
         help="Max rows to show (default 20)",
     )
 
+    # Phase E: user-controlled privacy prefs
+    p_prefs = sub.add_parser(
+        "prefs",
+        help="Show or change health-route privacy preferences.",
+    )
+    prefs_sub = p_prefs.add_subparsers(dest="prefs_action", required=True)
+    prefs_sub.add_parser("show", help="Print current prefs.")
+    p_set = prefs_sub.add_parser(
+        "set",
+        help="Set a pref. Currently only --privacy-mode is configurable.",
+    )
+    p_set.add_argument(
+        "--privacy-mode",
+        choices=("standard", "private_tee"),
+        required=True,
+        help=(
+            "standard: general-health turns route to NEAR Anonymised "
+            "Claude (or your configured main pipeline). "
+            "private_tee: route to NEAR Private TEE open-weight models "
+            "(GPT OSS / Qwen3.5) — hardware-attested isolation, "
+            "different quality trade-off."
+        ),
+    )
+
     args = parser.parse_args(argv)
 
     logging.basicConfig(
@@ -74,6 +98,11 @@ def health_cli(argv: list[str]) -> int:
         return _cmd_install_skill()
     if args.action == "audit" and args.audit_action == "list":
         return _cmd_audit_list(args.limit)
+    if args.action == "prefs":
+        if args.prefs_action == "show":
+            return _cmd_prefs_show()
+        if args.prefs_action == "set":
+            return _cmd_prefs_set(privacy_mode=args.privacy_mode)
 
     return 1
 
@@ -230,4 +259,66 @@ def _cmd_audit_list(limit: int) -> int:
             f"{ts}  route={r['route']:<12} phi={r.get('triage_phi_class') or '-':<8} "
             f"topic={topic:<14} latency={latency}ms  sources=[{sources_summary}]"
         )
+    return 0
+
+
+# --- Phase E: prefs ---
+
+
+def _cmd_prefs_show() -> int:
+    """Print current health privacy prefs."""
+    from datetime import datetime
+    from src.health.user_prefs import init_tables, load_pref
+    from src.session.engine import SessionEngine
+
+    config = load_config()
+    engine = SessionEngine(config.db_path)
+    engine.connect()
+    init_tables(engine.conn)
+    pref = load_pref(engine.conn)
+
+    print(f"Privacy mode:                  {pref.privacy_mode}")
+    print(
+        f"Consent to Anonymised general: "
+        f"{'yes' if pref.consent_anonymised_general else 'no (default)'}"
+    )
+    if pref.last_updated:
+        when = datetime.fromtimestamp(pref.last_updated).isoformat(timespec="seconds")
+        print(f"Last updated:                  {when}")
+    else:
+        print("Last updated:                  never (using defaults)")
+    print()
+    print("Notes:")
+    print(" - standard: general health routes to your main pipeline LLM")
+    print("   (NEAR Anonymised Claude). PII metadata is stripped before")
+    print("   forwarding, but the upstream provider sees the de-identified prompt.")
+    print(" - private_tee: general health routes to NEAR Private TEE")
+    print("   open-weight models (GPT OSS 120B / Qwen3.5 122B). Hardware-")
+    print("   attested isolation; NEAR cannot read the prompt. Quality vs.")
+    print("   Anonymised Claude is unmeasured — flag for your own bake-off.")
+    print(" - Personal/PHI turns ignore this setting and route to BAA when")
+    print("   configured, decline_phi otherwise.")
+    return 0
+
+
+def _cmd_prefs_set(*, privacy_mode: str) -> int:
+    """Update health prefs."""
+    from src.health.user_prefs import init_tables, save_pref
+    from src.session.engine import SessionEngine
+
+    config = load_config()
+    engine = SessionEngine(config.db_path)
+    engine.connect()
+    init_tables(engine.conn)
+    pref = save_pref(engine.conn, privacy_mode=privacy_mode)  # type: ignore[arg-type]
+    print(f"✓ Privacy mode set to {pref.privacy_mode!r}.")
+    if pref.privacy_mode == "private_tee":
+        import os
+        if not os.environ.get("NEAR_API_KEY", "").strip():
+            print(
+                "\n⚠ NEAR_API_KEY is not set in your environment. "
+                "General-health turns will silently fall back to the standard "
+                "main pipeline (the orchestrator logs a warning). "
+                "Set NEAR_API_KEY in .env to actually use the Private-TEE path."
+            )
     return 0

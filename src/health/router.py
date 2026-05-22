@@ -25,10 +25,13 @@ from dataclasses import dataclass
 from typing import Literal
 
 from src.health.config import HealthConfig
+from src.health.user_prefs import UserHealthPref
 from src.session.models import TriageResult
 
 
-HealthPath = Literal["skip", "general", "phi", "decline_phi"]
+HealthPath = Literal[
+    "skip", "general", "general_private_tee", "phi", "decline_phi",
+]
 
 
 @dataclass(frozen=True)
@@ -40,8 +43,13 @@ class HealthRoute:
     # True only on the BAA path. The orchestrator selects the Bedrock
     # client when this is set; otherwise the standard LLM client runs.
     use_baa_llm: bool
-    # General + phi paths fan out to PubMed/MedlinePlus/etc.; skip
-    # and decline_phi don't.
+    # Phase E: True only on the `general_private_tee` path. Orchestrator
+    # selects a NEAR Private TEE open-weight LLM (GPT OSS 120B / Qwen3.5)
+    # so the prompt stays inside hardware-attested isolation. False on
+    # every other path. Mutually exclusive with `use_baa_llm`.
+    use_private_tee: bool
+    # General + phi + general_private_tee paths fan out to PubMed/
+    # MedlinePlus/etc.; skip and decline_phi don't.
     enable_retrieval: bool
     # When True, the response gets the health.md channel rules appended
     # so disclaimers fire. Always True for any non-skip path; False for
@@ -58,30 +66,36 @@ class HealthRoute:
         return self.path != "skip"
 
 
-def route(triage: TriageResult, config: HealthConfig) -> HealthRoute:
+def route(
+    triage: TriageResult,
+    config: HealthConfig,
+    user_pref: UserHealthPref | None = None,
+) -> HealthRoute:
     """Pick a path for a triage-classified message.
 
     Decision tree:
     1. Module disabled → skip (zero behavior change vs. pre-health build)
     2. phi_class == "none" → skip (not health-related)
-    3. phi_class == "general" → general path (retrieval + disclaimer,
-       standard LLM)
-    4. phi_class in ("personal", "unknown") AND BAA configured → phi path
+    3. phi_class == "general":
+       a. user_pref.privacy_mode == "private_tee" → general_private_tee
+          (NEAR Private TEE open-weight LLM; retrieval + disclaimer)
+       b. otherwise → general (standard main pipeline; retrieval + disclaimer)
+    4. phi_class in ("personal", "unknown") AND BAA configured → phi
        (retrieval + disclaimer + Bedrock LLM)
     5. phi_class in ("personal", "unknown") AND BAA NOT configured →
        decline_phi (safety message, no LLM call, no retrieval)
 
-    Step 5 is the Phase 1 reality: we don't ship a Bedrock client
-    until Phase 2, so personal queries fall back to a safety message
-    by default. Once Phase 2 lands and `phi_path_available` flips True,
-    the same router code starts routing personal queries to BAA without
-    any caller-side change.
+    `user_pref` is optional for backward compatibility — when None the
+    router treats privacy_mode as the default ("standard"), which is
+    identical to pre-Phase-E behavior. Callers that want the new TEE
+    path must pass the user's loaded pref.
     """
     if not config.enabled:
         return HealthRoute(
             path="skip",
             reason="module disabled",
             use_baa_llm=False,
+            use_private_tee=False,
             enable_retrieval=False,
             require_disclaimer=False,
         )
@@ -91,15 +105,29 @@ def route(triage: TriageResult, config: HealthConfig) -> HealthRoute:
             path="skip",
             reason="not health-related",
             use_baa_llm=False,
+            use_private_tee=False,
             enable_retrieval=False,
             require_disclaimer=False,
         )
 
     if triage.phi_class == "general":
+        # Phase E: when the user opted into private_tee, route general
+        # health through NEAR Private. Disclaimer + retrieval still
+        # apply — only the LLM destination changes.
+        if user_pref is not None and user_pref.privacy_mode == "private_tee":
+            return HealthRoute(
+                path="general_private_tee",
+                reason="general health, user opted into TEE",
+                use_baa_llm=False,
+                use_private_tee=True,
+                enable_retrieval=True,
+                require_disclaimer=True,
+            )
         return HealthRoute(
             path="general",
             reason="general health query",
             use_baa_llm=False,
+            use_private_tee=False,
             enable_retrieval=True,
             require_disclaimer=True,
         )
@@ -110,6 +138,7 @@ def route(triage: TriageResult, config: HealthConfig) -> HealthRoute:
             path="phi",
             reason=f"phi_class={triage.phi_class}",
             use_baa_llm=True,
+            use_private_tee=False,
             enable_retrieval=True,
             require_disclaimer=True,
         )
@@ -122,6 +151,7 @@ def route(triage: TriageResult, config: HealthConfig) -> HealthRoute:
         path="decline_phi",
         reason=f"phi_class={triage.phi_class} but no BAA provider configured",
         use_baa_llm=False,
+        use_private_tee=False,
         enable_retrieval=False,
         require_disclaimer=False,
     )

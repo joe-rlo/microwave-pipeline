@@ -122,13 +122,15 @@ class Orchestrator:
         )
         self.session_engine.connect()
 
-        # Breadcrumb + consolidation tables live alongside `turns` on
-        # the same connection. Init is idempotent; cheap to run on
-        # every startup.
+        # Breadcrumb + consolidation + user-prefs tables live alongside
+        # `turns` on the same connection. Init is idempotent; cheap to
+        # run on every startup.
+        from src.health.user_prefs import init_tables as init_user_prefs_tables
         from src.memory.breadcrumbs import ToolCallCounter, init_tables as init_breadcrumbs_tables
         from src.memory.consolidation import init_tables as init_consolidation_tables
         init_breadcrumbs_tables(self.session_engine.conn)
         init_consolidation_tables(self.session_engine.conn)
+        init_user_prefs_tables(self.session_engine.conn)
         # Per-process tool-call counter. Cleared on `new_session()`.
         self._tool_call_counter = ToolCallCounter()
         # Snapshot of cumulative tool calls in the current session — fed
@@ -355,7 +357,13 @@ class Orchestrator:
         # auto-activate the health-qa skill, run evidence retrieval, and
         # splice the disclaimer block into assembly. The "decline_phi"
         # path short-circuits the LLM entirely with a safety message.
-        h_route = health_route(triage_result, self.config.health)
+        # Phase E: pass the user's health prefs so the router can pick
+        # general_private_tee when privacy_mode=private_tee. Default
+        # pref (no row in user_health_prefs) keeps behavior identical
+        # to pre-Phase-E.
+        from src.health.user_prefs import load_pref as _load_user_pref
+        _user_pref = _load_user_pref(self.session_engine.conn)
+        h_route = health_route(triage_result, self.config.health, _user_pref)
         health_evidence: list = []
         health_disclaimer_text: str = ""
 
@@ -527,35 +535,53 @@ class Orchestrator:
 
         # PHI turns route through a separate BAA-covered LLM (AWS
         # Bedrock + Anthropic) built per-turn, so PHI history stays
-        # isolated from the main pipeline's session. Non-PHI turns
-        # use self.llm as before.
-        baa_llm = None
+        # isolated from the main pipeline's session. The Phase E
+        # general_private_tee route does the same with NEAR Private
+        # TEE open-weight models. Non-PHI / non-TEE turns use self.llm.
+        alt_llm = None
         if h_route.use_baa_llm:
             from src.llm.factory import build_baa_llm
-            baa_llm = build_baa_llm(self.config)
-            if baa_llm is None:
-                # phi_path_available passed earlier but provider construction
-                # failed (e.g., AWS_REGION missing) — surface as a route
-                # downgrade rather than crashing the turn.
+            alt_llm = build_baa_llm(self.config)
+            if alt_llm is None:
                 log.error(
                     "BAA LLM construction failed mid-turn; sending decline_phi"
                 )
                 yield {"type": "delta", "text": DECLINE_PHI_MESSAGE}
                 yield {"type": "result", "text": DECLINE_PHI_MESSAGE}
                 return
-            await baa_llm.connect(assembly_result.stable_prompt)
-        active_llm = baa_llm if baa_llm is not None else self.llm
+            await alt_llm.connect(assembly_result.stable_prompt)
+        elif h_route.use_private_tee:
+            from src.llm.factory import build_private_tee_llm
+            alt_llm = build_private_tee_llm(
+                self.config, complexity=triage_result.complexity,
+            )
+            if alt_llm is None:
+                # NEAR_API_KEY missing → downgrade to standard general
+                # path silently (the user opted into TEE but the env
+                # isn't set up). Log loudly so misconfig is visible.
+                log.warning(
+                    "Private-TEE LLM unavailable; downgrading to standard "
+                    "general-health LLM for this turn"
+                )
+                # alt_llm stays None → falls through to self.llm below
+            else:
+                await alt_llm.connect(assembly_result.stable_prompt)
+        active_llm = alt_llm if alt_llm is not None else self.llm
 
         # Escalate to Opus+thinking for complex tasks. On the BAA path
         # the escalation target is the health-specific opus model id
-        # (config.health.baa_model_escalation) rather than the main one.
+        # (config.health.baa_model_escalation). The Private-TEE path
+        # is already on its complex model (build_private_tee_llm
+        # picked GPT OSS 120B at construction); no further swap.
         escalated = triage_result.complexity == "complex"
         if escalated:
-            esc_model = (
-                self.config.health.baa_model_escalation
-                if baa_llm is not None
-                else self.config.model_escalation
-            )
+            if h_route.use_baa_llm and alt_llm is not None:
+                esc_model = self.config.health.baa_model_escalation
+            elif h_route.use_private_tee and alt_llm is not None:
+                # Already on the complex Private-TEE model; no escalation.
+                esc_model = active_llm.model
+            else:
+                esc_model = self.config.model_escalation
             log.info(
                 f"Escalating to {esc_model} "
                 f"(effort={self.config.escalation_effort}) for complex task"
@@ -592,10 +618,10 @@ class Orchestrator:
         finally:
             if escalated:
                 await active_llm.de_escalate()
-            if baa_llm is not None:
-                # Per-turn lifecycle: tear down so PHI history doesn't
-                # leak into the next turn's session.
-                await baa_llm.disconnect()
+            if alt_llm is not None:
+                # Per-turn lifecycle: tear down so PHI / Private-TEE
+                # history doesn't leak into the next turn's session.
+                await alt_llm.disconnect()
 
         # --- Stage 4: Reflection ---
         # Route by triage complexity to avoid burning a Haiku round-trip
