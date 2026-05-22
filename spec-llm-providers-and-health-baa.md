@@ -76,56 +76,63 @@ Unverified — flagged in-line where they appear:
 
 ## 3. NEAR AI model catalog (verified 2026-05-22)
 
-From `cloud.near.ai/models`. Pricing is per million tokens unless
-noted. Cache column is when documented; em-dash means no cache pricing
-shown.
+From `cloud.near.ai/models` and confirmed against a live
+`GET /v1/models` call on 2026-05-22. Pricing is per million tokens
+unless noted. Cache column is when documented; em-dash means no cache
+pricing shown.
+
+**API model slugs** use the shape `<vendor>/<model>` (e.g.
+`anthropic/claude-haiku-4-5`, `openai/gpt-5.5`, `google/gemma-4-31B-it`,
+`Qwen/Qwen3-30B-A3B-Instruct-2507` — note capital `Q`). Display names
+in the tables below match the dashboard; the slugs you'd pass to
+`/v1/chat/completions` are listed in the "Slug" column.
 
 **Private (nearai-hosted in TEE — privacy guarantee is hardware
 attestation; NEAR cannot read prompts/outputs):**
 
-| Model | Provider | Ctx | In $/M | Out $/M | Cache $/M |
+| Model | Slug | Ctx | In $/M | Out $/M | Cache $/M |
 |---|---|---|---|---|---|
-| FLUX.2-klein-4B | nearai | 128K | $1 | $1 | $0.012/image |
-| Gemma 4 31B Instruct | nearai | 262K | $0.13 | $0.4 | $0.026 |
-| GLM 5.1 | nearai | 202K | $0.85 | $3.3 | $0.17 |
-| GPT OSS 120B | nearai | 131K | $0.15 | $0.55 | $0.03 |
-| Privacy Filter | nearai | 0K | $0.01 | $0 | — |
-| Qwen 3.6 35B A3B FP8 | nearai | 262K | $0.17 | $1.1 | $0.056 |
-| Qwen3 30B A3B Instruct | nearai | 262K | $0.15 | $0.55 | $0.03 |
-| Qwen3-Embedding-0.6B | nearai | 40K | $0.01 | $0.01 | — |
-| Qwen3-Reranker-0.6B | nearai | 40K | $0.01 | $0.01 | — |
-| Qwen3-VL-30B-A3B-Instruct | nearai | 256K | $0.15 | $0.55 | $0.03 |
-| Qwen3.5 122B A10B | nearai | 131K | $0.4 | $3.2 | $0.08 |
-| Whisper Large v3 | nearai | 0K | $0.01 | $0.01 | — |
+| FLUX.2-klein-4B | `black-forest-labs/FLUX.2-klein-4B` | 128K | $1 | $1 | $0.012/image |
+| Gemma 4 31B Instruct | `google/gemma-4-31B-it` | 262K | $0.13 | $0.4 | $0.026 |
+| GLM 5.1 | `zai-org/GLM-5.1-FP8` | 202K | $0.85 | $3.3 | $0.17 |
+| GPT OSS 120B | `openai/gpt-oss-120b` | 131K | $0.15 | $0.55 | $0.03 |
+| Privacy Filter | `openai/privacy-filter` | 0K | $0.01 | $0 | — |
+| Qwen 3.6 35B A3B FP8 | `Qwen/Qwen3.6-35B-A3B-FP8` | 262K | $0.17 | $1.1 | $0.056 |
+| Qwen3 30B A3B Instruct | `Qwen/Qwen3-30B-A3B-Instruct-2507` | 262K | $0.15 | $0.55 | $0.03 |
+| Qwen3-Embedding-0.6B | `Qwen/Qwen3-Embedding-0.6B` | 40K | $0.01 | $0.01 | — |
+| Qwen3-Reranker-0.6B | `Qwen/Qwen3-Reranker-0.6B` | 40K | $0.01 | $0.01 | — |
+| Qwen3-VL-30B-A3B-Instruct | `Qwen/Qwen3-VL-30B-A3B-Instruct` | 256K | $0.15 | $0.55 | $0.03 |
+| Qwen3.5 122B A10B | `Qwen/Qwen3.5-122B-A10B` | 131K | $0.4 | $3.2 | $0.08 |
+| Whisper Large v3 | `openai/whisper-large-v3` | 0K | $0.01 | $0.01 | — |
 
 **Anonymised (NEAR strips PII, proxies to upstream — upstream still
 sees the (de-identified) prompt):**
 
-| Model | Upstream | Ctx | In $/M | Out $/M | Cache $/M |
+| Model | Slug | Ctx | In $/M | Out $/M | Cache $/M |
 |---|---|---|---|---|---|
-| Claude Haiku 4.5 | anthropic | 200K | $1 | $5 | $0.1 |
-| Claude Sonnet 4.5 | anthropic | 200K | $3 | $15.5 | — |
-| Claude Sonnet 4.6 | anthropic | 1000K | $3 | $15 | $0.3 |
-| Claude Opus 4.6 | anthropic | 200K | $5 | $25 | — |
-| Claude Opus 4.7 | anthropic | 1000K | $5 | $25 | $0.5 |
-| Gemini 2.5 Flash Lite | google | 1048K | $0.1 | $0.4 | — |
-| Gemini 2.5 Flash | google | 1000K | $0.3 | $2.5 | — |
-| Gemini 2.5 Pro | google | 1000K | $1.25 | $10 | — |
-| Gemini 3.1 Flash Lite | google | 1048K | $0.25 | $1.5 | — |
-| Gemini 3 Pro Preview | google | 1000K | $1.25 | $15 | — |
-| Gemini 3.5 Flash | google | 1000K | $1.5 | $9 | $0.15 |
-| Kimi K2.6 | moonshotai | 262K | $0.8 | $3.5 | $0.3 |
-| GPT-5 Nano | openai | 400K | $0.05 | $0.4 | — |
-| GPT-5 Mini | openai | 400K | $0.25 | $2 | — |
-| GPT-5.1 | openai | 400K | $1.25 | $10 | — |
-| GPT-5.4 Nano | openai | 400K | $0.2 | $1.25 | — |
-| GPT-5.4 Mini | openai | 400K | $0.75 | $4.5 | — |
-| GPT-5.4 | openai | 1050K | $2.5 | $15 | — |
-| GPT-5.5 | openai | 1050K | $5 | $30 | — |
-| o3 Mini | openai | 200K | $1.1 | $4.4 | — |
-| OpenAI GPT-4.1 Nano | openai | 1000K | $0.1 | $0.4 | $0.025 |
-| OpenAI GPT-4.1 Mini | openai | 1000K | $0.4 | $1.6 | $0.1 |
-| OpenAI GPT-4.1 | openai | 1000K | $2 | $8 | $0.5 |
+| Claude Haiku 4.5 | `anthropic/claude-haiku-4-5` | 200K | $1 | $5 | $0.1 |
+| Claude Sonnet 4.5 | `anthropic/claude-sonnet-4-5` | 200K | $3 | $15.5 | — |
+| Claude Sonnet 4.6 | `anthropic/claude-sonnet-4-6` | 1000K | $3 | $15 | $0.3 |
+| Claude Opus 4.6 | `anthropic/claude-opus-4-6` | 200K | $5 | $25 | — |
+| Claude Opus 4.7 | `anthropic/claude-opus-4-7` | 1000K | $5 | $25 | $0.5 |
+| Gemini 2.5 Flash Lite | `google/gemini-2.5-flash-lite` | 1048K | $0.1 | $0.4 | — |
+| Gemini 2.5 Flash | `google/gemini-2.5-flash` | 1000K | $0.3 | $2.5 | — |
+| Gemini 2.5 Pro | `google/gemini-2.5-pro` | 1000K | $1.25 | $10 | — |
+| Gemini 3.1 Flash Lite | `google/gemini-3.1-flash-lite` | 1048K | $0.25 | $1.5 | — |
+| Gemini 3 Pro Preview | `google/gemini-3-pro` | 1000K | $1.25 | $15 | — |
+| Gemini 3.5 Flash | `google/gemini-3.5-flash` | 1000K | $1.5 | $9 | $0.15 |
+| Kimi K2.6 | `moonshotai/kimi-k2.6` | 262K | $0.8 | $3.5 | $0.3 |
+| GPT-5 Nano | `openai/gpt-5-nano` | 400K | $0.05 | $0.4 | — |
+| GPT-5 Mini | `openai/gpt-5-mini` | 400K | $0.25 | $2 | — |
+| GPT-5.1 | `openai/gpt-5.1` | 400K | $1.25 | $10 | — |
+| GPT-5.4 Nano | `openai/gpt-5.4-nano` | 400K | $0.2 | $1.25 | — |
+| GPT-5.4 Mini | `openai/gpt-5.4-mini` | 400K | $0.75 | $4.5 | — |
+| GPT-5.4 | `openai/gpt-5.4` | 1050K | $2.5 | $15 | — |
+| GPT-5.5 | `openai/gpt-5.5` | 1050K | $5 | $30 | — |
+| o3 Mini | `openai/o3-mini` | 200K | $1.1 | $4.4 | — |
+| OpenAI GPT-4.1 Nano | `openai/gpt-4.1-nano` | 1000K | $0.1 | $0.4 | $0.025 |
+| OpenAI GPT-4.1 Mini | `openai/gpt-4.1-mini` | 1000K | $0.4 | $1.6 | $0.1 |
+| OpenAI GPT-4.1 | `openai/gpt-4.1` | 1000K | $2 | $8 | $0.5 |
 
 **Key consequence:** "smart routing with Gemma" likely means
 Gemma 4 31B Instruct ($0.13 / $0.4 per M, 262K ctx) as a triage /
@@ -254,12 +261,12 @@ def select(ctx: SelectionContext, cfg: ProviderConfig) -> ProviderRequest:
     # 2) Privacy-max opt-in (e.g., general health when user asked
     #    for max privacy) → NEAR Private (TEE) open-weight models
     if ctx.privacy_mode == "private_tee":
-        model = "gpt-oss-120b" if ctx.complexity == "complex" else "qwen3.5-122b-a10b"
+        model = "openai/gpt-oss-120b" if ctx.complexity == "complex" else "Qwen/Qwen3.5-122B-A10B"
         return _near_request(model, tier="private", ctx=ctx)
 
     # 3) Triage / reflection → NEAR Private Gemma (fast + cheap)
     if ctx.stage in ("triage", "reflection"):
-        return _near_request("gemma-4-31b-instruct", tier="private", ctx=ctx)
+        return _near_request("google/gemma-4-31B-it", tier="private", ctx=ctx)
 
     # 4) Main / compaction → NEAR Anonymised Claude (or user-configured)
     model = _pick_main_model(ctx.complexity, cfg)
@@ -690,13 +697,13 @@ the trade that you're paying *something* vs. zero on Max.
 LLM_PROVIDER_DEFAULT=near        # near | anthropic | openai | bedrock
 
 # Per-stage overrides — each takes "<provider>:<model>". Empty = use default.
-LLM_STAGE_TRIAGE=near:gemma-4-31b-instruct
-LLM_STAGE_REFLECTION=near:gemma-4-31b-instruct
-LLM_STAGE_COMPACTION=near:claude-sonnet-4-6
-LLM_STAGE_SESSION_SUMMARY=near:claude-haiku-4-5
-LLM_STAGE_MAIN_SIMPLE=near:claude-sonnet-4-6
-LLM_STAGE_MAIN_MODERATE=near:claude-sonnet-4-6
-LLM_STAGE_MAIN_COMPLEX=near:claude-opus-4-7
+LLM_STAGE_TRIAGE=near:anthropic/claude-haiku-4-5
+LLM_STAGE_REFLECTION=near:anthropic/claude-haiku-4-5
+LLM_STAGE_COMPACTION=near:anthropic/claude-sonnet-4-6
+LLM_STAGE_SESSION_SUMMARY=near:anthropic/claude-haiku-4-5
+LLM_STAGE_MAIN_SIMPLE=near:anthropic/claude-sonnet-4-6
+LLM_STAGE_MAIN_MODERATE=near:anthropic/claude-sonnet-4-6
+LLM_STAGE_MAIN_COMPLEX=near:anthropic/claude-opus-4-7
 
 # === NEAR AI ===
 NEAR_API_KEY=
@@ -1075,9 +1082,9 @@ MEMORY_BRIEFING_PATH=workspace/BRIEFING.md
 MEMORY_BRIEFING_MAX_TOKENS=2000            # cap so it stays cached
 
 # Per-stage model overrides
-LLM_STAGE_CONSOLIDATION_EXTRACT=near:claude-haiku-4-5
-LLM_STAGE_CONSOLIDATION_LINK=near:claude-sonnet-4-6
-LLM_STAGE_CONSOLIDATION_BRIEF=near:claude-sonnet-4-6
+LLM_STAGE_CONSOLIDATION_EXTRACT=near:anthropic/claude-haiku-4-5
+LLM_STAGE_CONSOLIDATION_LINK=near:anthropic/claude-sonnet-4-6
+LLM_STAGE_CONSOLIDATION_BRIEF=near:anthropic/claude-sonnet-4-6
 ```
 
 ### 12.7 Schema additions
