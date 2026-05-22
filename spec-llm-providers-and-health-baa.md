@@ -719,15 +719,24 @@ ANTHROPIC_API_KEY=
 OPENAI_API_KEY=
 
 # === AWS Bedrock — BAA path ===
+# Auth: a long-term Bedrock API key is the simplest path (env var picked
+# up by boto3 automatically). Traditional IAM access keys also work
+# but require more setup. Verified end-to-end on 2026-05-22.
 HEALTH_BAA_PROVIDER=bedrock           # bedrock | none
 AWS_REGION=us-east-1
-AWS_ACCESS_KEY_ID=
-AWS_SECRET_ACCESS_KEY=
-# Bedrock model IDs (Claude on Bedrock uses different IDs than direct):
-HEALTH_BAA_MODEL_MAIN=anthropic.claude-sonnet-4-x-vYYYYMMDD
-HEALTH_BAA_MODEL_ESCALATION=anthropic.claude-opus-4-x-vYYYYMMDD
-# (exact IDs verified at deploy time — Bedrock model IDs change with each
-# Anthropic release; the existing health spec lists placeholder values)
+AWS_BEARER_TOKEN_BEDROCK=<long-term Bedrock API key>
+#
+# Model IDs MUST be cross-region inference profile IDs for newer
+# Anthropic models — the raw model ID (e.g. anthropic.claude-haiku-4-5-...)
+# fails with "on-demand throughput isn't supported" because newer
+# models require a regional / global profile. Prefix shapes:
+#   us.anthropic.claude-...   eu.anthropic.claude-...
+#   apac.anthropic.claude-... global.anthropic.claude-...
+# List what your account has via:
+#   client = boto3.client("bedrock", region_name="us-east-1")
+#   client.list_inference_profiles()
+HEALTH_BAA_MODEL_MAIN=us.anthropic.claude-haiku-4-5-20251001-v1:0
+HEALTH_BAA_MODEL_ESCALATION=us.anthropic.claude-opus-4-x-...
 
 # === Health privacy preference ===
 HEALTH_USER_PRIVACY_MODE=standard     # standard | private_tee

@@ -27,6 +27,30 @@ What this adapter deliberately does NOT do:
   / `ValidationException` — surface them as Error events and let the
   orchestrator decide.
 
+Auth — verified 2026-05-22:
+- The simplest path is a long-term Bedrock API key set as
+  `AWS_BEARER_TOKEN_BEDROCK` in env. boto3 reads it automatically; you
+  don't pass it as a constructor kwarg (boto3 currently only accepts
+  Bedrock bearer tokens via env, see boto3/boto3#4723). Traditional
+  IAM access keys also work via the standard
+  AWS_ACCESS_KEY_ID/SECRET_ACCESS_KEY env vars.
+- Long-term keys are convenient for personal/exploration use; rotate
+  every ~90 days. Short-term keys are preferred for production.
+
+Model IDs — verified 2026-05-22:
+- Newer Anthropic models require CROSS-REGION INFERENCE PROFILE IDs
+  for on-demand invocation, not the raw model id. Passing
+  `anthropic.claude-haiku-4-5-...` directly fails with "on-demand
+  throughput isn't supported." Use the profile ID instead:
+    us.anthropic.claude-haiku-4-5-20251001-v1:0    (US)
+    eu.anthropic.claude-...                        (EU)
+    apac.anthropic.claude-...                      (Asia Pacific)
+    global.anthropic.claude-...                    (global cross-region)
+- List what your account has access to via
+  `boto3.client("bedrock").list_inference_profiles()`. The adapter
+  passes whatever you put in `req.model` straight to Bedrock — no
+  translation here.
+
 boto3 is synchronous. We wrap it via `asyncio.to_thread` to play nice
 with the rest of the async pipeline; the stream-event iteration also
 hops to a thread because boto3's EventStream is a sync iterator.
