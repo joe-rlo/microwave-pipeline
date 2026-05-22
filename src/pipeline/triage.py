@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 
-from src.llm.client import SingleTurnClient
+from src.llm.selector import get_stage_callable
 from src.session.models import TriageResult, Turn
 
 log = logging.getLogger(__name__)
@@ -322,8 +322,17 @@ async def triage(
     """
     from src.pipeline.json_utils import query_json_with_retry
 
-    client = SingleTurnClient(
-        model=model, auth_mode=auth_mode, api_key=api_key, cli_path=cli_path,
+    # Selector reads LLM_STAGE_TRIAGE / LLM_PROVIDER_DEFAULT / NEAR_* env
+    # vars and returns a (system, user) → str callable. With no env
+    # overrides, this is the same SingleTurnClient.query path as before.
+    # With LLM_STAGE_TRIAGE="near:claude-haiku-4-5", the call routes
+    # through NEARProvider — no other code changes needed here.
+    call = get_stage_callable(
+        "triage",
+        fallback_model=model,
+        auth_mode=auth_mode,
+        api_key=api_key,
+        cli_path=cli_path,
         workspace_dir=workspace_dir,
     )
     input_text = _format_triage_input(message, recent_turns)
@@ -336,7 +345,7 @@ async def triage(
 
     schema_hint = _TRIAGE_SCHEMA_HINT_HEALTH if health_enabled else _TRIAGE_SCHEMA_HINT
     data = await query_json_with_retry(
-        client.query,
+        call,
         prompt,
         input_text,
         schema_hint,

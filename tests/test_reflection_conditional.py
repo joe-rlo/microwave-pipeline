@@ -134,7 +134,7 @@ class TestReflectVariantWiring:
             '{"confidence": 0.9, "action": "deliver", "hedging_detected": false}'
         )
         with patch(
-            "src.pipeline.reflection.SingleTurnClient", return_value=client,
+            "src.pipeline.reflection.get_stage_callable", return_value=client.query,
         ):
             result = await reflect("response", "ctx", variant="normal")
         assert result.path == "normal"
@@ -147,7 +147,7 @@ class TestReflectVariantWiring:
             '{"confidence": 0.9, "action": "deliver", "hedging_detected": false}'
         )
         with patch(
-            "src.pipeline.reflection.SingleTurnClient", return_value=client,
+            "src.pipeline.reflection.get_stage_callable", return_value=client.query,
         ):
             result = await reflect("response", "ctx", variant="deep")
         assert result.path == "deep"
@@ -162,7 +162,7 @@ class TestReflectVariantWiring:
             '{"confidence": 0.9, "action": "deliver", "hedging_detected": false}'
         )
         with patch(
-            "src.pipeline.reflection.SingleTurnClient", return_value=client,
+            "src.pipeline.reflection.get_stage_callable", return_value=client.query,
         ):
             result = await reflect("response", "ctx")
         assert result.path == "normal"
@@ -174,7 +174,7 @@ class TestReflectVariantWiring:
         robustness per variant."""
         client = _ScriptedClient("not json")
         with patch(
-            "src.pipeline.reflection.SingleTurnClient", return_value=client,
+            "src.pipeline.reflection.get_stage_callable", return_value=client.query,
         ):
             result = await reflect("response", "ctx", variant="deep")
         assert result.path == "deep"

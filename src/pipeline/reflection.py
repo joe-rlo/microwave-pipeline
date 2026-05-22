@@ -20,7 +20,7 @@ from __future__ import annotations
 import logging
 import re
 
-from src.llm.client import SingleTurnClient
+from src.llm.selector import get_stage_callable
 from src.session.models import ReflectionResult
 
 log = logging.getLogger(__name__)
@@ -233,14 +233,20 @@ async def reflect(
     else:
         prompt = REFLECTION_PROMPT_NORMAL
 
-    client = SingleTurnClient(
-        model=model, auth_mode=auth_mode, api_key=api_key, cli_path=cli_path,
+    # Selector reads LLM_STAGE_REFLECTION / NEAR_* env vars; with no
+    # override this is identical to the previous SingleTurnClient path.
+    call = get_stage_callable(
+        "reflection",
+        fallback_model=model,
+        auth_mode=auth_mode,
+        api_key=api_key,
+        cli_path=cli_path,
         workspace_dir=workspace_dir,
     )
     input_text = _format_reflection_input(response, context)
 
     data = await query_json_with_retry(
-        client.query,
+        call,
         prompt,
         input_text,
         _REFLECTION_SCHEMA_HINT,

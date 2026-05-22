@@ -64,6 +64,21 @@ class Config(BaseModel):
     # with Contents: Read, Metadata: Read, Pull requests: Read, Issues: Read.
     github_token: str = ""
 
+    # Provider routing — see spec-llm-providers-and-health-baa.md §9.
+    # These fields exist on Config for visibility and `health status` /
+    # debug surfaces; the runtime selector in src/llm/selector.py reads
+    # env directly so per-stage overrides take effect without a process
+    # restart of any caller threading config through.
+    #
+    # llm_provider_default = "legacy" preserves current Agent SDK
+    # behavior. Per-stage overrides like LLM_STAGE_TRIAGE="near:claude-haiku-4-5"
+    # flip individual stages to NEAR without touching the rest.
+    llm_provider_default: str = "legacy"
+    llm_stage_triage: str = ""
+    llm_stage_reflection: str = ""
+    near_api_key: str = ""
+    near_base_url: str = ""  # empty = use selector's default
+
     # Built-in Agent SDK tools the bot is allowed to call during a turn.
     # Empty = no built-in tools (default — keeps the bot conversational
     # only). Non-empty = listed names are added to allowed_tools AND the
@@ -184,6 +199,11 @@ def load_config() -> Config:
         instacart_api_key=os.getenv("INSTACART_API_KEY", ""),
         instacart_partner_linkback_url=os.getenv("INSTACART_PARTNER_LINKBACK_URL", ""),
         github_token=os.getenv("GITHUB_TOKEN", ""),
+        llm_provider_default=os.getenv("LLM_PROVIDER_DEFAULT", "legacy"),
+        llm_stage_triage=os.getenv("LLM_STAGE_TRIAGE", ""),
+        llm_stage_reflection=os.getenv("LLM_STAGE_REFLECTION", ""),
+        near_api_key=os.getenv("NEAR_API_KEY", ""),
+        near_base_url=os.getenv("NEAR_BASE_URL", ""),
         bot_builtin_tools=tuple(
             t.strip() for t in os.getenv("BOT_BUILTIN_TOOLS", "").split(",") if t.strip()
         ),
