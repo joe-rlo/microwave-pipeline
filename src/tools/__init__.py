@@ -30,12 +30,21 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
 from src.llm.provider import ToolDefinition
 
 log = logging.getLogger(__name__)
+
+
+def _web_tools_disabled() -> bool:
+    """True when the WEB_TOOLS_DISABLED env flag is set (escape hatch for
+    isolated tests / paranoid deployments). Default is enabled."""
+    return os.environ.get("WEB_TOOLS_DISABLED", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
 
 
 # Provider-shape handler: async (args) -> response text. Raises on error.
@@ -121,6 +130,16 @@ def build_tools(config) -> ToolBundle:
     else:
         log.debug("GITHUB_TOKEN not set; GitHub tools disabled")
 
+    # --- Web tools (native, replaces SDK built-ins) ---
+    if not _web_tools_disabled():
+        from src.tools.web import build_webfetch_sdk_tools, WEB_TOOL_DOCS
+
+        web_tools = build_webfetch_sdk_tools()
+        if web_tools:
+            tools.extend(web_tools)
+            catalog_lines.append(WEB_TOOL_DOCS)
+            log.info("Registered native web tools (webfetch)")
+
     if not tools:
         return ToolBundle(mcp_servers={}, allowed_tools=[], catalog_text="")
 
@@ -177,6 +196,31 @@ def build_provider_tools(config) -> list[ProviderTool]:
                     input_schema=instacart_mod.INSTACART_CREATE_CART_SCHEMA,
                 ),
                 handler=_instacart_handler(config),
+            )
+        )
+
+    # --- Web tools (native; no env key required) ---
+    if not _web_tools_disabled():
+        from src.tools import web as web_mod
+
+        async def _webfetch(args: dict[str, Any]) -> str:
+            return _unwrap_mcp_result(
+                await web_mod._handle_webfetch(args),
+                tool_name="webfetch",
+            )
+
+        out.append(
+            ProviderTool(
+                definition=ToolDefinition(
+                    name="webfetch",
+                    description=(
+                        "Fetch a public web page and return its content as "
+                        "plain text. Use when the user shares a URL or you "
+                        "need information from a specific public page."
+                    ),
+                    input_schema=web_mod.WEBFETCH_SCHEMA,
+                ),
+                handler=_webfetch,
             )
         )
 

@@ -29,12 +29,18 @@ from src.tools import ProviderTool, build_provider_tools
 
 
 class TestProviderRegistry:
-    def test_empty_when_no_keys(self):
+    """Registry assertions disable always-on web tools so each test
+    isolates to the env keys it controls. Web-tool registration is
+    covered separately in test_web_tools.py."""
+
+    def test_empty_when_no_keys(self, monkeypatch):
+        monkeypatch.setenv("WEB_TOOLS_DISABLED", "1")
         config = SimpleNamespace(instacart_api_key="", github_token="")
         tools = build_provider_tools(config)
         assert tools == []
 
-    def test_instacart_only(self):
+    def test_instacart_only(self, monkeypatch):
+        monkeypatch.setenv("WEB_TOOLS_DISABLED", "1")
         config = SimpleNamespace(
             instacart_api_key="fake",
             instacart_partner_linkback_url="",
@@ -44,7 +50,8 @@ class TestProviderRegistry:
         names = [t.definition.name for t in tools]
         assert names == ["instacart_create_cart"]
 
-    def test_github_only_registers_three(self):
+    def test_github_only_registers_three(self, monkeypatch):
+        monkeypatch.setenv("WEB_TOOLS_DISABLED", "1")
         config = SimpleNamespace(
             instacart_api_key="",
             github_token="ghp_fake",
@@ -57,7 +64,8 @@ class TestProviderRegistry:
             "github_recent_activity",
         ]
 
-    def test_both_registered_when_both_keys_set(self):
+    def test_both_registered_when_both_keys_set(self, monkeypatch):
+        monkeypatch.setenv("WEB_TOOLS_DISABLED", "1")
         config = SimpleNamespace(
             instacart_api_key="fake",
             instacart_partner_linkback_url="",
@@ -71,6 +79,19 @@ class TestProviderRegistry:
             "github_repo_summary",
             "github_recent_activity",
         ])
+
+    def test_webfetch_registered_by_default(self):
+        # When env doesn't disable web tools, webfetch should always appear.
+        config = SimpleNamespace(instacart_api_key="", github_token="")
+        tools = build_provider_tools(config)
+        names = [t.definition.name for t in tools]
+        assert "webfetch" in names
+
+    def test_webfetch_can_be_disabled(self, monkeypatch):
+        monkeypatch.setenv("WEB_TOOLS_DISABLED", "true")
+        config = SimpleNamespace(instacart_api_key="", github_token="")
+        tools = build_provider_tools(config)
+        assert tools == []
 
     def test_returned_definitions_are_real_ToolDefinitions(self):
         config = SimpleNamespace(

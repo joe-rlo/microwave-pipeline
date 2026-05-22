@@ -100,15 +100,18 @@ class TestToolsPassthrough:
     def test_no_tools_when_no_keys(self, monkeypatch):
         monkeypatch.setenv("LLM_STAGE_MAIN", "near:m")
         monkeypatch.setenv("NEAR_API_KEY", "k")
+        # Disable always-on web tools so this assertion isolates to
+        # instacart/github wiring.
+        monkeypatch.setenv("WEB_TOOLS_DISABLED", "1")
         config = _make_config()  # neither instacart nor github
         llm = build_main_llm(config)
-        # No tool defs registered on the session
         assert llm._tools == []
         assert llm._tool_handlers == {}
 
     def test_github_tools_registered_on_session(self, monkeypatch):
         monkeypatch.setenv("LLM_STAGE_MAIN", "near:m")
         monkeypatch.setenv("NEAR_API_KEY", "k")
+        monkeypatch.setenv("WEB_TOOLS_DISABLED", "1")
         config = _make_config(github_token="ghp_fake")
         llm = build_main_llm(config)
         # Three github tools should land on the session
@@ -119,6 +122,17 @@ class TestToolsPassthrough:
             "github_recent_activity",
         ])
         assert set(llm._tool_handlers.keys()) == set(names)
+
+    def test_webfetch_registered_by_default(self, monkeypatch):
+        # Without WEB_TOOLS_DISABLED, webfetch appears on the NEAR path
+        # automatically — no env key required.
+        monkeypatch.setenv("LLM_STAGE_MAIN", "near:m")
+        monkeypatch.setenv("NEAR_API_KEY", "k")
+        monkeypatch.delenv("WEB_TOOLS_DISABLED", raising=False)
+        config = _make_config()
+        llm = build_main_llm(config)
+        names = [td.name for td in llm._tools]
+        assert "webfetch" in names
 
     def test_builtin_tools_warn_on_near_path(self, monkeypatch, caplog):
         # BOT_BUILTIN_TOOLS is an SDK-only feature. When set alongside

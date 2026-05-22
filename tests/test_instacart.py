@@ -262,7 +262,10 @@ class TestToolHandler:
 
 
 class TestRegistry:
-    def test_no_key_means_empty_bundle(self):
+    def test_no_key_means_empty_bundle(self, monkeypatch):
+        # Disable always-on web tools so the registry assertion isolates
+        # to instacart behavior.
+        monkeypatch.setenv("WEB_TOOLS_DISABLED", "1")
         from src.tools import build_tools
 
         config = SimpleNamespace(instacart_api_key="")
