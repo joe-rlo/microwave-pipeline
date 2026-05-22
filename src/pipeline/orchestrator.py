@@ -5,6 +5,7 @@ This is the core cognitive loop of MicrowaveOS.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from datetime import datetime
@@ -121,10 +122,13 @@ class Orchestrator:
         )
         self.session_engine.connect()
 
-        # Breadcrumb table lives alongside `turns` on the same connection.
-        # Init is idempotent; cheap to run on every startup.
+        # Breadcrumb + consolidation tables live alongside `turns` on
+        # the same connection. Init is idempotent; cheap to run on
+        # every startup.
         from src.memory.breadcrumbs import ToolCallCounter, init_tables as init_breadcrumbs_tables
+        from src.memory.consolidation import init_tables as init_consolidation_tables
         init_breadcrumbs_tables(self.session_engine.conn)
+        init_consolidation_tables(self.session_engine.conn)
         # Per-process tool-call counter. Cleared on `new_session()`.
         self._tool_call_counter = ToolCallCounter()
         # Snapshot of cumulative tool calls in the current session — fed
@@ -227,6 +231,24 @@ class Orchestrator:
         # summary, which is close enough — the prior session's actual
         # `started` was lost across the previous shutdown.
         self._session_started_at = datetime.now()
+
+        # Phase F.3 — startup catchup for memory consolidation. If the
+        # last run was >24h ago (or never), kick off a background task
+        # so the bot's first-message latency isn't gated on a multi-
+        # second Extract → Link → Brief sequence. Failures inside the
+        # catchup are logged but don't bubble up.
+        try:
+            from src.memory.consolidation import run_catchup_if_due
+            asyncio.create_task(
+                run_catchup_if_due(
+                    conn=self.session_engine.conn,
+                    config=self.config,
+                    interval_hours=24,
+                ),
+                name="consolidation-catchup",
+            )
+        except Exception as e:
+            log.warning("Could not schedule consolidation catchup: %s", e)
 
     async def process(
         self,

@@ -17,6 +17,11 @@ from src.memory.consolidation.pipeline import (
     ConsolidationResult,
     run_consolidation,
 )
+from src.memory.consolidation.scheduler import (
+    run_catchup_if_due,
+    should_run,
+    touch_marker,
+)
 from src.memory.consolidation.schema import (
     EDGE_RELATIONS,
     FACT_TYPES,
@@ -35,7 +40,10 @@ __all__ = [
     "PendingContradiction",
     "init_tables",
     "run_brief",
+    "run_catchup_if_due",
     "run_consolidation",
     "run_extract",
     "run_link",
+    "should_run",
+    "touch_marker",
 ]
