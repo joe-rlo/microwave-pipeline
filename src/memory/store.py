@@ -44,6 +44,7 @@ class MemoryStore:
         self.workspace_dir = workspace_dir
         self.identity_path = workspace_dir / "IDENTITY.md"
         self.memory_path = workspace_dir / "MEMORY.md"
+        self.todo_path = workspace_dir / "TODO.md"
         self.daily_dir = workspace_dir / "memory"
 
     @property
@@ -90,6 +91,68 @@ class MemoryStore:
         existing = self.load_memory()
         separator = "\n\n" if existing.strip() else ""
         self.memory_path.write_text(existing + separator + fact.strip() + "\n")
+
+    # --- Open tasks (TODO.md) ---
+
+    def load_todo_open_items(self) -> str:
+        """Return just the open `[ ]` items from TODO.md, grouped by section.
+
+        We deliberately don't load the whole file:
+        - The `Done (recent)` section is dead weight in the prompt — the
+          model doesn't need to remember what's already shipped.
+        - Checked items (`[x]`) are filtered out for the same reason.
+        - Section headings (`## ...`) are kept so the model sees the
+          rough buckets (MicrowaveOS / Blog / Personal) and can route
+          surfacing decisions accordingly.
+
+        Returns "" when TODO.md is missing or has no open items, so the
+        caller can skip injecting an empty block.
+        """
+        if not self.todo_path.exists():
+            return ""
+
+        try:
+            text = self.todo_path.read_text(encoding="utf-8")
+        except Exception as e:
+            log.warning(f"Could not read TODO.md: {e}")
+            return ""
+
+        out_lines: list[str] = []
+        current_section: str | None = None
+        current_section_emitted = False
+
+        for raw_line in text.splitlines():
+            line = raw_line.rstrip()
+
+            # Stop at the "Done (recent)" section — everything below it
+            # is archive, not pending work. Match liberally on the heading
+            # text so a user-renamed Done section ("## Done", "## Shipped",
+            # "## Recently done") all terminate parsing the same way.
+            if line.startswith("## ") and "done" in line.lower():
+                break
+
+            # Section heading — remember it but don't emit until we know
+            # there's at least one open item under it (avoid empty headers).
+            if line.startswith("## "):
+                current_section = line
+                current_section_emitted = False
+                continue
+
+            # Open task: `- [ ] ...` or `* [ ] ...` (with optional indent)
+            stripped = line.lstrip()
+            if stripped.startswith(("- [ ]", "* [ ]")):
+                if current_section and not current_section_emitted:
+                    if out_lines:
+                        out_lines.append("")  # blank line between sections
+                    out_lines.append(current_section)
+                    current_section_emitted = True
+                out_lines.append(line)
+                continue
+
+            # Checked items, comments, and prose are all skipped — the
+            # model only needs the actionable list.
+
+        return "\n".join(out_lines).strip()
 
     # --- Daily notes ---
 
@@ -215,7 +278,7 @@ class MemoryStore:
         channel: str | None = None,
         bible_path=None,
     ) -> str:
-        """Build the stable system prompt from identity + channel rules + memory + bible.
+        """Build the stable system prompt from identity + channel rules + memory + open todos + bible.
 
         When `bible_path` is provided and points to an existing file, the
         active project's BIBLE.md is appended as a labeled section. That
@@ -250,6 +313,25 @@ class MemoryStore:
         if memory:
             sections.append(f"[Long-term memory]\n{memory}")
 
+        # Open tasks. Visible to every turn but with a behavioral guard
+        # so Microwave doesn't nag about them every reply — surfacing
+        # is reserved for daily briefings or when a task is genuinely
+        # relevant to what the user just asked.
+        todo_open = self.load_todo_open_items()
+        if todo_open:
+            sections.append(
+                "[Open tasks — from TODO.md]\n"
+                f"{todo_open}\n\n"
+                "Surfacing rules:\n"
+                "- Don't mention these unprompted in normal chat. They're context, "
+                "not a checklist to read at the user.\n"
+                "- DO surface them when generating a daily briefing or morning report.\n"
+                "- DO surface a specific task if the user asks something that's "
+                "directly blocked by it (e.g. they ask about Instacart while the "
+                "API key is still pending).\n"
+                "- Never volunteer the full list. One nudge max per turn."
+            )
+
         # Daily notes intentionally NOT concatenated here — see
         # docstring. They're indexed via _index_workspace and surface
         # through the search pipeline per turn when relevant. Keeps
@@ -283,7 +365,7 @@ class MemoryStore:
         so a daily-note write shouldn't trigger an LLM reconnect.
         """
         mtimes = []
-        for path in [self.identity_path, self.memory_path]:
+        for path in [self.identity_path, self.memory_path, self.todo_path]:
             if path.exists():
                 mtimes.append(path.stat().st_mtime)
         # Channel config
