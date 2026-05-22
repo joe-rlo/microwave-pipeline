@@ -489,21 +489,49 @@ class Orchestrator:
         output_dir = self.config.output_dir
         pre_files = _snapshot_dir(output_dir)
 
-        # Escalate to Opus+thinking for complex tasks
+        # PHI turns route through a separate BAA-covered LLM (AWS
+        # Bedrock + Anthropic) built per-turn, so PHI history stays
+        # isolated from the main pipeline's session. Non-PHI turns
+        # use self.llm as before.
+        baa_llm = None
+        if h_route.use_baa_llm:
+            from src.llm.factory import build_baa_llm
+            baa_llm = build_baa_llm(self.config)
+            if baa_llm is None:
+                # phi_path_available passed earlier but provider construction
+                # failed (e.g., AWS_REGION missing) — surface as a route
+                # downgrade rather than crashing the turn.
+                log.error(
+                    "BAA LLM construction failed mid-turn; sending decline_phi"
+                )
+                yield {"type": "delta", "text": DECLINE_PHI_MESSAGE}
+                yield {"type": "result", "text": DECLINE_PHI_MESSAGE}
+                return
+            await baa_llm.connect(assembly_result.stable_prompt)
+        active_llm = baa_llm if baa_llm is not None else self.llm
+
+        # Escalate to Opus+thinking for complex tasks. On the BAA path
+        # the escalation target is the health-specific opus model id
+        # (config.health.baa_model_escalation) rather than the main one.
         escalated = triage_result.complexity == "complex"
         if escalated:
+            esc_model = (
+                self.config.health.baa_model_escalation
+                if baa_llm is not None
+                else self.config.model_escalation
+            )
             log.info(
-                f"Escalating to {self.config.model_escalation} "
+                f"Escalating to {esc_model} "
                 f"(effort={self.config.escalation_effort}) for complex task"
             )
-            await self.llm.escalate(
-                model=self.config.model_escalation,
+            await active_llm.escalate(
+                model=esc_model,
                 effort=self.config.escalation_effort,
             )
 
         full_response = ""
         try:
-            async for chunk in self.llm.send(
+            async for chunk in active_llm.send(
                 message,
                 memory_context=assembly_result.memory_context or None,
                 images=images,
@@ -516,7 +544,11 @@ class Orchestrator:
                     full_response = chunk.get("text", full_response)
         finally:
             if escalated:
-                await self.llm.de_escalate()
+                await active_llm.de_escalate()
+            if baa_llm is not None:
+                # Per-turn lifecycle: tear down so PHI history doesn't
+                # leak into the next turn's session.
+                await baa_llm.disconnect()
 
         # --- Stage 4: Reflection ---
         # Route by triage complexity to avoid burning a Haiku round-trip

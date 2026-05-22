@@ -134,6 +134,103 @@ class TestToolsPassthrough:
         names = [td.name for td in llm._tools]
         assert "webfetch" in names
 
+
+# --- build_baa_llm (Phase D.2) ---
+
+
+from src.health.config import HealthConfig
+from src.llm.factory import build_baa_llm
+from src.llm.session import LLMSession
+
+
+def _make_health_baa_config(**overrides) -> HealthConfig:
+    """HealthConfig with the BAA path fully populated."""
+    defaults = {
+        "enabled": True,
+        "baa_provider": "bedrock",
+        "baa_model_main": "anthropic.claude-sonnet-4-x",
+        "baa_model_escalation": "anthropic.claude-opus-4-x",
+    }
+    defaults.update(overrides)
+    return HealthConfig(**defaults)
+
+
+class TestBuildBaaLlm:
+    def test_returns_none_when_health_module_disabled(self, monkeypatch):
+        monkeypatch.setenv("AWS_REGION", "us-east-1")
+        config = _make_config()
+        config.health = HealthConfig(enabled=False)
+        assert build_baa_llm(config) is None
+
+    def test_returns_none_when_baa_provider_is_none(self, monkeypatch):
+        monkeypatch.setenv("AWS_REGION", "us-east-1")
+        config = _make_config()
+        config.health = HealthConfig(
+            enabled=True, baa_provider="none", baa_model_main="x"
+        )
+        assert build_baa_llm(config) is None
+
+    def test_returns_none_when_no_model_main(self, monkeypatch):
+        monkeypatch.setenv("AWS_REGION", "us-east-1")
+        config = _make_config()
+        config.health = HealthConfig(
+            enabled=True, baa_provider="bedrock", baa_model_main=""
+        )
+        # phi_path_available is False when baa_model_main is empty
+        assert build_baa_llm(config) is None
+
+    def test_returns_none_when_aws_region_missing(self, monkeypatch, caplog):
+        monkeypatch.delenv("AWS_REGION", raising=False)
+        config = _make_config()
+        config.health = _make_health_baa_config()
+        with caplog.at_level("ERROR"):
+            result = build_baa_llm(config)
+        assert result is None
+        assert any("AWS_REGION" in r.message for r in caplog.records)
+
+    def test_returns_none_for_unsupported_baa_provider(
+        self, monkeypatch, caplog
+    ):
+        monkeypatch.setenv("AWS_REGION", "us-east-1")
+        config = _make_config()
+        # vertex isn't wired in D.1 — should warn and return None
+        config.health = HealthConfig(
+            enabled=True, baa_provider="vertex", baa_model_main="x",
+        )
+        with caplog.at_level("WARNING"):
+            result = build_baa_llm(config)
+        assert result is None
+        assert any("vertex" in r.message for r in caplog.records)
+
+    def test_returns_llmsession_when_fully_configured(self, monkeypatch):
+        monkeypatch.setenv("AWS_REGION", "us-east-1")
+        config = _make_config()
+        config.health = _make_health_baa_config()
+
+        # Inject a fake bedrock client via the provider's `client` arg
+        # would require patching boto3.client at the import site; simpler
+        # is to confirm the factory returns an LLMSession with the
+        # right model + no tools, and trust the provider's own tests.
+        # We monkeypatch boto3 import to avoid the real dependency.
+        from src.llm.providers import bedrock as bedrock_mod
+
+        # Build a placeholder boto3 module so BedrockProvider's lazy
+        # import succeeds even though the real boto3 isn't installed.
+        class _StubBoto3:
+            @staticmethod
+            def client(name, **kwargs):
+                return object()  # never called in this test
+
+        import sys
+        monkeypatch.setitem(sys.modules, "boto3", _StubBoto3)
+
+        llm = build_baa_llm(config)
+        assert isinstance(llm, LLMSession)
+        assert llm.model == "anthropic.claude-sonnet-4-x"
+        # No tools wired on the BAA path
+        assert llm._tools == []
+        assert llm._tool_handlers == {}
+
     def test_builtin_tools_warn_on_near_path(self, monkeypatch, caplog):
         # BOT_BUILTIN_TOOLS is an SDK-only feature. When set alongside
         # the NEAR path, the factory should warn loudly so the user

@@ -80,6 +80,61 @@ def _build_legacy_client(config: Any):
     )
 
 
+def build_baa_llm(config: Any):
+    """Construct the BAA LLM for the health PHI route, or return None.
+
+    Returns an `LLMSession` backed by `BedrockProvider` when the health
+    module is enabled, `HEALTH_BAA_PROVIDER=bedrock`, AWS credentials
+    are present in env, and the BAA model IDs are configured. Returns
+    None in any other case — the router uses `decline_phi` instead.
+
+    No tools are wired on the BAA path. PHI responses are
+    evidence-grounded via the spliced `[Evidence context]` block + the
+    `health-qa` skill body. Cross-tool calls aren't part of the spec
+    (and webfetch / instacart / github don't need to see PHI prompts).
+
+    Lifecycle is per-turn (the orchestrator constructs, connects,
+    sends, disconnects). That keeps PHI history isolated from the main
+    pipeline's session — the privacy-correct default. Long-running
+    BAA conversations across many turns are out of scope; the Health
+    Profile system (future spec) handles cross-turn structured PHI
+    via a different mechanism.
+    """
+    health = getattr(config, "health", None)
+    if health is None or not health.phi_path_available:
+        return None
+    if health.baa_provider != "bedrock":
+        log.warning(
+            "BAA provider %r not supported yet; only 'bedrock' is wired",
+            health.baa_provider,
+        )
+        return None
+
+    region = os.environ.get("AWS_REGION", "").strip()
+    if not region:
+        log.error(
+            "Health PHI route configured but AWS_REGION is not set; "
+            "router will fall back to decline_phi"
+        )
+        return None
+
+    from src.llm.providers.bedrock import BedrockProvider
+    from src.llm.session import LLMSession
+
+    try:
+        provider = BedrockProvider(region=region)
+    except RuntimeError as e:
+        log.error("Failed to construct BedrockProvider: %s", e)
+        return None
+
+    return LLMSession(
+        model=health.baa_model_main,
+        provider=provider,
+        tools=[],
+        tool_handlers={},
+    )
+
+
 def _build_near_session(config: Any, model_override: str):
     """Construct an LLMSession backed by NEAR.
 
