@@ -121,6 +121,20 @@ class Orchestrator:
         )
         self.session_engine.connect()
 
+        # Breadcrumb table lives alongside `turns` on the same connection.
+        # Init is idempotent; cheap to run on every startup.
+        from src.memory.breadcrumbs import ToolCallCounter, init_tables as init_breadcrumbs_tables
+        init_breadcrumbs_tables(self.session_engine.conn)
+        # Per-process tool-call counter. Cleared on `new_session()`.
+        self._tool_call_counter = ToolCallCounter()
+        # Snapshot of cumulative tool calls in the current session — fed
+        # into breadcrumbs as `tool_call_count`.
+        self._session_tool_calls = 0
+        # Set to True when the counter signals an auto_interval breadcrumb
+        # is due. The flag is consumed at end-of-turn so the breadcrumb
+        # never interrupts the user-visible stream.
+        self._breadcrumb_due = False
+
         # Memory searcher — wired to session engine so it can also pull
         # matching turns from recent conversation as a second retrieval path.
         self.searcher = MemorySearcher(self.memory_index, embedder, self.session_engine)
@@ -542,6 +556,17 @@ class Orchestrator:
                     yield chunk
                 elif chunk["type"] == "result":
                     full_response = chunk.get("text", full_response)
+                elif chunk["type"] == "tool_use":
+                    # Track every tool call for the auto-interval breadcrumb.
+                    # Don't fire mid-stream — defer until the turn lands so
+                    # breadcrumbs never interrupt the user-visible response.
+                    self._session_tool_calls += 1
+                    self._tool_call_counter.note_tool_name(
+                        chunk.get("name", "")
+                    )
+                    if self._tool_call_counter.record_tool_call():
+                        self._breadcrumb_due = True
+                    yield chunk
         finally:
             if escalated:
                 await active_llm.de_escalate()
@@ -741,6 +766,13 @@ class Orchestrator:
                 except Exception as e:
                     log.warning(f"Memory re-index after write-back failed: {e}")
 
+        # Auto-interval breadcrumb — fires when the per-process counter
+        # hit its threshold during this turn. Deferred from mid-stream
+        # so it never interrupts the user-visible response.
+        if self._breadcrumb_due:
+            self._breadcrumb_due = False
+            self._write_breadcrumb("auto_interval")
+
         # Check for compaction — yield any events it produces so the channel
         # can surface them (the user deserves to know their context was reset).
         if self.session_engine.needs_compaction(self._session_id):
@@ -822,6 +854,11 @@ class Orchestrator:
         can recover it across sessions.
         """
         from src.llm.client import SingleTurnClient
+
+        # Pre-compaction breadcrumb — discipline paper § 5.1's strongest
+        # finding (100% capture rate). Fires before any heavy work so
+        # even if compaction itself fails the breadcrumb has landed.
+        self._write_breadcrumb("pre_compaction")
 
         # Importance-aware split: substantive turns (complex triage or
         # high reflection confidence) stay verbatim past the rollup
@@ -1161,6 +1198,48 @@ class Orchestrator:
         """Return aggregated pipeline stats for recent assistant turns."""
         return self.session_engine.get_recent_stats(channel, user_id, limit)
 
+    def _write_breadcrumb(self, trigger: str) -> None:
+        """Persist a breadcrumb capturing current execution state.
+
+        Called from three hook points:
+          - top of `_compact()` for `pre_compaction`
+          - top of `new_session()` for `pre_reset`
+          - end-of-turn in `process()` for `auto_interval`
+
+        Never raises. Counter / session-state issues are logged; a
+        breadcrumb failure must not break the user-visible turn.
+        """
+        if self.session_engine is None or self.session_engine.conn is None:
+            log.debug("Breadcrumb skipped (session engine not connected)")
+            return
+        try:
+            from src.memory.breadcrumbs import write_breadcrumb
+            # Inline COUNT to avoid adding a method to SessionEngine for
+            # something only the breadcrumb path needs.
+            turn_count = 0
+            if self._session_id:
+                rows = list(self.session_engine.conn.execute(
+                    "SELECT COUNT(*) AS n FROM turns WHERE session_id = ?",
+                    (self._session_id,),
+                ))
+                turn_count = int(rows[0]["n"]) if rows else 0
+            write_breadcrumb(
+                self.session_engine.conn,
+                trigger=trigger,
+                session_key=self._session_id or "unknown",
+                turn_count=turn_count,
+                tool_call_count=self._session_tool_calls,
+                recent_tools=self._tool_call_counter.recent_tools,
+                active_project=(
+                    self._active_project.name if self._active_project else None
+                ),
+                active_skill=(
+                    self._active_skill.name if self._active_skill else None
+                ),
+            )
+        except Exception as e:
+            log.warning("Breadcrumb (%s) failed: %s", trigger, e)
+
     async def new_session(self) -> str:
         """Start a completely fresh session. Returns the new session ID.
 
@@ -1172,6 +1251,10 @@ class Orchestrator:
         what lets the next session retrieve "what we were just doing"
         without replaying the full transcript.
         """
+        # Pre-reset breadcrumb — captures execution state before the
+        # context is destroyed. Runs *before* the close hook so a Sonnet
+        # failure in the summary path doesn't prevent the breadcrumb.
+        self._write_breadcrumb("pre_reset")
         await self._close_session()
 
         self._session_id = self.session_engine.new_session_id()
@@ -1182,6 +1265,10 @@ class Orchestrator:
         # the start time. Next process() call surfaces recent sessions.
         self._session_started_at = datetime.now()
         self._first_turn_pending = True
+        # Reset tool-call counter so the new session doesn't inherit the
+        # old one's breadcrumb cadence.
+        self._tool_call_counter.reset()
+        self._session_tool_calls = 0
         log.info(f"Fresh session started: {self._session_id}")
         return self._session_id
 
