@@ -1,29 +1,57 @@
-"""Agent SDK tool registry.
+"""Tool registry — dual-shape during the SDK-to-provider migration.
 
-This is the layer where we cross from "MicrowaveOS owns the data" to
-"the LLM can take an action." Each module here exposes one or more
-`SdkMcpTool` objects (created via `claude_agent_sdk.tool`) that the
-LLM can invoke during a turn.
+Two surfaces live here in parallel during Phase C:
 
-The registry pattern keeps tool wiring out of the orchestrator: the
-orchestrator asks `build_mcp_servers(config)` and gets back a dict of
-named MCP server configs ready to pass into `ClaudeAgentOptions`,
-plus an `allowed_tools` list of fully-qualified tool names.
+1. **Agent SDK shape** (`build_tools(config) -> ToolBundle`) — the
+   pre-existing path. Returns `SdkMcpTool` objects bundled into an
+   in-process MCP server the SDK can mount. Used by `src/llm/client.py`'s
+   Max-auth path.
 
-Naming convention. The Agent SDK exposes in-process tools as
-`mcp__<server-name>__<tool-name>`. We use a single server named
-`microwave` so all tools land at `mcp__microwave__<tool-name>`. One
-server is enough until we want per-domain sandboxing (e.g. revoking
-just file-system tools).
+2. **Provider shape** (`build_provider_tools(config) -> list[ProviderTool]`)
+   — the Phase C path. Returns plain (`ToolDefinition`, `handler`) pairs
+   for `src/llm/session.py`'s tool loop. Same JSON schemas, same
+   underlying handlers — just unwrapped from the SDK envelope.
+
+The provider-shape handlers raise exceptions on tool errors instead
+of returning `{"is_error": True}` dicts; the session's loop catches
+those and reports `is_error=True` to the model. Same semantics, less
+ceremony.
+
+Naming convention (SDK shape only). The Agent SDK exposes in-process
+tools as `mcp__<server-name>__<tool-name>`. We use one server named
+`microwave` so all SDK tools land at `mcp__microwave__<tool-name>`.
+The provider shape uses bare names — `instacart_create_cart`, not
+`mcp__microwave__instacart_create_cart`. That's because the provider
+itself doesn't know about MCP — it talks to the model in OpenAI /
+Anthropic native shape, where tool names are unqualified.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Awaitable, Callable
+
+from src.llm.provider import ToolDefinition
 
 log = logging.getLogger(__name__)
+
+
+# Provider-shape handler: async (args) -> response text. Raises on error.
+ProviderToolHandler = Callable[[dict[str, Any]], Awaitable[str]]
+
+
+@dataclass
+class ProviderTool:
+    """One tool, in the provider abstraction's shape.
+
+    `definition` is what the provider sends to the model so it knows
+    the tool exists. `handler` is what we run when the model calls it.
+    """
+
+    definition: ToolDefinition
+    handler: ProviderToolHandler
 
 
 # Single in-process MCP server name. Tools are exposed as
@@ -120,3 +148,134 @@ def _qualified_name(sdk_tool) -> str:
         # practice, but better than crashing the orchestrator.
         bare = getattr(sdk_tool, "__name__", "unknown")
     return f"mcp__{MCP_SERVER_NAME}__{bare}"
+
+
+# === Provider-shape registry ================================================
+#
+# Returns the same logical tools as build_tools() but in the shape
+# LLMSession's tool loop consumes: (ToolDefinition, async handler).
+# This is the Phase C path; build_tools() above stays for the Agent
+# SDK path until C.4 drops it entirely.
+
+
+def build_provider_tools(config) -> list[ProviderTool]:
+    """Build (ToolDefinition, handler) pairs from configured tools."""
+    out: list[ProviderTool] = []
+
+    # --- Instacart ---
+    if getattr(config, "instacart_api_key", ""):
+        from src.tools import instacart as instacart_mod
+
+        out.append(
+            ProviderTool(
+                definition=ToolDefinition(
+                    name="instacart_create_cart",
+                    description=(
+                        "Build a Shop with Instacart cart from a list of "
+                        "items and return a checkout URL."
+                    ),
+                    input_schema=instacart_mod.INSTACART_CREATE_CART_SCHEMA,
+                ),
+                handler=_instacart_handler(config),
+            )
+        )
+
+    # --- GitHub ---
+    if getattr(config, "github_token", ""):
+        from src.tools import github as github_mod
+
+        token = config.github_token
+        out.append(
+            ProviderTool(
+                definition=ToolDefinition(
+                    name="github_list_repos",
+                    description=(
+                        "List GitHub repos visible to the authenticated user."
+                    ),
+                    input_schema=github_mod.LIST_REPOS_SCHEMA,
+                ),
+                handler=_github_handler(github_mod._handle_list_repos, token),
+            )
+        )
+        out.append(
+            ProviderTool(
+                definition=ToolDefinition(
+                    name="github_repo_summary",
+                    description=(
+                        "Get a composite snapshot of one GitHub repo "
+                        "(metadata + README + commits + PRs/issues + langs)."
+                    ),
+                    input_schema=github_mod.REPO_SUMMARY_SCHEMA,
+                ),
+                handler=_github_handler(github_mod._handle_repo_summary, token),
+            )
+        )
+        out.append(
+            ProviderTool(
+                definition=ToolDefinition(
+                    name="github_recent_activity",
+                    description=(
+                        "Recent push/PR/issue/release events for the "
+                        "authenticated user across all repos."
+                    ),
+                    input_schema=github_mod.RECENT_ACTIVITY_SCHEMA,
+                ),
+                handler=_github_handler(github_mod._handle_recent_activity, token),
+            )
+        )
+
+    return out
+
+
+def _instacart_handler(config) -> ProviderToolHandler:
+    """Wrap the existing instacart `_handle_create_cart` for provider shape."""
+    from src.tools.instacart import _handle_create_cart
+
+    api_key = config.instacart_api_key
+    linkback = getattr(config, "instacart_partner_linkback_url", "") or None
+
+    async def call(args: dict[str, Any]) -> str:
+        mcp_result = await _handle_create_cart(args, api_key, linkback)
+        return _unwrap_mcp_result(mcp_result, tool_name="instacart_create_cart")
+
+    return call
+
+
+def _github_handler(
+    underlying: Callable[[dict[str, Any], str], Awaitable[dict[str, Any]]],
+    token: str,
+) -> ProviderToolHandler:
+    """Wrap a github `_handle_*` so its (args, token) -> mcp-dict shape
+    looks like the provider's (args) -> str."""
+
+    async def call(args: dict[str, Any]) -> str:
+        mcp_result = await underlying(args, token)
+        return _unwrap_mcp_result(mcp_result, tool_name=underlying.__name__)
+
+    return call
+
+
+def _unwrap_mcp_result(mcp_result: dict[str, Any], *, tool_name: str) -> str:
+    """Turn an MCP-shaped tool response into a plain string.
+
+    MCP shape:
+      success: {"content": [{"type": "text", "text": <json or message>}]}
+      error:   {"content": [{"type": "text", "text": <message>}], "is_error": True}
+
+    For errors we raise — the LLMSession's tool loop catches and reports
+    `is_error=True` to the model. For success we return the text payload
+    verbatim (already JSON-encoded when the tool wanted to return
+    structured data, which the model parses on the other side).
+    """
+    content = mcp_result.get("content") or []
+    text_parts = [
+        block.get("text", "")
+        for block in content
+        if isinstance(block, dict) and block.get("type") == "text"
+    ]
+    text = "\n".join(t for t in text_parts if t)
+
+    if mcp_result.get("is_error"):
+        raise RuntimeError(text or f"Tool {tool_name!r} returned an error")
+
+    return text

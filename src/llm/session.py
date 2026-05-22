@@ -5,10 +5,7 @@ SDK's `ClaudeSDKClient` — system-prompt-once, then a sequence of
 turns with growing history. NEAR / Anthropic / OpenAI all support
 this natively via stateless HTTP + we-send-the-history-each-call.
 
-What this DOES NOT do (yet — Phase C.2 / C.3):
-- Tool use. Phase C.1 streams plain text only. `tool_loop.py` (next
-  commit) will wrap this session to handle tool_use / tool_result
-  round-trips before the user sees the final response.
+What this DOES NOT do (yet — Phase C.3 / C.4):
 - Anthropic direct (not via NEAR). For Phase C only the NEAR provider
   is wired; Anthropic Direct is a future provider option.
 - Multimodal. The orchestrator passes images through `send(images=...)`;
@@ -33,21 +30,39 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import AsyncIterator
+from typing import Any, AsyncIterator, Awaitable, Callable
 
 from src.llm.provider import (
+    ContentBlock,
     Done,
     Error,
     LLMProvider,
     ProviderMessage,
     ProviderRequest,
     TextDelta,
+    ToolDefinition,
+    ToolResult,
+    ToolUse,
+    ToolUseEnd,
     ToolUseStart,
     Usage,
 )
 from src.llm.providers.near import NEARProvider
 
 log = logging.getLogger(__name__)
+
+
+# A tool handler is an async function: arguments dict → result string.
+# Errors should be raised; the loop converts them into is_error=True
+# ToolResult blocks so the model can recover gracefully.
+ToolHandler = Callable[[dict[str, Any]], Awaitable[str]]
+
+
+# Cap on how many tool-use rounds the model can chain in a single send().
+# 8 is a sensible default — Anthropic's own docs suggest most legitimate
+# workflows complete in 2–4 rounds; 8 leaves headroom for adversarial
+# patterns while preventing infinite loops on a broken tool.
+DEFAULT_MAX_TOOL_ITERATIONS = 8
 
 
 class LLMSession:
@@ -83,16 +98,36 @@ class LLMSession:
         model: str,
         provider: LLMProvider | None = None,
         max_tokens: int = 8192,
+        tools: list[ToolDefinition] | None = None,
+        tool_handlers: dict[str, ToolHandler] | None = None,
+        max_tool_iterations: int = DEFAULT_MAX_TOOL_ITERATIONS,
     ):
         """Build a session.
 
         `provider` is injected for tests. Production uses the env-driven
         factory at module bottom: `build_default_session()`.
+
+        `tools` + `tool_handlers` enable tool use. They MUST agree on
+        names — every ToolDefinition.name needs a matching key in
+        tool_handlers, or the loop will surface a clear error to the
+        model when a call comes through.
         """
         self.model = model
         self._base_model = model
         self._provider = provider if provider is not None else _build_default_provider()
         self._max_tokens = max_tokens
+
+        self._tools = list(tools or [])
+        self._tool_handlers = dict(tool_handlers or {})
+        self._max_tool_iters = max_tool_iterations
+        # Cheap consistency check at construction so a typo doesn't
+        # surface only when the model first calls the tool.
+        for td in self._tools:
+            if td.name not in self._tool_handlers:
+                log.warning(
+                    "Tool %r has a definition but no handler — calls will fail",
+                    td.name,
+                )
 
         self._system_prompt: str | None = None
         self._history: list[ProviderMessage] = []
@@ -141,18 +176,26 @@ class LLMSession:
         memory_context: str | None = None,
         images: list[tuple[bytes, str]] | None = None,
     ) -> AsyncIterator[dict]:
-        """Stream a turn. Yields LLMClient-shape dict chunks.
+        """Stream a turn, running any tool-use rounds inline.
+
+        Yields LLMClient-shape dict chunks:
+          {"type": "delta",     "text": ...}        — streaming text
+          {"type": "tool_use",  "name": ...}        — visibility (typing)
+          {"type": "tool_result", "name": ...,
+           "is_error": bool}                        — tool finished
+          {"type": "result",    "text": <full>}    — final assembled
 
         Per-turn memory context is prepended to the user message (same
         as existing LLMClient behavior — see
-        src/llm/client.py line 215).
+        src/llm/client.py line 215). The tool loop runs internally:
+        when the model emits tool_use blocks, we run handlers, append
+        results to history, and continue streaming until the model
+        finishes with stop_reason="end_turn" (or hits the iteration cap).
         """
         if self._system_prompt is None:
             raise RuntimeError("LLMSession.send() called before connect()")
 
         if images:
-            # Phase C.1 limitation — flagged in module docstring. Log
-            # loudly so we don't silently drop images.
             log.warning(
                 "LLMSession received %d image(s); multimodal handling lands "
                 "in Phase C.4. Sending text-only for now.",
@@ -163,57 +206,124 @@ class LLMSession:
             f"[Relevant memory context]\n{memory_context}\n\n{user_message}"
             if memory_context else user_message
         )
-
         self._history.append(ProviderMessage(role="user", content=enriched))
 
-        req = ProviderRequest(
-            model=self.model,
-            system=self._system_prompt,
-            messages=list(self._history),
-            max_tokens=self._max_tokens,
-            thinking_budget=self._thinking_budget,
-            stream=True,
-            metadata={"stage": "main"},
-        )
-
         full_response_chunks: list[str] = []
-        error: Error | None = None
-        async for evt in self._provider.send(req):
-            if isinstance(evt, TextDelta):
-                full_response_chunks.append(evt.text)
-                yield {"type": "delta", "text": evt.text}
-            elif isinstance(evt, ToolUseStart):
-                # Visibility only at C.1 — tool calls don't actually
-                # round-trip until C.2's tool_loop wraps this method.
-                yield {"type": "tool_use", "name": evt.name}
-            elif isinstance(evt, Usage):
-                # Don't yield — usage isn't part of the LLMClient contract.
-                # Phase C.3 may wire this to telemetry; for now we drop it.
-                pass
-            elif isinstance(evt, Done):
-                # Provider's terminal event. We emit the orchestrator's
-                # `result` chunk below regardless of stop_reason.
-                pass
-            elif isinstance(evt, Error):
-                error = evt
+
+        for iteration in range(self._max_tool_iters):
+            # Per-iteration state: text and tool-use accumulators
+            iter_text_chunks: list[str] = []
+            tool_uses: list[ToolUse] = []
+            error: Error | None = None
+            stop_reason: str = "other"
+
+            req = ProviderRequest(
+                model=self.model,
+                system=self._system_prompt,
+                messages=list(self._history),
+                tools=list(self._tools),
+                max_tokens=self._max_tokens,
+                thinking_budget=self._thinking_budget,
+                stream=True,
+                metadata={"stage": "main", "iter": str(iteration)},
+            )
+
+            async for evt in self._provider.send(req):
+                if isinstance(evt, TextDelta):
+                    iter_text_chunks.append(evt.text)
+                    full_response_chunks.append(evt.text)
+                    yield {"type": "delta", "text": evt.text}
+                elif isinstance(evt, ToolUseStart):
+                    yield {"type": "tool_use", "name": evt.name}
+                elif isinstance(evt, ToolUseEnd):
+                    tool_uses.append(
+                        ToolUse(id=evt.id, name=evt.name, arguments=evt.arguments)
+                    )
+                elif isinstance(evt, Done):
+                    stop_reason = evt.stop_reason
+                elif isinstance(evt, Error):
+                    error = evt
+                # Usage / ThinkingDelta intentionally dropped — not in
+                # the LLMClient contract.
+
+            # If the stream errored before we got anything useful AND no
+            # tool calls landed, surface to the caller.
+            if error is not None and not iter_text_chunks and not tool_uses:
+                raise RuntimeError(
+                    f"LLMSession.send failed: {error.message} "
+                    f"(status={error.status}, retryable={error.retryable})"
+                )
+
+            # Append the assistant turn (text + tool_uses) to history so
+            # the next iteration sees it. Building the content list is
+            # subtle: assistant turns with tool_use must include the
+            # text + every tool_use as separate blocks, in order.
+            assistant_blocks: list[ContentBlock] = []
+            iter_text = "".join(iter_text_chunks)
+            if iter_text:
+                assistant_blocks.append(ContentBlock.of_text(iter_text))
+            for tu in tool_uses:
+                assistant_blocks.append(ContentBlock.of_tool_use(tu))
+
+            if assistant_blocks:
+                self._history.append(
+                    ProviderMessage(role="assistant", content=assistant_blocks)
+                )
+
+            # Done with no tool calls → conversation is over for this send()
+            if not tool_uses:
+                break
+
+            # Execute tools and stage the results for the next iteration.
+            # We run sequentially because most use cases only have one or
+            # two parallel calls per turn and concurrent execution would
+            # complicate handler error semantics. If a real workload needs
+            # parallelism, switch to asyncio.gather here.
+            result_blocks: list[ContentBlock] = []
+            for tu in tool_uses:
+                handler = self._tool_handlers.get(tu.name)
+                if handler is None:
+                    text = f"No handler registered for tool {tu.name!r}"
+                    is_error = True
+                    log.warning("Unhandled tool call: %s", tu.name)
+                else:
+                    try:
+                        text = await handler(tu.arguments)
+                        is_error = False
+                    except Exception as e:
+                        text = f"Tool {tu.name!r} raised: {e}"
+                        is_error = True
+                        log.warning("Tool %s raised: %s", tu.name, e)
+
+                result_blocks.append(
+                    ContentBlock.of_tool_result(
+                        ToolResult(
+                            tool_use_id=tu.id, content=text, is_error=is_error
+                        )
+                    )
+                )
+                yield {
+                    "type": "tool_result",
+                    "name": tu.name,
+                    "is_error": is_error,
+                }
+
+            # tool-role message carrying all results for this iteration
+            self._history.append(
+                ProviderMessage(role="tool", content=result_blocks)
+            )
+
+            # Continue to next iteration — model gets the tool results
+            # and decides what to say next.
+        else:
+            # for-else: loop exhausted without break (i.e. without an
+            # end_turn). The model kept calling tools past the cap.
+            log.warning(
+                "Tool loop hit max iterations (%d); ending conversation",
+                self._max_tool_iters,
+            )
 
         full_response = "".join(full_response_chunks)
-
-        if error is not None and not full_response:
-            # Stream produced nothing and reported an error — surface as
-            # exception so the orchestrator's try/finally can clean up.
-            raise RuntimeError(
-                f"LLMSession.send failed: {error.message} "
-                f"(status={error.status}, retryable={error.retryable})"
-            )
-
-        # Append assistant turn to history so the next send() sees it.
-        if full_response:
-            self._history.append(
-                ProviderMessage(role="assistant", content=full_response)
-            )
-
-        # Final marker — orchestrator keys on this.
         yield {"type": "result", "text": full_response}
 
     # --- Helpers for tests / introspection ---

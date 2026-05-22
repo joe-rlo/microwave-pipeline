@@ -27,6 +27,19 @@ from src.llm.provider import (
 from src.llm.session import LLMSession
 
 
+def _assistant_text(msg) -> str:
+    """Extract concatenated text from an assistant turn's block list.
+
+    After Phase C.2, assistant history entries hold a list of
+    ContentBlock so tool_use blocks can sit next to text blocks. Tests
+    that only care about the text use this helper instead of teaching
+    every assertion about the block shape.
+    """
+    if isinstance(msg.content, str):
+        return msg.content
+    return "".join(b.text or "" for b in msg.content if b.type == "text")
+
+
 class _ScriptedProvider:
     """A provider that returns a pre-baked stream and captures the
     most recent request. Used in place of NEARProvider for tests."""
@@ -213,9 +226,10 @@ class TestHistory:
         # First user message includes "q1"
         assert "q1" in session.history[0].content
         assert session.history[1].role == "assistant"
-        assert session.history[1].content == "r1"
+        # Assistant turns store as block lists (so tool_use can join text)
+        assert _assistant_text(session.history[1]) == "r1"
         assert "q2" in session.history[2].content
-        assert session.history[3].content == "r2"
+        assert _assistant_text(session.history[3]) == "r2"
 
     async def test_memory_context_prepended(self):
         provider = _ScriptedProvider([
@@ -358,3 +372,241 @@ class TestProviderFactory:
         # Construction shouldn't fail; we don't actually call send().
         session = LLMSession(model="m")
         assert session.model == "m"
+
+
+# --- Tool loop ---
+
+
+from src.llm.provider import ToolDefinition, ToolUseEnd
+
+
+def _tool_def(name: str = "echo", schema: dict | None = None) -> ToolDefinition:
+    return ToolDefinition(
+        name=name,
+        description=f"test tool {name}",
+        input_schema=schema or {
+            "type": "object",
+            "properties": {"text": {"type": "string"}},
+            "required": ["text"],
+        },
+    )
+
+
+@pytest.mark.asyncio
+class TestToolLoop:
+    async def test_single_tool_round_trip(self):
+        # Round 1: model calls tool. Round 2: model finishes.
+        provider = _ScriptedProvider([])
+        provider._queue = [
+            [
+                TextDelta(text="let me call "),
+                ToolUseStart(id="call_1", name="echo"),
+                ToolUseEnd(id="call_1", name="echo", arguments={"text": "x"}),
+                Done(stop_reason="tool_use"),
+            ],
+            [
+                TextDelta(text="tool said "),
+                TextDelta(text="ECHO:x"),
+                Done(stop_reason="end_turn"),
+            ],
+        ]
+
+        async def echo_handler(args: dict) -> str:
+            return f"ECHO:{args['text']}"
+
+        session = LLMSession(
+            model="m",
+            provider=provider,
+            tools=[_tool_def("echo")],
+            tool_handlers={"echo": echo_handler},
+        )
+        await session.connect("p")
+
+        chunks = [c async for c in session.send("please echo x")]
+
+        # Deltas from BOTH iterations are interleaved in user-visible order
+        delta_texts = [c["text"] for c in chunks if c["type"] == "delta"]
+        assert delta_texts == ["let me call ", "tool said ", "ECHO:x"]
+
+        # Tool use was visible
+        tool_use_chunks = [c for c in chunks if c["type"] == "tool_use"]
+        assert tool_use_chunks == [{"type": "tool_use", "name": "echo"}]
+
+        # Tool result visibility chunk emitted
+        result_chunks = [c for c in chunks if c["type"] == "tool_result"]
+        assert result_chunks == [
+            {"type": "tool_result", "name": "echo", "is_error": False}
+        ]
+
+        # Final result chunk contains the full assembled text
+        final = [c for c in chunks if c["type"] == "result"][0]
+        assert final["text"] == "let me call tool said ECHO:x"
+
+        # History after the round-trip: user, assistant(text+tool_use),
+        # tool(results), assistant(text)
+        assert len(session.history) == 4
+        assert session.history[0].role == "user"
+        assert session.history[1].role == "assistant"
+        assert session.history[2].role == "tool"
+        assert session.history[3].role == "assistant"
+
+    async def test_handler_exception_becomes_tool_error(self):
+        provider = _ScriptedProvider([])
+        provider._queue = [
+            [
+                ToolUseEnd(id="call_1", name="brokenly", arguments={}),
+                Done(stop_reason="tool_use"),
+            ],
+            [
+                TextDelta(text="I will report the failure"),
+                Done(stop_reason="end_turn"),
+            ],
+        ]
+
+        async def angry_handler(args: dict) -> str:
+            raise ValueError("nope")
+
+        session = LLMSession(
+            model="m",
+            provider=provider,
+            tools=[_tool_def("brokenly")],
+            tool_handlers={"brokenly": angry_handler},
+        )
+        await session.connect("p")
+
+        chunks = [c async for c in session.send("call it")]
+
+        result_chunks = [c for c in chunks if c["type"] == "tool_result"]
+        assert result_chunks == [
+            {"type": "tool_result", "name": "brokenly", "is_error": True}
+        ]
+        # The tool-result message in history must carry is_error=True so
+        # the model knows the call failed.
+        tool_msg = session.history[2]
+        assert tool_msg.role == "tool"
+        result_block = tool_msg.content[0]
+        assert result_block.tool_result.is_error is True
+        assert "nope" in result_block.tool_result.content
+
+    async def test_unknown_tool_call_surfaces_error(self):
+        # The model calls a tool that has a definition but no handler —
+        # the loop must NOT crash; it surfaces an is_error result so the
+        # model can recover.
+        provider = _ScriptedProvider([])
+        provider._queue = [
+            [
+                ToolUseEnd(id="call_1", name="missing", arguments={}),
+                Done(stop_reason="tool_use"),
+            ],
+            [
+                TextDelta(text="fallback"),
+                Done(stop_reason="end_turn"),
+            ],
+        ]
+
+        session = LLMSession(
+            model="m",
+            provider=provider,
+            tools=[_tool_def("missing")],
+            tool_handlers={},  # intentionally empty
+        )
+        await session.connect("p")
+
+        chunks = [c async for c in session.send("x")]
+        result_chunks = [c for c in chunks if c["type"] == "tool_result"]
+        assert result_chunks[0]["is_error"] is True
+
+    async def test_multiple_parallel_tool_calls_in_one_iteration(self):
+        provider = _ScriptedProvider([])
+        provider._queue = [
+            [
+                TextDelta(text="calling both"),
+                ToolUseEnd(id="call_1", name="alpha", arguments={"v": 1}),
+                ToolUseEnd(id="call_2", name="beta", arguments={"v": 2}),
+                Done(stop_reason="tool_use"),
+            ],
+            [
+                TextDelta(text="done"),
+                Done(stop_reason="end_turn"),
+            ],
+        ]
+
+        async def alpha(args):
+            return f"a={args['v']}"
+
+        async def beta(args):
+            return f"b={args['v']}"
+
+        session = LLMSession(
+            model="m",
+            provider=provider,
+            tools=[_tool_def("alpha"), _tool_def("beta")],
+            tool_handlers={"alpha": alpha, "beta": beta},
+        )
+        await session.connect("p")
+
+        chunks = [c async for c in session.send("x")]
+        # Both tool-result visibility chunks emitted
+        names = [c["name"] for c in chunks if c["type"] == "tool_result"]
+        assert names == ["alpha", "beta"]
+
+        # Tool-role message in history carries BOTH results
+        tool_msg = session.history[2]
+        assert tool_msg.role == "tool"
+        assert len(tool_msg.content) == 2
+        assert tool_msg.content[0].tool_result.content == "a=1"
+        assert tool_msg.content[1].tool_result.content == "b=2"
+
+    async def test_max_iters_cap_stops_runaway_loop(self):
+        # Model keeps calling tools forever. Cap stops it.
+        forever_round = [
+            ToolUseEnd(id="call_x", name="loop", arguments={}),
+            Done(stop_reason="tool_use"),
+        ]
+        provider = _ScriptedProvider([])
+        provider._queue = [list(forever_round) for _ in range(20)]
+
+        async def loop_handler(args):
+            return "again"
+
+        session = LLMSession(
+            model="m",
+            provider=provider,
+            tools=[_tool_def("loop")],
+            tool_handlers={"loop": loop_handler},
+            max_tool_iterations=3,
+        )
+        await session.connect("p")
+
+        chunks = [c async for c in session.send("go")]
+        # 3 iterations × 1 tool_result per iter = 3 result visibility chunks
+        result_chunks = [c for c in chunks if c["type"] == "tool_result"]
+        assert len(result_chunks) == 3
+        # Final result still emitted (orchestrator always expects one)
+        assert chunks[-1]["type"] == "result"
+
+    async def test_handler_with_no_text_response_is_legitimate(self):
+        # A tool that returns "" is a legitimate "no output, ran ok"
+        # outcome — must not be treated as an error.
+        provider = _ScriptedProvider([])
+        provider._queue = [
+            [
+                ToolUseEnd(id="call_1", name="quiet", arguments={}),
+                Done(stop_reason="tool_use"),
+            ],
+            [TextDelta(text="ok"), Done(stop_reason="end_turn")],
+        ]
+
+        async def quiet(args):
+            return ""
+
+        session = LLMSession(
+            model="m",
+            provider=provider,
+            tools=[_tool_def("quiet")],
+            tool_handlers={"quiet": quiet},
+        )
+        await session.connect("p")
+        chunks = [c async for c in session.send("x")]
+        result_chunks = [c for c in chunks if c["type"] == "tool_result"]
+        assert result_chunks[0]["is_error"] is False
