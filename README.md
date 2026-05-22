@@ -40,6 +40,7 @@ Edit `.env`:
 | `SCHEDULER_ENABLED` | No | `true` to run the scheduler alongside `--signal` |
 | `INSTACART_API_KEY` | No | Enables the `instacart_create_cart` tool (build Shop with Instacart links). Get a key at developer.instacart.com. |
 | `INSTACART_PARTNER_LINKBACK_URL` | No | Optional. Where Instacart sends the user after checkout. |
+| `GITHUB_TOKEN` | No | Fine-grained PAT. Registers read-only `github_list_repos`, `github_repo_summary`, `github_recent_activity` tools for "walk my repos and report" workflows. Scopes: Contents/Metadata/Pull requests/Issues — all Read. |
 | `BOT_BUILTIN_TOOLS` | No | Comma-separated list of Agent SDK built-in tools the bot may call (e.g. `WebFetch,WebSearch` or `Read,Write,Edit,Bash,WebFetch,WebSearch`). Empty = no built-ins. See [Built-in tools](#built-in-tools-read-write-bash-webfetch-websearch-) for the permission model. |
 | `HEALTH_MODULE_ENABLED` | No | `true` to turn on the [health module](#health-module--workspaceskillshealth-qa) (privacy-aware health Q&A with cited evidence). Off by default. |
 | `NCBI_API_KEY` | No | Optional. Raises PubMed E-utilities rate limit from ~3 req/s to ~10 req/s. Personal-use volume rarely needs it. |
@@ -272,7 +273,7 @@ microwaveos skills edit <name>            # opens in $EDITOR
 microwaveos skills remove <name>          # asks for confirmation
 ```
 
-Seed skills shipped with v1: `substack-writer`, `blog-writing`, `github-tool`, `novel-writing`, `screenplay-writing`.
+Seed skills shipped with v1: `substack-writer`, `blog-writing`, `github` (uses the read-only GitHub tools — see Tools below), `novel-writing`, `screenplay-writing`.
 
 **Adaptive activation.** Triage classifies every message and *also* picks a matching skill from your catalog. If you say "draft a Substack about NEAR's Q2 metrics," `substack-writer` auto-activates for that turn — no need to type `/skill`. Auto-match is per-turn and ephemeral; explicit `/skill <name>` always wins as a sticky pin. Triage uses the description field on each skill, so write descriptions that tell the LLM when *not* to match (the seed skills include "skip when X" guards). `/debug` shows whether a skill auto-matched.
 
@@ -744,6 +745,7 @@ Images and photos are received but not seen. The pipeline is text-only — there
 Microwave wires real Agent SDK tools through an in-process MCP server (`src/tools/`). Each tool self-registers based on whether its prerequisite env var is set — no key, no tool. Today's roster:
 
 - **`instacart_create_cart`** — build a Shop with Instacart cart and return a checkout URL. Activates when `INSTACART_API_KEY` is set. The seed `instacart` skill teaches the model when to call it (and when to ask first).
+- **`github_list_repos`** / **`github_repo_summary`** / **`github_recent_activity`** — read-only GitHub walker. Lists owned repos, fetches a composite snapshot (README excerpt + recent commits + open PRs/issues + languages) for one repo, and surfaces a cross-repo activity feed. Activates when `GITHUB_TOKEN` is set. The seed `github` skill auto-activates on phrasings like "walk my repos" or "what have I been working on." Goes straight to api.github.com via aiohttp — never touches your local `gh auth` state.
 
 Tools work in **Max auth mode only**. API-key mode currently falls back to text-only — adding tool-use there means managing the tool_use loop manually against the Messages API and isn't wired in yet.
 

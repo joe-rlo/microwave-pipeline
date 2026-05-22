@@ -55,6 +55,15 @@ class Config(BaseModel):
     # personal use can leave it blank).
     instacart_partner_linkback_url: str = ""
 
+    # GitHub fine-grained PAT (read-only is plenty). When set, three
+    # tools register: `github_list_repos`, `github_repo_summary`,
+    # `github_recent_activity`. The token goes straight to the GitHub
+    # REST API via aiohttp — we deliberately don't touch the user's
+    # local `gh auth` state so MicrowaveOS auth and personal CLI auth
+    # stay independent. Generate at github.com/settings/tokens?type=beta
+    # with Contents: Read, Metadata: Read, Pull requests: Read, Issues: Read.
+    github_token: str = ""
+
     # Built-in Agent SDK tools the bot is allowed to call during a turn.
     # Empty = no built-in tools (default — keeps the bot conversational
     # only). Non-empty = listed names are added to allowed_tools AND the
@@ -174,6 +183,7 @@ def load_config() -> Config:
         openai_api_key=os.getenv("OPENAI_API_KEY", ""),
         instacart_api_key=os.getenv("INSTACART_API_KEY", ""),
         instacart_partner_linkback_url=os.getenv("INSTACART_PARTNER_LINKBACK_URL", ""),
+        github_token=os.getenv("GITHUB_TOKEN", ""),
         bot_builtin_tools=tuple(
             t.strip() for t in os.getenv("BOT_BUILTIN_TOOLS", "").split(",") if t.strip()
         ),

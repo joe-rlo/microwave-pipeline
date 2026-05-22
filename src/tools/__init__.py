@@ -83,6 +83,16 @@ def build_tools(config) -> ToolBundle:
     else:
         log.debug("INSTACART_API_KEY not set; Instacart tool disabled")
 
+    # --- GitHub ---
+    if getattr(config, "github_token", ""):
+        from src.tools.github import build_github_tools, GITHUB_TOOL_DOCS
+
+        tools.extend(build_github_tools(config))
+        catalog_lines.append(GITHUB_TOOL_DOCS)
+        log.info("Registered GitHub tools")
+    else:
+        log.debug("GITHUB_TOKEN not set; GitHub tools disabled")
+
     if not tools:
         return ToolBundle(mcp_servers={}, allowed_tools=[], catalog_text="")
 
