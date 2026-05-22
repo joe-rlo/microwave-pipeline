@@ -13,6 +13,7 @@ dependencies = [
     "pydantic>=2.0",
     "apsw",
     "aiohttp",
+    "httpx",
     "croniter>=2.0",
 ]
 
