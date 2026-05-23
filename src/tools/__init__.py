@@ -54,6 +54,13 @@ def _file_tools_disabled() -> bool:
     )
 
 
+def _websearch_disabled() -> bool:
+    """True when the WEBSEARCH_DISABLED env flag is set. Default is enabled."""
+    return os.environ.get("WEBSEARCH_DISABLED", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
 # Provider-shape handler: async (args) -> response text. Raises on error.
 ProviderToolHandler = Callable[[dict[str, Any]], Awaitable[str]]
 
@@ -157,6 +164,16 @@ def build_tools(config) -> ToolBundle:
             tools.extend(file_tools)
             catalog_lines.append(WEBFETCH_TOOL_DOCS)
             log.info("Registered native file tools (read_file)")
+
+    # --- Web search (native, replaces SDK WebSearch; Phase C.5 part 2) ---
+    if not _websearch_disabled():
+        from src.tools.search import build_websearch_sdk_tools, WEBSEARCH_TOOL_DOCS
+
+        ws_tools = build_websearch_sdk_tools()
+        if ws_tools:
+            tools.extend(ws_tools)
+            catalog_lines.append(WEBSEARCH_TOOL_DOCS)
+            log.info("Registered native websearch tool")
 
     if not tools:
         return ToolBundle(mcp_servers={}, allowed_tools=[], catalog_text="")
@@ -269,6 +286,31 @@ def build_provider_tools(config) -> list[ProviderTool]:
                     input_schema=files_mod.READ_FILE_SCHEMA,
                 ),
                 handler=_read_file,
+            )
+        )
+
+    # --- Web search (native; pluggable backend; default DDG) ---
+    if not _websearch_disabled():
+        from src.tools import search as search_mod
+
+        async def _websearch(args: dict[str, Any]) -> str:
+            return _unwrap_mcp_result(
+                await search_mod._handle_websearch(args),
+                tool_name="websearch",
+            )
+
+        out.append(
+            ProviderTool(
+                definition=ToolDefinition(
+                    name="websearch",
+                    description=(
+                        "Search the public web. Returns up to N "
+                        "{title, url, snippet} results. Backend is "
+                        "pluggable via WEBSEARCH_BACKEND env (default ddg)."
+                    ),
+                    input_schema=search_mod.WEBSEARCH_SCHEMA,
+                ),
+                handler=_websearch,
             )
         )
 

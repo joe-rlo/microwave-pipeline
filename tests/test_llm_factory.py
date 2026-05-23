@@ -104,6 +104,7 @@ class TestToolsPassthrough:
         # to instacart/github wiring.
         monkeypatch.setenv("WEB_TOOLS_DISABLED", "1")
         monkeypatch.setenv("FILE_TOOLS_DISABLED", "1")
+        monkeypatch.setenv("WEBSEARCH_DISABLED", "1")
         config = _make_config()  # neither instacart nor github
         llm = build_main_llm(config)
         assert llm._tools == []
@@ -114,6 +115,7 @@ class TestToolsPassthrough:
         monkeypatch.setenv("NEAR_API_KEY", "k")
         monkeypatch.setenv("WEB_TOOLS_DISABLED", "1")
         monkeypatch.setenv("FILE_TOOLS_DISABLED", "1")
+        monkeypatch.setenv("WEBSEARCH_DISABLED", "1")
         config = _make_config(github_token="ghp_fake")
         llm = build_main_llm(config)
         # Three github tools should land on the session

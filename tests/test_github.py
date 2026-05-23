@@ -574,6 +574,7 @@ class TestRegistry:
         # is genuinely empty for instacart/github when neither key is set.
         monkeypatch.setenv("WEB_TOOLS_DISABLED", "1")
         monkeypatch.setenv("FILE_TOOLS_DISABLED", "1")
+        monkeypatch.setenv("WEBSEARCH_DISABLED", "1")
         from src.tools import build_tools
 
         config = SimpleNamespace(instacart_api_key="", github_token="")

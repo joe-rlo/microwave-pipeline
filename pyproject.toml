@@ -16,6 +16,7 @@ dependencies = [
     "httpx",
     "boto3",
     "croniter>=2.0",
+    "duckduckgo-search",
 ]
 
 [project.optional-dependencies]

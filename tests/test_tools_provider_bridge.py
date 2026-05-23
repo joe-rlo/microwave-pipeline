@@ -36,6 +36,7 @@ class TestProviderRegistry:
     def test_empty_when_no_keys(self, monkeypatch):
         monkeypatch.setenv("WEB_TOOLS_DISABLED", "1")
         monkeypatch.setenv("FILE_TOOLS_DISABLED", "1")
+        monkeypatch.setenv("WEBSEARCH_DISABLED", "1")
         config = SimpleNamespace(instacart_api_key="", github_token="")
         tools = build_provider_tools(config)
         assert tools == []
@@ -43,6 +44,7 @@ class TestProviderRegistry:
     def test_instacart_only(self, monkeypatch):
         monkeypatch.setenv("WEB_TOOLS_DISABLED", "1")
         monkeypatch.setenv("FILE_TOOLS_DISABLED", "1")
+        monkeypatch.setenv("WEBSEARCH_DISABLED", "1")
         config = SimpleNamespace(
             instacart_api_key="fake",
             instacart_partner_linkback_url="",
@@ -55,6 +57,7 @@ class TestProviderRegistry:
     def test_github_only_registers_three(self, monkeypatch):
         monkeypatch.setenv("WEB_TOOLS_DISABLED", "1")
         monkeypatch.setenv("FILE_TOOLS_DISABLED", "1")
+        monkeypatch.setenv("WEBSEARCH_DISABLED", "1")
         config = SimpleNamespace(
             instacart_api_key="",
             github_token="ghp_fake",
@@ -70,6 +73,7 @@ class TestProviderRegistry:
     def test_both_registered_when_both_keys_set(self, monkeypatch):
         monkeypatch.setenv("WEB_TOOLS_DISABLED", "1")
         monkeypatch.setenv("FILE_TOOLS_DISABLED", "1")
+        monkeypatch.setenv("WEBSEARCH_DISABLED", "1")
         config = SimpleNamespace(
             instacart_api_key="fake",
             instacart_partner_linkback_url="",
@@ -94,6 +98,7 @@ class TestProviderRegistry:
     def test_webfetch_can_be_disabled(self, monkeypatch):
         monkeypatch.setenv("WEB_TOOLS_DISABLED", "true")
         monkeypatch.setenv("FILE_TOOLS_DISABLED", "true")
+        monkeypatch.setenv("WEBSEARCH_DISABLED", "1")
         config = SimpleNamespace(instacart_api_key="", github_token="")
         tools = build_provider_tools(config)
         assert tools == []
