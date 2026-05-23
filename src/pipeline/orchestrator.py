@@ -141,6 +141,12 @@ class Orchestrator:
         # never interrupts the user-visible stream.
         self._breadcrumb_due = False
 
+        # Phase G.2.b: profile proposals surfaced in the most-recent
+        # bot response. Used to parse the next user message as a reply
+        # ("yes" / "no" / "1 2") and apply accepted proposals to the
+        # profile. Cleared once consumed by the next turn.
+        self._last_shown_profile_proposals: list = []
+
         # Memory searcher — wired to session engine so it can also pull
         # matching turns from recent conversation as a second retrieval path.
         self.searcher = MemorySearcher(self.memory_index, embedder, self.session_engine)
@@ -281,6 +287,19 @@ class Orchestrator:
             except Exception as e:
                 log.warning(f"LLM reset before turn failed: {e}")
             self._needs_llm_reset = False
+
+        # Phase G.2.b: parse the user's message as a reply to any
+        # profile proposals surfaced in the previous response. If it's
+        # a clear yes/no/indices reply we apply the action AND let the
+        # main pipeline continue (the user might also have a real
+        # question in the same message; we don't short-circuit).
+        try:
+            profile_reply_chunks = await self._handle_profile_reply(message)
+        except Exception as e:
+            log.warning("Profile-reply handler failed: %s", e)
+            profile_reply_chunks = []
+        for chunk in profile_reply_chunks:
+            yield chunk
 
         # User turn is built here but NOT persisted yet — we commit it as a
         # pair with the assistant turn at the end of process(), so a pipeline
@@ -784,6 +803,20 @@ class Orchestrator:
         )
         self.session_engine.add_turn(assistant_turn)
 
+        # Phase G.2.b: run the profile extractor on health turns after
+        # the response lands. Proposals append to profile.pending_updates
+        # and a confirmation footer streams to the user. Failures
+        # swallowed — extractor must not break the turn.
+        if h_route.is_health and h_route.path != "decline_phi" and full_response:
+            try:
+                async for chunk in self._run_profile_extractor(
+                    user_message=message,
+                    assistant_response=full_response,
+                ):
+                    yield chunk
+            except Exception as e:
+                log.warning("Profile extractor hook failed: %s", e)
+
         # Health audit — only when the route fired. Captures what the
         # turn did and how (route, sources, model, latency) but never
         # the prompt or response content. The spec is explicit on this:
@@ -1245,6 +1278,195 @@ class Orchestrator:
     def get_pipeline_stats(self, user_id: str = "default", channel: str = "telegram", limit: int = 10) -> dict:
         """Return aggregated pipeline stats for recent assistant turns."""
         return self.session_engine.get_recent_stats(channel, user_id, limit)
+
+    # --- Phase G.2.b: profile extractor hooks ---
+
+    async def _handle_profile_reply(self, message: str) -> list[dict]:
+        """If the previous response surfaced proposals, parse this
+        message as a yes/no/indices reply and apply accepted ones.
+
+        Returns a list of `{"type": "profile_update", ...}` chunks to
+        yield BEFORE the main pipeline runs. The user's message itself
+        flows through the pipeline unchanged — they may have asked a
+        real question in the same turn as their confirmation reply.
+        """
+        if not self._last_shown_profile_proposals:
+            return []
+        if self.session_engine is None or self.session_engine.conn is None:
+            return []
+
+        from src.health.profile.confirmation import (
+            ProposalReplyIntent,
+            apply_proposal,
+            mark_proposals,
+            parse_user_reply,
+        )
+        from src.health.profile.store import (
+            StaleProfileError,
+            load_profile,
+            save_profile,
+        )
+
+        shown = list(self._last_shown_profile_proposals)
+        # Clear the shown list FIRST — even if parsing fails or the
+        # reply is "no", the proposals shouldn't be re-shown on the
+        # next turn. They live in pending_updates with whatever status
+        # we set them to.
+        self._last_shown_profile_proposals = []
+
+        reply = parse_user_reply(message, pending_count=len(shown))
+        if reply.intent == ProposalReplyIntent.NORMAL:
+            return []
+
+        key_source = self.config.health.phi_encryption_key_source
+        try:
+            loaded = load_profile(
+                self.session_engine.conn, key_source=key_source,
+            )
+        except Exception as e:
+            log.warning("Profile load for reply failed: %s", e)
+            return []
+
+        # Match shown proposals against the in-DB pending_updates by id.
+        # If a proposal isn't in the queue anymore (manually cleared,
+        # auto-expired), skip it gracefully.
+        in_queue_by_id = {p.id: p for p in loaded.profile.pending_updates}
+
+        if reply.intent == ProposalReplyIntent.YES:
+            chosen = [p for p in shown if p.id in in_queue_by_id]
+        elif reply.intent == ProposalReplyIntent.NO:
+            chosen = []
+            mark_proposals(
+                loaded.profile,
+                [p.id for p in shown if p.id in in_queue_by_id],
+                "rejected",
+            )
+        elif reply.intent == ProposalReplyIntent.INDICES:
+            chosen = [
+                shown[i - 1] for i in reply.indices
+                if shown[i - 1].id in in_queue_by_id
+            ]
+            # The un-chosen ones get rejected.
+            chosen_ids = {p.id for p in chosen}
+            un_chosen = [
+                p.id for p in shown
+                if p.id in in_queue_by_id and p.id not in chosen_ids
+            ]
+            mark_proposals(loaded.profile, un_chosen, "rejected")
+        else:
+            return []
+
+        applied_chunks: list[dict] = []
+        if chosen:
+            for prop in chosen:
+                in_queue_prop = in_queue_by_id[prop.id]
+                if apply_proposal(loaded.profile, in_queue_prop):
+                    applied_chunks.append({
+                        "type": "profile_update",
+                        "section": prop.target_section,
+                        "operation": prop.operation,
+                        "summary": prop.extractor_reasoning or prop.target_section,
+                    })
+            mark_proposals(
+                loaded.profile, [p.id for p in chosen], "accepted",
+            )
+
+        try:
+            save_profile(
+                self.session_engine.conn,
+                loaded.profile,
+                expected_version=loaded.version,
+                key_source=key_source,
+                operation="confirm",
+                section="pending_updates",
+            )
+        except StaleProfileError:
+            log.warning("Profile-reply save raced; user may need to retry.")
+
+        if applied_chunks:
+            # Surface as text too so non-rich channels see it.
+            text = "✓ Updated profile:\n" + "\n".join(
+                f"  • {c['summary']}" for c in applied_chunks
+            )
+            applied_chunks.insert(0, {"type": "delta", "text": text + "\n\n"})
+        elif reply.intent == ProposalReplyIntent.NO:
+            applied_chunks.append({
+                "type": "delta",
+                "text": "Got it — no profile changes.\n\n",
+            })
+        return applied_chunks
+
+    async def _run_profile_extractor(
+        self, *, user_message: str, assistant_response: str,
+    ):
+        """Run the extractor on the turn that just landed.
+
+        Yields a single delta chunk (the confirmation footer) when
+        there are new proposals. Persists the proposals to
+        pending_updates so they survive process restarts even if the
+        user navigates away before replying.
+        """
+        if self.session_engine is None or self.session_engine.conn is None:
+            return
+
+        from src.health.profile.extractor import (
+            persist_proposals,
+            run_extractor,
+            summarize_structure,
+        )
+        from src.health.profile.confirmation import format_confirmation_footer
+        from src.health.profile.store import load_profile
+        from src.llm.selector import get_stage_callable
+
+        key_source = self.config.health.phi_encryption_key_source
+        try:
+            loaded = load_profile(
+                self.session_engine.conn, key_source=key_source,
+            )
+        except Exception as e:
+            log.warning("Profile load before extraction failed: %s", e)
+            return
+
+        structure = summarize_structure(loaded.profile)
+        extractor_call = get_stage_callable(
+            "profile_extractor",
+            fallback_model=self.config.model_triage,
+            auth_mode=self.config.auth_mode,
+            api_key=self.config.anthropic_api_key,
+            cli_path=self.config.cli_path,
+            workspace_dir=str(self.config.workspace_dir),
+        )
+
+        active_project = (
+            self._active_project.name if self._active_project else None
+        )
+        proposals = await run_extractor(
+            user_message=user_message,
+            assistant_response=assistant_response,
+            profile_structure=structure,
+            llm_call=extractor_call,
+            active_project=active_project,
+            source_turn_id=self._session_id or "unknown",
+        )
+        if not proposals:
+            return
+
+        try:
+            persist_proposals(
+                conn=self.session_engine.conn,
+                proposals=proposals,
+                key_source=key_source,
+            )
+        except Exception as e:
+            log.warning("persist_proposals failed: %s", e)
+            return
+
+        # Track for the next-turn reply parser.
+        self._last_shown_profile_proposals = list(proposals)
+
+        footer = format_confirmation_footer(proposals)
+        if footer:
+            yield {"type": "delta", "text": footer}
 
     def _write_breadcrumb(self, trigger: str) -> None:
         """Persist a breadcrumb capturing current execution state.
