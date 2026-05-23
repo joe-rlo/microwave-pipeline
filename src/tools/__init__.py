@@ -47,6 +47,13 @@ def _web_tools_disabled() -> bool:
     )
 
 
+def _file_tools_disabled() -> bool:
+    """True when the FILE_TOOLS_DISABLED env flag is set. Default is enabled."""
+    return os.environ.get("FILE_TOOLS_DISABLED", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
 # Provider-shape handler: async (args) -> response text. Raises on error.
 ProviderToolHandler = Callable[[dict[str, Any]], Awaitable[str]]
 
@@ -140,6 +147,17 @@ def build_tools(config) -> ToolBundle:
             catalog_lines.append(WEB_TOOL_DOCS)
             log.info("Registered native web tools (webfetch)")
 
+    # --- File tools (native, replaces SDK Read; Phase C.5) ---
+    workspace_dir = getattr(config, "workspace_dir", None)
+    if workspace_dir is not None and not _file_tools_disabled():
+        from src.tools.files import build_read_sdk_tools, WEBFETCH_TOOL_DOCS
+
+        file_tools = build_read_sdk_tools(workspace_dir)
+        if file_tools:
+            tools.extend(file_tools)
+            catalog_lines.append(WEBFETCH_TOOL_DOCS)
+            log.info("Registered native file tools (read_file)")
+
     if not tools:
         return ToolBundle(mcp_servers={}, allowed_tools=[], catalog_text="")
 
@@ -221,6 +239,36 @@ def build_provider_tools(config) -> list[ProviderTool]:
                     input_schema=web_mod.WEBFETCH_SCHEMA,
                 ),
                 handler=_webfetch,
+            )
+        )
+
+    # --- File tools (native; no env key required; workspace-sandboxed) ---
+    workspace_dir = getattr(config, "workspace_dir", None)
+    if workspace_dir is not None and not _file_tools_disabled():
+        from src.tools import files as files_mod
+
+        # Capture workspace_dir in closure so the handler doesn't need
+        # to re-read config at call time.
+        _ws = workspace_dir
+
+        async def _read_file(args: dict[str, Any]) -> str:
+            return _unwrap_mcp_result(
+                await files_mod._handle_read_file(args, workspace_dir=_ws),
+                tool_name="read_file",
+            )
+
+        out.append(
+            ProviderTool(
+                definition=ToolDefinition(
+                    name="read_file",
+                    description=(
+                        "Read a text file from the user's workspace. Paths "
+                        "are resolved against the workspace directory; "
+                        "absolute paths outside the workspace are rejected."
+                    ),
+                    input_schema=files_mod.READ_FILE_SCHEMA,
+                ),
+                handler=_read_file,
             )
         )
 

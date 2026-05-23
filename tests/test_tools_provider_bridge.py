@@ -35,12 +35,14 @@ class TestProviderRegistry:
 
     def test_empty_when_no_keys(self, monkeypatch):
         monkeypatch.setenv("WEB_TOOLS_DISABLED", "1")
+        monkeypatch.setenv("FILE_TOOLS_DISABLED", "1")
         config = SimpleNamespace(instacart_api_key="", github_token="")
         tools = build_provider_tools(config)
         assert tools == []
 
     def test_instacart_only(self, monkeypatch):
         monkeypatch.setenv("WEB_TOOLS_DISABLED", "1")
+        monkeypatch.setenv("FILE_TOOLS_DISABLED", "1")
         config = SimpleNamespace(
             instacart_api_key="fake",
             instacart_partner_linkback_url="",
@@ -52,6 +54,7 @@ class TestProviderRegistry:
 
     def test_github_only_registers_three(self, monkeypatch):
         monkeypatch.setenv("WEB_TOOLS_DISABLED", "1")
+        monkeypatch.setenv("FILE_TOOLS_DISABLED", "1")
         config = SimpleNamespace(
             instacart_api_key="",
             github_token="ghp_fake",
@@ -66,6 +69,7 @@ class TestProviderRegistry:
 
     def test_both_registered_when_both_keys_set(self, monkeypatch):
         monkeypatch.setenv("WEB_TOOLS_DISABLED", "1")
+        monkeypatch.setenv("FILE_TOOLS_DISABLED", "1")
         config = SimpleNamespace(
             instacart_api_key="fake",
             instacart_partner_linkback_url="",
@@ -89,9 +93,30 @@ class TestProviderRegistry:
 
     def test_webfetch_can_be_disabled(self, monkeypatch):
         monkeypatch.setenv("WEB_TOOLS_DISABLED", "true")
+        monkeypatch.setenv("FILE_TOOLS_DISABLED", "true")
         config = SimpleNamespace(instacart_api_key="", github_token="")
         tools = build_provider_tools(config)
         assert tools == []
+
+    def test_read_file_registered_when_workspace_set(self, monkeypatch, tmp_path):
+        # workspace_dir present + FILE_TOOLS_DISABLED unset → read_file appears.
+        monkeypatch.setenv("WEB_TOOLS_DISABLED", "1")
+        monkeypatch.delenv("FILE_TOOLS_DISABLED", raising=False)
+        config = SimpleNamespace(
+            instacart_api_key="", github_token="", workspace_dir=tmp_path,
+        )
+        tools = build_provider_tools(config)
+        names = [t.definition.name for t in tools]
+        assert "read_file" in names
+
+    def test_read_file_omitted_when_no_workspace_dir(self, monkeypatch):
+        monkeypatch.setenv("WEB_TOOLS_DISABLED", "1")
+        monkeypatch.delenv("FILE_TOOLS_DISABLED", raising=False)
+        # SimpleNamespace without workspace_dir attribute
+        config = SimpleNamespace(instacart_api_key="", github_token="")
+        tools = build_provider_tools(config)
+        names = [t.definition.name for t in tools]
+        assert "read_file" not in names
 
     def test_returned_definitions_are_real_ToolDefinitions(self):
         config = SimpleNamespace(

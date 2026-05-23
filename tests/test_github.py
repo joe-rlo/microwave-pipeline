@@ -570,9 +570,10 @@ class TestToolHandlers:
 
 class TestRegistry:
     def test_no_token_means_no_github_tools(self, monkeypatch):
-        # Disable always-on web tools so we can assert the registry is
-        # genuinely empty for instacart/github when neither key is set.
+        # Disable always-on web + file tools so we can assert the registry
+        # is genuinely empty for instacart/github when neither key is set.
         monkeypatch.setenv("WEB_TOOLS_DISABLED", "1")
+        monkeypatch.setenv("FILE_TOOLS_DISABLED", "1")
         from src.tools import build_tools
 
         config = SimpleNamespace(instacart_api_key="", github_token="")

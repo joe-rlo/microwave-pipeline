@@ -100,9 +100,10 @@ class TestToolsPassthrough:
     def test_no_tools_when_no_keys(self, monkeypatch):
         monkeypatch.setenv("LLM_STAGE_MAIN", "near:m")
         monkeypatch.setenv("NEAR_API_KEY", "k")
-        # Disable always-on web tools so this assertion isolates to
-        # instacart/github wiring.
+        # Disable always-on web + file tools so this assertion isolates
+        # to instacart/github wiring.
         monkeypatch.setenv("WEB_TOOLS_DISABLED", "1")
+        monkeypatch.setenv("FILE_TOOLS_DISABLED", "1")
         config = _make_config()  # neither instacart nor github
         llm = build_main_llm(config)
         assert llm._tools == []
@@ -112,6 +113,7 @@ class TestToolsPassthrough:
         monkeypatch.setenv("LLM_STAGE_MAIN", "near:m")
         monkeypatch.setenv("NEAR_API_KEY", "k")
         monkeypatch.setenv("WEB_TOOLS_DISABLED", "1")
+        monkeypatch.setenv("FILE_TOOLS_DISABLED", "1")
         config = _make_config(github_token="ghp_fake")
         llm = build_main_llm(config)
         # Three github tools should land on the session
