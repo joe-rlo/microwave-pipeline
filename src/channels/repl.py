@@ -13,6 +13,7 @@ from pathlib import Path
 from src.channels.base import Channel
 from src.pipeline.orchestrator import Orchestrator
 from src.pipeline.why import handle_why_command
+from src.health.profile.chat import handle_profile_command
 from src.projects.bible import handle_bible_command
 from src.projects.chat import handle_project_command
 from src.skills.chat import handle_skill_command
@@ -68,6 +69,7 @@ class REPLChannel(Channel):
                     handle_skill_command,
                     handle_project_command,
                     handle_bible_command,
+                    handle_profile_command,
                     handle_why_command,
                 ):
                     reply = await handler(line, self.orchestrator)

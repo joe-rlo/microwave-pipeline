@@ -23,6 +23,7 @@ from telegram.ext import Application, MessageHandler, CommandHandler, filters
 
 from src.channels.base import Channel
 from src.channels.telegram_format import markdown_to_telegram_html
+from src.health.profile.chat import handle_profile_command
 from src.pipeline.orchestrator import Orchestrator
 from src.projects.bible import handle_bible_command
 from src.projects.chat import handle_project_command
@@ -65,6 +66,7 @@ class TelegramChannel(Channel):
         self.app.add_handler(CommandHandler("project", self._cmd_project))
         self.app.add_handler(CommandHandler("projects", self._cmd_projects))
         self.app.add_handler(CommandHandler("bible", self._cmd_bible))
+        self.app.add_handler(CommandHandler("profile", self._cmd_profile))
         self.app.add_handler(CommandHandler("why", self._cmd_why))
 
         # Document handler (files sent as attachments)
@@ -488,6 +490,13 @@ class TelegramChannel(Channel):
         arg = " ".join(context.args) if context.args else ""
         text = f"/bible {arg}".rstrip()
         reply = await handle_bible_command(text, self.orchestrator)
+        if reply:
+            await update.message.reply_text(reply)
+
+    async def _cmd_profile(self, update: Update, context) -> None:
+        arg = " ".join(context.args) if context.args else ""
+        text = f"/profile {arg}".rstrip()
+        reply = await handle_profile_command(text, self.orchestrator)
         if reply:
             await update.message.reply_text(reply)
 
