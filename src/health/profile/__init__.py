@@ -1,10 +1,12 @@
 """Health Profile package (Phase G).
 
 Phase G.1.a — crypto substrate (landed).
-Phase G.1.b — schema + storage (landed this commit).
-Phase G.1.c — CLI surface (next).
-Phase G.1.d — REPL/Telegram/Signal integration + setup flow.
-Phase G.2+   — extractor, slice selector, etc.
+Phase G.1.b — schema + storage (landed).
+Phase G.1.c — CLI surface (landed).
+Phase G.1.d — REPL/Telegram/Signal integration + setup flow (TBD).
+Phase G.2.a — extractor + pending_updates persistence (landed).
+Phase G.2.b — inline confirmation surface across channels (TBD).
+Phase G.3+   — slice selector + assembly integration.
 """
 
 from src.health.profile.crypto import (
@@ -26,6 +28,12 @@ from src.health.profile.models import (
     Medication,
     PendingUpdate,
     ProfileField,
+)
+from src.health.profile.extractor import (
+    MIN_CONFIDENCE,
+    persist_proposals,
+    run_extractor,
+    summarize_structure,
 )
 from src.health.profile.store import (
     DEFAULT_USER_ID,
@@ -51,6 +59,7 @@ __all__ = [
     "LabResult",
     "LifestyleFactors",
     "LoadedProfile",
+    "MIN_CONFIDENCE",
     "Medication",
     "PendingUpdate",
     "ProfileField",
@@ -60,5 +69,8 @@ __all__ = [
     "init_tables",
     "list_change_log",
     "load_profile",
+    "persist_proposals",
+    "run_extractor",
     "save_profile",
+    "summarize_structure",
 ]
