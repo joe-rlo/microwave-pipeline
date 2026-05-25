@@ -275,14 +275,20 @@ def apply_proposal(profile: HealthProfile, proposal: PendingUpdate) -> bool:
     """Apply one accepted proposal to the profile in-place.
 
     Returns True when the proposal was applied, False when it was
-    skipped (unsupported section/operation combo, malformed value).
+    skipped (unsupported section/operation combo, malformed value
+    that survived defensive defaults).
 
     All accepted proposals get `field_meta.source = "extracted_confirmed"` —
     the spec's provenance shape for "extractor proposed, user accepted."
+
+    Defensive defaults: extractor output often omits required fields
+    (e.g. medication without `status`) or uses near-synonyms (`frequency`
+    instead of `dose`). `_defensive_defaults` fills in the common cases
+    so the proposal lands instead of being silently rejected.
     """
     section = proposal.target_section
     op = proposal.operation
-    val = proposal.proposed_value or {}
+    val = _defensive_defaults(section, proposal.proposed_value or {})
     now = _utc_now()
 
     if section in _LIST_SECTIONS and op == "add":
@@ -415,3 +421,38 @@ def _extracted_provenance(value: dict, now: datetime) -> ProfileField:
 def _utc_now() -> datetime:
     """Naive UTC now() — datetime.utcnow() is deprecated in 3.12+."""
     return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _defensive_defaults(section: str, value: dict) -> dict:
+    """Fill in commonly-missing required fields with sensible defaults.
+
+    Real-world failure that motivated this: extractor returned
+    `{'name': 'CoQ10', 'frequency': 'daily'}` for a medication. The
+    Medication Pydantic model requires `status` so the apply silently
+    rejected. With this default, the same input lands as
+    `{'name': 'CoQ10', 'status': 'active', 'frequency': 'daily'}` —
+    `frequency` is ignored (Medication has no such field) and the
+    entry is constructed cleanly with the user's `name`.
+
+    Defaults only fill REQUIRED fields the extractor is most likely
+    to omit. Optional fields stay unset.
+    """
+    val = dict(value)  # don't mutate caller's dict
+    now = _utc_now()
+
+    if section == "medications":
+        # Required: name, status. Status defaults to "active" since
+        # the extractor only fires when the user mentioned taking
+        # something currently.
+        val.setdefault("status", "active")
+    elif section == "conditions":
+        # Required: name, status. Same logic — extractor surfaces
+        # things the user currently has.
+        val.setdefault("status", "active")
+    elif section == "concerns":
+        # Required: text, raised_at, status. Default the latter two.
+        val.setdefault("status", "active")
+        val.setdefault("raised_at", now.isoformat())
+    # allergies, family_history, labs have no required Literal fields
+    # the extractor commonly omits — let them through unchanged.
+    return val

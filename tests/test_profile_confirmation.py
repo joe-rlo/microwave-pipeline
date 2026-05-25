@@ -262,6 +262,85 @@ class TestApplyProposal:
         assert p.medications == []
 
 
+# --- Defensive defaults (regression: real-world bug 2026-05-23) ----------
+
+
+class TestDefensiveDefaults:
+    """The extractor often omits required fields like `status`. Without
+    defaults, those proposals silently fail to apply (Pydantic raises,
+    apply_proposal logs + returns False, user sees nothing). With
+    defaults, the common cases land cleanly."""
+
+    def test_coq10_case_from_real_bug(self):
+        """The literal proposal that surfaced the bug in production —
+        extractor returned name + frequency (no status, no dose).
+        With defaults: status='active', frequency silently dropped
+        by Pydantic, medication entry created with name only."""
+        p = HealthProfile.empty("self")
+        prop = _proposal(
+            section="medications",
+            value={"name": "CoQ10", "frequency": "daily"},
+        )
+        assert apply_proposal(p, prop) is True
+        assert len(p.medications) == 1
+        med = p.medications[0]
+        assert med.name == "CoQ10"
+        assert med.status == "active"  # defaulted
+        # `frequency` isn't a Medication field — Pydantic ignores it
+        # cleanly (extra='ignore' is the default for v2 BaseModel).
+
+    def test_medication_missing_status_defaults_active(self):
+        p = HealthProfile.empty("self")
+        prop = _proposal(
+            section="medications", value={"name": "metformin"},
+        )
+        assert apply_proposal(p, prop) is True
+        assert p.medications[0].status == "active"
+
+    def test_explicit_status_not_overridden(self):
+        # Default only fires when the field is MISSING.
+        p = HealthProfile.empty("self")
+        prop = _proposal(
+            section="medications",
+            value={"name": "old-prescription", "status": "discontinued"},
+        )
+        assert apply_proposal(p, prop) is True
+        assert p.medications[0].status == "discontinued"
+
+    def test_condition_missing_status_defaults_active(self):
+        p = HealthProfile.empty("self")
+        prop = _proposal(
+            section="conditions", value={"name": "Type 2 Diabetes"},
+        )
+        assert apply_proposal(p, prop) is True
+        assert p.conditions[0].status == "active"
+
+    def test_concern_missing_status_and_raised_at_defaults(self):
+        p = HealthProfile.empty("self")
+        prop = _proposal(
+            section="concerns",
+            value={"text": "dull headache three days"},
+        )
+        assert apply_proposal(p, prop) is True
+        c = p.concerns[0]
+        assert c.status == "active"
+        # raised_at filled with now-ish — just confirm it's set
+        assert c.raised_at is not None
+
+    def test_allergy_no_required_status_field(self):
+        # Allergy doesn't have a required-with-no-default field that
+        # we'd default. Verify it lands without the helper interfering.
+        p = HealthProfile.empty("self")
+        prop = _proposal(
+            section="allergies",
+            value={"substance": "penicillin"},
+        )
+        assert apply_proposal(p, prop) is True
+        assert p.allergies[0].substance == "penicillin"
+        # severity stays None (optional)
+        assert p.allergies[0].severity is None
+
+
 # --- format_confirmation_footer ------------------------------------------
 
 

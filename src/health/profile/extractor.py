@@ -121,6 +121,59 @@ Only facts the user stated directly about themselves:
 - 0.4-0.6: User implied it strongly but did not state it
 - Below 0.4: Do NOT propose
 
+## Field schemas per section
+
+Use exactly these field names. Required fields MUST be present in
+proposed_value or the apply will fail.
+
+- medications:
+    name (required, string)
+    status (required, one of: "active" | "as_needed" | "discontinued")
+    dose (optional, string — combine dose + frequency: "500mg twice daily")
+    reason (optional, string — condition it treats)
+    started (optional, "YYYY-MM" or "YYYY-MM-DD")
+  Default status to "active" when the user describes currently taking it.
+
+- conditions:
+    name (required, string)
+    status (required, one of: "active" | "resolved" | "in_remission" | "monitoring")
+    diagnosed_when (optional, "approximate:2022" or "exact:2024-03-15")
+    severity (optional, "mild" | "moderate" | "severe")
+  Default status to "active" when the user describes currently having it.
+
+- allergies:
+    substance (required, string)
+    reaction (optional, string)
+    severity (optional, "mild" | "moderate" | "severe" | "anaphylactic")
+
+- family_history:
+    relation (required, string — "mother", "paternal grandfather")
+    condition (required, string)
+    age_of_onset (optional, string)
+
+- labs:
+    test_name (required, string)
+    value (required, string — keep the user's wording)
+    units (optional), date (optional, "YYYY-MM-DD"),
+    reference_range (optional)
+
+- concerns:
+    text (required, string — the concern in the user's words)
+    status (required, "active" | "addressed" | "ongoing"; default "active")
+    (raised_at is filled automatically — don't include it)
+
+- lifestyle (operation="modify"): proposed_value has ONE of:
+    smoking, alcohol, exercise_frequency, sleep_hours_typical, diet_pattern
+  Value is a free-form string ("former", "occasional", etc.).
+
+- demographics (operation="modify"): proposed_value has ONE of:
+    age_range, sex_assigned_at_birth, gender_identity,
+    height_range, weight_range, pregnancy_status
+  Use buckets for numerics: "30-39", "5'10\" — 6'0\"", "180-200 lbs".
+
+DO NOT invent fields not listed above. Anything you put outside this
+list (like "frequency" on a medication) is silently dropped.
+
 ## Output
 
 Return ONLY valid JSON matching this schema. If nothing should be

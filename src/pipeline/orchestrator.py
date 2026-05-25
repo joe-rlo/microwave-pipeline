@@ -1356,7 +1356,10 @@ class Orchestrator:
         else:
             return []
 
+        # Track applied vs failed separately so the user sees BOTH
+        # when a mix happens (some proposals lacked required fields).
         applied_chunks: list[dict] = []
+        failed_summaries: list[str] = []
         if chosen:
             for prop in chosen:
                 in_queue_prop = in_queue_by_id[prop.id]
@@ -1367,6 +1370,17 @@ class Orchestrator:
                         "operation": prop.operation,
                         "summary": prop.extractor_reasoning or prop.target_section,
                     })
+                else:
+                    failed_summaries.append(
+                        f"{prop.operation} {prop.target_section}: "
+                        f"{prop.extractor_reasoning or '(no detail)'}"
+                    )
+            # All chosen marked accepted regardless of apply success —
+            # the user explicitly consented. Failures get surfaced as
+            # a separate warning so the user knows to re-add manually
+            # if needed. (Re-promoting a failed proposal to pending
+            # would make it re-appear on the next turn, which is
+            # annoying when the failure is structural, not transient.)
             mark_proposals(
                 loaded.profile, [p.id for p in chosen], "accepted",
             )
@@ -1383,18 +1397,39 @@ class Orchestrator:
         except StaleProfileError:
             log.warning("Profile-reply save raced; user may need to retry.")
 
+        # Compose the user-facing message. Always surface SOMETHING when
+        # we intercepted the reply — silence after a yes/no is the bug
+        # we just fixed.
+        text_parts: list[str] = []
         if applied_chunks:
-            # Surface as text too so non-rich channels see it.
-            text = "✓ Updated profile:\n" + "\n".join(
-                f"  • {c['summary']}" for c in applied_chunks
+            text_parts.append(
+                "✓ Updated profile:\n" + "\n".join(
+                    f"  • {c['summary']}" for c in applied_chunks
+                )
             )
-            applied_chunks.insert(0, {"type": "delta", "text": text + "\n\n"})
-        elif reply.intent == ProposalReplyIntent.NO:
-            applied_chunks.append({
+        if failed_summaries:
+            count_word = (
+                "this one" if len(failed_summaries) == 1
+                else f"{len(failed_summaries)} of these"
+            )
+            detail = "\n".join(f"  • {s}" for s in failed_summaries)
+            text_parts.append(
+                f"⚠ Couldn't apply {count_word} — the extractor returned "
+                f"incomplete data:\n{detail}\n"
+                "Add manually via `/profile` or the `microwaveos profile` CLI "
+                "if you want to keep them."
+            )
+        if reply.intent == ProposalReplyIntent.NO and not text_parts:
+            text_parts.append("Got it — no profile changes.")
+
+        result_chunks: list[dict] = []
+        if text_parts:
+            result_chunks.append({
                 "type": "delta",
-                "text": "Got it — no profile changes.\n\n",
+                "text": "\n\n".join(text_parts) + "\n\n",
             })
-        return applied_chunks
+        result_chunks.extend(applied_chunks)
+        return result_chunks
 
     async def _run_profile_extractor(
         self, *, user_message: str, assistant_response: str,
