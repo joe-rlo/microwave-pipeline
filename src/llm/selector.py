@@ -123,15 +123,29 @@ def get_stage_callable(
     used when the resolved spec is `legacy` (no override, or invalid
     override). When the spec is `near`, those args are ignored —
     NEAR uses NEAR_API_KEY from env.
+
+    Emits a `[llm-stage]` INFO log every time a callable is built so
+    the operator can see which provider+model each pipeline stage is
+    using per turn. Grep `[llm-` to surface all routing decisions.
     """
     spec = get_stage_spec(stage)
 
     if spec.is_near:
-        return _build_near_callable(spec.model or fallback_model, stage)
+        resolved_model = spec.model or fallback_model
+        log.info(
+            "[llm-stage] %s → provider=near model=%s",
+            stage, resolved_model,
+        )
+        return _build_near_callable(resolved_model, stage)
 
     # Legacy path — unchanged from pre-selector behavior.
+    resolved_model = spec.model or fallback_model
+    log.info(
+        "[llm-stage] %s → provider=legacy model=%s (auth=%s)",
+        stage, resolved_model, auth_mode,
+    )
     return _build_legacy_callable(
-        model=spec.model or fallback_model,
+        model=resolved_model,
         auth_mode=auth_mode,
         api_key=api_key,
         cli_path=cli_path,

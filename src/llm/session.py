@@ -138,7 +138,16 @@ class LLMSession:
     async def connect(self, stable_prompt: str) -> None:
         self._system_prompt = stable_prompt
         self._history = []
-        log.info("LLMSession connected (model=%s)", self.model)
+        # Surface the provider so it's clear from logs whether this
+        # session is talking to NEAR Cloud, AWS Bedrock, or a future
+        # adapter — the model id alone isn't always disambiguating
+        # (`anthropic/claude-sonnet-4-6` vs `us.anthropic.claude-sonnet-4-6`
+        # differ by one prefix character).
+        log.info(
+            "[llm-session] connected provider=%s model=%s",
+            getattr(self._provider, "name", "unknown"),
+            self.model,
+        )
 
     async def reconnect(self, stable_prompt: str) -> None:
         """Reset system prompt + history. Used by the orchestrator when

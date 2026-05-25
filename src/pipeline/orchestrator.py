@@ -289,17 +289,60 @@ class Orchestrator:
             self._needs_llm_reset = False
 
         # Phase G.2.b: parse the user's message as a reply to any
-        # profile proposals surfaced in the previous response. If it's
-        # a clear yes/no/indices reply we apply the action AND let the
-        # main pipeline continue (the user might also have a real
-        # question in the same message; we don't short-circuit).
+        # profile proposals surfaced in the previous response.
+        #
+        # For mixed messages ("yes also what about X" — >4 words, parser
+        # returns NORMAL), nothing happens here and the pipeline runs.
+        #
+        # For PURE replies (bare "yes" / "no" / "1 2"), apply the action
+        # and short-circuit — don't bother the main LLM with a bare
+        # affirmative; calling Sonnet on "yes" produces "yes what?"
+        # confusion that's worse than no response at all.
         try:
-            profile_reply_chunks = await self._handle_profile_reply(message)
+            profile_reply_chunks, was_pure_reply = (
+                await self._handle_profile_reply(message)
+            )
         except Exception as e:
             log.warning("Profile-reply handler failed: %s", e)
-            profile_reply_chunks = []
+            profile_reply_chunks, was_pure_reply = [], False
         for chunk in profile_reply_chunks:
             yield chunk
+
+        if was_pure_reply:
+            # Build the assembled response from the delta chunks we
+            # just emitted so channels see a final `result` event and
+            # the session engine has a persistable assistant turn.
+            assembled = "".join(
+                c.get("text", "") for c in profile_reply_chunks
+                if c.get("type") == "delta"
+            )
+            yield {"type": "result", "text": assembled}
+            # Persist the user + assistant pair so session history +
+            # /debug stay coherent. Use minimal metadata; this turn
+            # didn't run triage/search/reflection.
+            try:
+                self.session_engine.add_turn(Turn(
+                    session_id=self._session_id, channel=self._channel,
+                    user_id="user", role="user", content=message, metadata={},
+                ))
+                self.session_engine.add_turn(Turn(
+                    session_id=self._session_id, channel=self._channel,
+                    user_id="bot", role="assistant", content=assembled,
+                    metadata={"type": "profile_reply_short_circuit"},
+                ))
+            except Exception as e:
+                log.warning("Could not persist short-circuit turn: %s", e)
+            yield {
+                "type": "metadata",
+                "pipeline": {
+                    "short_circuit": "profile_reply",
+                    "total_time_ms": int((time.time() - start) * 1000),
+                },
+            }
+            log.info(
+                "[llm-route] turn → short-circuit (profile reply, no LLM call)"
+            )
+            return
 
         # User turn is built here but NOT persisted yet — we commit it as a
         # pair with the assistant turn at the end of process(), so a pipeline
@@ -587,6 +630,31 @@ class Orchestrator:
                 await alt_llm.connect(assembly_result.stable_prompt)
         active_llm = alt_llm if alt_llm is not None else self.llm
 
+        # Per-turn route log — one greppable line per LLM dispatch so
+        # the operator can see which provider+model handled which turn.
+        # Sits BEFORE escalation so the base model is logged; the
+        # escalate() call below logs separately when it fires.
+        if alt_llm is not None and h_route.use_baa_llm:
+            log.info(
+                "[llm-route] turn → BAA path: provider=bedrock model=%s "
+                "(phi_class=%s)",
+                alt_llm.model, triage_result.phi_class,
+            )
+        elif alt_llm is not None and h_route.use_private_tee:
+            log.info(
+                "[llm-route] turn → private-TEE path: model=%s "
+                "(complexity=%s)",
+                alt_llm.model, triage_result.complexity,
+            )
+        else:
+            main_model = getattr(self.llm, "model", "unknown")
+            llm_type = type(self.llm).__name__
+            log.info(
+                "[llm-route] turn → main path: client=%s model=%s "
+                "(health_route=%s)",
+                llm_type, main_model, h_route.path,
+            )
+
         # Escalate to Opus+thinking for complex tasks. On the BAA path
         # the escalation target is the health-specific opus model id
         # (config.health.baa_model_escalation). The Private-TEE path
@@ -601,6 +669,10 @@ class Orchestrator:
                 esc_model = active_llm.model
             else:
                 esc_model = self.config.model_escalation
+            log.info(
+                "[llm-route] escalation → model=%s effort=%s",
+                esc_model, self.config.escalation_effort,
+            )
             log.info(
                 f"Escalating to {esc_model} "
                 f"(effort={self.config.escalation_effort}) for complex task"
@@ -1281,19 +1353,31 @@ class Orchestrator:
 
     # --- Phase G.2.b: profile extractor hooks ---
 
-    async def _handle_profile_reply(self, message: str) -> list[dict]:
+    async def _handle_profile_reply(
+        self, message: str,
+    ) -> tuple[list[dict], bool]:
         """If the previous response surfaced proposals, parse this
         message as a yes/no/indices reply and apply accepted ones.
 
-        Returns a list of `{"type": "profile_update", ...}` chunks to
-        yield BEFORE the main pipeline runs. The user's message itself
-        flows through the pipeline unchanged — they may have asked a
-        real question in the same turn as their confirmation reply.
+        Returns `(chunks, was_pure_reply)`:
+          - `chunks`: profile_update + delta chunks to yield BEFORE the
+            main pipeline. Empty when the message wasn't a reply at all
+            (intent=NORMAL), or when the parser short-circuited (no
+            tracked proposals, no DB).
+          - `was_pure_reply`: True when the message was a clean
+            yes/no/indices reply with nothing else. In that case, the
+            caller should short-circuit and SKIP the main LLM —
+            calling Sonnet on a bare "yes" produces "yes what?"
+            confusion that's worse than no response.
+
+        For mixed messages ("yes also what about X" — which the parser
+        flags as NORMAL because >4 words), this returns (`[]`, `False`)
+        and the main pipeline runs as usual.
         """
         if not self._last_shown_profile_proposals:
-            return []
+            return [], False
         if self.session_engine is None or self.session_engine.conn is None:
-            return []
+            return [], False
 
         from src.health.profile.confirmation import (
             ProposalReplyIntent,
@@ -1316,7 +1400,7 @@ class Orchestrator:
 
         reply = parse_user_reply(message, pending_count=len(shown))
         if reply.intent == ProposalReplyIntent.NORMAL:
-            return []
+            return [], False
 
         key_source = self.config.health.phi_encryption_key_source
         try:
@@ -1325,7 +1409,7 @@ class Orchestrator:
             )
         except Exception as e:
             log.warning("Profile load for reply failed: %s", e)
-            return []
+            return [], False
 
         # Match shown proposals against the in-DB pending_updates by id.
         # If a proposal isn't in the queue anymore (manually cleared,
@@ -1354,27 +1438,31 @@ class Orchestrator:
             ]
             mark_proposals(loaded.profile, un_chosen, "rejected")
         else:
-            return []
+            return [], False
 
         # Track applied vs failed separately so the user sees BOTH
         # when a mix happens (some proposals lacked required fields).
+        # Use _summarize_proposal for the displayed summary — the
+        # extractor's `extractor_reasoning` is often generic ("you
+        # stated you take this supplement daily") so all N entries
+        # showed the same text. The summarizer renders name+dose+status
+        # per section type instead.
+        from src.health.profile.confirmation import _summarize_proposal
         applied_chunks: list[dict] = []
         failed_summaries: list[str] = []
         if chosen:
             for prop in chosen:
                 in_queue_prop = in_queue_by_id[prop.id]
+                summary = _summarize_proposal(in_queue_prop)
                 if apply_proposal(loaded.profile, in_queue_prop):
                     applied_chunks.append({
                         "type": "profile_update",
                         "section": prop.target_section,
                         "operation": prop.operation,
-                        "summary": prop.extractor_reasoning or prop.target_section,
+                        "summary": summary,
                     })
                 else:
-                    failed_summaries.append(
-                        f"{prop.operation} {prop.target_section}: "
-                        f"{prop.extractor_reasoning or '(no detail)'}"
-                    )
+                    failed_summaries.append(summary)
             # All chosen marked accepted regardless of apply success —
             # the user explicitly consented. Failures get surfaced as
             # a separate warning so the user knows to re-add manually
@@ -1429,7 +1517,9 @@ class Orchestrator:
                 "text": "\n\n".join(text_parts) + "\n\n",
             })
         result_chunks.extend(applied_chunks)
-        return result_chunks
+        # Was this a pure reply? YES/NO/INDICES intent with nothing
+        # else — caller should short-circuit the main LLM.
+        return result_chunks, True
 
     async def _run_profile_extractor(
         self, *, user_message: str, assistant_response: str,
