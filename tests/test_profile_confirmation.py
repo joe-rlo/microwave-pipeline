@@ -68,6 +68,17 @@ def _utc_now():
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
+def _provenance(value: str = "x") -> ProfileField:
+    """Minimal ProfileField wrapper for tests that don't care about
+    the wrapper's specific values — just need a valid field_meta on
+    a Condition / Medication / etc."""
+    now = _utc_now()
+    return ProfileField(
+        value=value, added_at=now, last_modified=now,
+        confirmed=True, source="user_stated_setup", confidence=1.0,
+    )
+
+
 def _proposal(
     section: str = "medications",
     operation: str = "add",
@@ -243,7 +254,8 @@ class TestApplyProposal:
         assert apply_proposal(p, prop) is False
 
     def test_remove_operation_skips_today(self):
-        # remove isn't supported in this phase
+        # remove isn't supported yet (covered by `modify status=discontinued`
+        # for the common discontinue case)
         p = HealthProfile.empty("self")
         prop = _proposal(
             section="medications", operation="remove",
@@ -339,6 +351,164 @@ class TestDefensiveDefaults:
         assert p.allergies[0].substance == "penicillin"
         # severity stays None (optional)
         assert p.allergies[0].severity is None
+
+
+# --- Modify list sections (regression: real-world bug 2026-05-25) -------
+
+
+class TestModifyListSection:
+    """Real bug: user said 'I'll drop the DHEA' → extractor proposed
+    {section: medications, op: modify, value: {name: DHEA, status: discontinued}}.
+    Before this fix, apply_proposal returned False because modify on
+    list sections wasn't wired."""
+
+    def _setup_with_dhea(self) -> HealthProfile:
+        p = HealthProfile.empty("self")
+        added_long_ago = datetime(2026, 1, 1, 12, 0, 0)
+        p.medications.append(Medication(
+            name="DHEA", dose="100mg daily", status="active",
+            field_meta=ProfileField(
+                value="DHEA",
+                added_at=added_long_ago,
+                last_modified=added_long_ago,
+                confirmed=True,
+                source="user_stated_inline",
+                confidence=1.0,
+                notes="started for energy",
+            ),
+        ))
+        return p
+
+    def test_modify_medication_status_to_discontinued(self):
+        """The literal case from the screenshot."""
+        p = self._setup_with_dhea()
+        prop = _proposal(
+            section="medications", operation="modify",
+            value={"name": "DHEA", "status": "discontinued"},
+        )
+        assert apply_proposal(p, prop) is True
+        # Same entry, status updated; dose preserved
+        assert len(p.medications) == 1
+        assert p.medications[0].name == "DHEA"
+        assert p.medications[0].status == "discontinued"
+        assert p.medications[0].dose == "100mg daily"
+
+    def test_modify_preserves_unmodified_fields(self):
+        p = self._setup_with_dhea()
+        prop = _proposal(
+            section="medications", operation="modify",
+            value={"name": "DHEA", "status": "discontinued"},
+        )
+        apply_proposal(p, prop)
+        med = p.medications[0]
+        # field_meta.added_at preserved; last_modified bumped
+        assert med.field_meta.added_at == datetime(2026, 1, 1, 12, 0, 0)
+        assert med.field_meta.last_modified > med.field_meta.added_at
+        # Original user note preserved
+        assert med.field_meta.notes == "started for energy"
+        # Source restamped to extracted_confirmed
+        assert med.field_meta.source == "extracted_confirmed"
+
+    def test_modify_case_insensitive_identifier_match(self):
+        # User says "dhea" lowercase; existing entry is "DHEA" uppercase.
+        # Should still match.
+        p = self._setup_with_dhea()
+        prop = _proposal(
+            section="medications", operation="modify",
+            value={"name": "dhea", "status": "discontinued"},
+        )
+        assert apply_proposal(p, prop) is True
+        assert p.medications[0].status == "discontinued"
+
+    def test_modify_nonexistent_returns_false(self):
+        """When there's no matching entry, apply returns False with a
+        clear log line — the user gets the 'couldn't apply' warning so
+        they know to add it first."""
+        p = HealthProfile.empty("self")  # no DHEA at all
+        prop = _proposal(
+            section="medications", operation="modify",
+            value={"name": "DHEA", "status": "discontinued"},
+        )
+        assert apply_proposal(p, prop) is False
+        # And nothing was added (we don't accidentally turn modify into add)
+        assert p.medications == []
+
+    def test_modify_missing_identifier_returns_false(self):
+        # No name → can't find existing → no match → False
+        p = self._setup_with_dhea()
+        prop = _proposal(
+            section="medications", operation="modify",
+            value={"status": "discontinued"},  # no name
+        )
+        assert apply_proposal(p, prop) is False
+        # Existing entry untouched
+        assert p.medications[0].status == "active"
+
+    def test_modify_first_match_wins_with_duplicates(self):
+        # Two entries with the same name — first one gets modified.
+        p = self._setup_with_dhea()
+        added_recent = datetime(2026, 4, 1, 12, 0, 0)
+        p.medications.append(Medication(
+            name="DHEA", dose="50mg daily", status="active",
+            field_meta=ProfileField(
+                value="DHEA", added_at=added_recent,
+                last_modified=added_recent, confirmed=True,
+                source="user_stated_inline", confidence=1.0,
+            ),
+        ))
+        prop = _proposal(
+            section="medications", operation="modify",
+            value={"name": "DHEA", "status": "discontinued"},
+        )
+        apply_proposal(p, prop)
+        # First entry (older) modified
+        assert p.medications[0].status == "discontinued"
+        assert p.medications[0].dose == "100mg daily"
+        # Second entry untouched
+        assert p.medications[1].status == "active"
+
+    def test_modify_condition_status_to_resolved(self):
+        # Same pattern for conditions.
+        p = HealthProfile.empty("self")
+        p.conditions.append(Condition(
+            name="Seasonal allergies", status="active",
+            field_meta=_provenance(),
+        ))
+        prop = _proposal(
+            section="conditions", operation="modify",
+            value={"name": "Seasonal allergies", "status": "resolved"},
+        )
+        assert apply_proposal(p, prop) is True
+        assert p.conditions[0].status == "resolved"
+
+    def test_modify_compound_identifier_family_history(self):
+        # family_history uses (relation, condition) as the compound id.
+        p = HealthProfile.empty("self")
+        from src.health.profile import FamilyHistoryEntry
+        p.family_history.append(FamilyHistoryEntry(
+            relation="mother", condition="diabetes",
+            field_meta=_provenance(),
+        ))
+        prop = _proposal(
+            section="family_history", operation="modify",
+            value={
+                "relation": "mother", "condition": "diabetes",
+                "age_of_onset": "55",
+            },
+        )
+        assert apply_proposal(p, prop) is True
+        assert p.family_history[0].age_of_onset == "55"
+
+    def test_modify_invalid_value_returns_false(self):
+        # Proposed status not in the Literal → Pydantic rejects → False
+        p = self._setup_with_dhea()
+        prop = _proposal(
+            section="medications", operation="modify",
+            value={"name": "DHEA", "status": "not-a-status"},
+        )
+        assert apply_proposal(p, prop) is False
+        # Original entry untouched
+        assert p.medications[0].status == "active"
 
 
 # --- format_confirmation_footer ------------------------------------------
