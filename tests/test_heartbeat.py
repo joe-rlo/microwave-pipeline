@@ -438,7 +438,9 @@ class TestBlinkHook:
             "owls": [],
         }
 
-        # Monkeypatch aiohttp.ClientSession to return our canned response
+        # Patch the certifi-backed session factory used by the hook —
+        # NOT bare aiohttp.ClientSession (the hook routes through
+        # src/channels/_http.make_session so macOS SSL trust works).
         from src.heartbeat.hooks import blink as blink_mod
 
         class _FakeResp:
@@ -460,7 +462,10 @@ class TestBlinkHook:
                 # homescreen request inside. Echo a 200 with the body.
                 return _FakeResp(200, json_dumps_bytes(homescreen))
 
-        monkeypatch.setattr(blink_mod.aiohttp, "ClientSession", _FakeSession)
+        def _fake_make_session(*args, **kwargs):
+            return _FakeSession()
+
+        monkeypatch.setattr(blink_mod, "make_session", _fake_make_session)
 
         result = await fetch_blink_status()
         assert "networks" in result
@@ -477,3 +482,38 @@ class TestBlinkHook:
 
 def json_dumps_bytes(d) -> bytes:
     return json.dumps(d).encode("utf-8")
+
+
+class TestBlinkSslSafety:
+    """Regression test for the macOS CERTIFICATE_VERIFY_FAILED bug
+    that surfaced in real Signal traffic on 2026-05-26.
+
+    The hook MUST use the certifi-backed make_session factory rather
+    than bare aiohttp.ClientSession — macOS python.org installs ship
+    without a working system trust store, and a regression here causes
+    every heartbeat tick to fail with SSL trust errors.
+    """
+
+    def test_blink_hook_imports_make_session(self):
+        # Compile-time check: make_session is in scope inside the hook.
+        from src.heartbeat.hooks import blink as blink_mod
+        assert hasattr(blink_mod, "make_session"), (
+            "blink hook must import make_session from src.channels._http "
+            "for certifi-backed SSL trust. See the comment in "
+            "src/channels/_http.py for why."
+        )
+
+    def test_blink_hook_does_not_call_bare_clientsession(self):
+        # The hook should NOT call aiohttp.ClientSession() directly —
+        # that path has the macOS SSL bug. Grep the source.
+        from src.heartbeat.hooks import blink as blink_mod
+        import inspect
+        source = inspect.getsource(blink_mod)
+        # `aiohttp.ClientSession(` is the bug shape. The hook's only
+        # references to ClientSession should be type hints / typing.
+        # We check for the call shape with parentheses.
+        # Note: aiohttp.ClientTimeout is fine (different class).
+        assert "aiohttp.ClientSession(" not in source, (
+            "blink hook should not call aiohttp.ClientSession() directly; "
+            "use make_session() from src.channels._http instead."
+        )

@@ -37,6 +37,8 @@ from typing import Optional
 
 import aiohttp
 
+from src.channels._http import make_session
+
 log = logging.getLogger(__name__)
 
 
@@ -209,7 +211,10 @@ async def fetch_blink_status() -> dict:
       }
     """
     creds = _load_creds()
-    async with aiohttp.ClientSession(timeout=_HTTP_TIMEOUT) as session:
+    # Use the shared session factory — provides certifi-backed SSL trust
+    # so macOS python.org installs don't fail with CERTIFICATE_VERIFY_FAILED
+    # the way bare aiohttp.ClientSession does. See src/channels/_http.py.
+    async with make_session(timeout=_HTTP_TIMEOUT) as session:
         url = (
             f"{_base_url(creds)}/api/v3/accounts/"
             f"{creds['account_id']}/homescreen"
