@@ -79,6 +79,19 @@ class Config(BaseModel):
     near_api_key: str = ""
     near_base_url: str = ""  # empty = use selector's default
 
+    # Heartbeat — lightweight sub-day-cadence task runner.
+    # Separate from the cron scheduler: in-process Python callables
+    # that share a loop and report state changes via an LLM judge.
+    # See src/heartbeat/ for the full surface.
+    heartbeat_enabled: bool = False
+    heartbeat_notify_channel: str = ""   # "signal" | "telegram" | ""
+    heartbeat_notify_recipient: str = ""  # phone for Signal, chat id for Telegram
+
+    # First built-in hook: Blink camera monitoring.
+    blink_heartbeat_enabled: bool = False
+    blink_heartbeat_interval_minutes: int = 15
+    blink_credentials_path: str = ""  # empty = check workspace, then OpenClaw default
+
     # Built-in Agent SDK tools the bot is allowed to call during a turn.
     # Empty = no built-in tools (default — keeps the bot conversational
     # only). Non-empty = listed names are added to allowed_tools AND the
@@ -204,6 +217,12 @@ def load_config() -> Config:
         llm_stage_reflection=os.getenv("LLM_STAGE_REFLECTION", ""),
         near_api_key=os.getenv("NEAR_API_KEY", ""),
         near_base_url=os.getenv("NEAR_BASE_URL", ""),
+        heartbeat_enabled=os.getenv("HEARTBEAT_ENABLED", "").lower() in ("1", "true", "yes", "on"),
+        heartbeat_notify_channel=os.getenv("HEARTBEAT_NOTIFY_CHANNEL", ""),
+        heartbeat_notify_recipient=os.getenv("HEARTBEAT_NOTIFY_RECIPIENT", ""),
+        blink_heartbeat_enabled=os.getenv("BLINK_HEARTBEAT_ENABLED", "").lower() in ("1", "true", "yes", "on"),
+        blink_heartbeat_interval_minutes=int(os.getenv("BLINK_HEARTBEAT_INTERVAL_MINUTES", "15") or 15),
+        blink_credentials_path=os.getenv("BLINK_CREDENTIALS_PATH", ""),
         bot_builtin_tools=tuple(
             t.strip() for t in os.getenv("BOT_BUILTIN_TOOLS", "").split(",") if t.strip()
         ),

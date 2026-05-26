@@ -109,12 +109,23 @@ async def run_signal(config) -> None:
             config=config,
         )
 
+    # Heartbeat — lightweight in-process tasks running on sub-day
+    # cadence. Independent of the cron scheduler; both can run together.
+    # Channels dict shares the same Signal sender so notifications
+    # land in the same chat as scheduled jobs.
+    from src.heartbeat import setup_runner
+    heartbeat = setup_runner(config, {"signal": channel})
+
     try:
         await channel.start()
         if scheduler:
             await scheduler.start()
+        if heartbeat:
+            await heartbeat.start()
         await asyncio.Event().wait()
     finally:
+        if heartbeat:
+            await heartbeat.stop()
         if scheduler:
             await scheduler.stop()
         if store:
