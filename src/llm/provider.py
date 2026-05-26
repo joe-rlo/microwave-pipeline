@@ -211,7 +211,17 @@ class ProviderRequest:
     tools: list[ToolDefinition] = field(default_factory=list)
     max_tokens: int = 4096
     temperature: float | None = None
-    thinking_budget: int | None = None   # extended thinking budget; None = off
+    # Two thinking knobs — providers pick whichever shape their target
+    # model expects.
+    #   thinking_budget: integer token budget. Used by Anthropic's
+    #       legacy "enabled" mode and OpenAI's reasoning models. Some
+    #       Bedrock-hosted Claude models still accept this.
+    #   thinking_effort: string ("low" | "medium" | "high" | "max").
+    #       Used by Bedrock's newer "adaptive" mode (Sonnet 4.6+, Opus
+    #       4.7+) and by future provider-side adaptive shapes. When
+    #       present, adapters that support adaptive prefer this.
+    thinking_budget: int | None = None    # legacy enabled + budget_tokens
+    thinking_effort: str | None = None    # adaptive: low|medium|high|max
     stream: bool = True
     metadata: dict[str, str] = field(default_factory=dict)
 

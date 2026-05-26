@@ -214,7 +214,20 @@ class BedrockProvider:
     # --- Body shaping ---
 
     def _build_anthropic_body(self, req: ProviderRequest) -> dict[str, Any]:
-        """Translate a ProviderRequest into the Anthropic-on-Bedrock body."""
+        """Translate a ProviderRequest into the Anthropic-on-Bedrock body.
+
+        Extended thinking shape:
+          - Newer models on Bedrock (Sonnet 4.6+, Opus 4.7+) require
+            the ADAPTIVE shape: `thinking.type=adaptive` + a top-level
+            `output_config.effort` field. The legacy
+            `thinking.type=enabled` + `budget_tokens` shape returns
+            ValidationException on these models.
+          - We always emit the adaptive shape when thinking is
+            requested. If the caller only supplied `thinking_budget`
+            (legacy field) and no `thinking_effort`, we derive the
+            effort string from the budget so existing callers that
+            haven't been updated still work.
+        """
         body: dict[str, Any] = {
             "anthropic_version": ANTHROPIC_BEDROCK_VERSION,
             "max_tokens": req.max_tokens,
@@ -224,11 +237,12 @@ class BedrockProvider:
             body["system"] = req.system
         if req.temperature is not None:
             body["temperature"] = req.temperature
-        if req.thinking_budget is not None:
-            body["thinking"] = {
-                "type": "enabled",
-                "budget_tokens": req.thinking_budget,
-            }
+
+        effort = _resolve_thinking_effort(req)
+        if effort is not None:
+            body["thinking"] = {"type": "adaptive"}
+            body["output_config"] = {"effort": effort}
+
         if req.tools:
             body["tools"] = [_tool_to_anthropic(t) for t in req.tools]
         # NOTE: prompt caching is intentionally NOT enabled here. See
@@ -246,6 +260,43 @@ def _tool_to_anthropic(t: ToolDefinition) -> dict[str, Any]:
         "description": t.description,
         "input_schema": t.input_schema,
     }
+
+
+# Valid effort strings the Bedrock adaptive thinking shape accepts.
+# Mirrors LLMSession._EFFORT_BUDGETS keys so the round-trip is clean.
+_VALID_EFFORTS = ("low", "medium", "high", "max")
+
+
+def _resolve_thinking_effort(req) -> str | None:
+    """Decide which effort string to send for Bedrock's adaptive shape.
+
+    Preference order:
+      1. `thinking_effort` if explicitly set (and valid)
+      2. derived from `thinking_budget` via reverse mapping
+      3. None (no thinking section emitted)
+
+    Reverse mapping mirrors LLMSession._EFFORT_BUDGETS:
+      <= 2K  → low
+      <= 8K  → medium
+      <= 32K → high
+      else   → max
+    """
+    if req.thinking_effort:
+        effort = req.thinking_effort.strip().lower()
+        if effort in _VALID_EFFORTS:
+            return effort
+        # Unknown effort string — fall through to budget-based derivation
+        # if available, else None.
+    if req.thinking_budget is None or req.thinking_budget <= 0:
+        return None
+    b = req.thinking_budget
+    if b <= 2_000:
+        return "low"
+    if b <= 8_000:
+        return "medium"
+    if b <= 32_000:
+        return "high"
+    return "max"
 
 
 def _message_to_anthropic(m: ProviderMessage) -> dict[str, Any]:

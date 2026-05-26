@@ -460,11 +460,18 @@ class TestSendIntegration:
         assert body["tools"] == [{
             "name": "t", "description": "d", "input_schema": {"type": "object"},
         }]
-        assert body["thinking"] == {"type": "enabled", "budget_tokens": 8000}
+        # Bedrock adaptive thinking shape — see regression test below
+        # for the literal failure case this protects against.
+        assert body["thinking"] == {"type": "adaptive"}
+        # 8000 budget → "medium" effort per the reverse-mapping ladder
+        assert body["output_config"] == {"effort": "medium"}
         # CRITICAL: no prompt-cache-control field present.
         # The existing health spec disables caching pending BAA verification.
         body_str = call["body"]
         assert "cache_control" not in body_str
+        # And: no legacy enabled-budget shape leaked through
+        assert "budget_tokens" not in body_str
+        assert '"enabled"' not in body_str
 
     async def test_throttling_frame_yields_error(self):
         # Bedrock can interleave error frames into the stream.
@@ -491,3 +498,74 @@ class TestSendIntegration:
         req = ProviderRequest(model="bad", messages=[])
         events = [e async for e in provider.send(req)]
         assert any(isinstance(e, Error) for e in events)
+
+
+# --- Regression: adaptive thinking shape (real bug 2026-05-26) -----------
+
+
+class TestAdaptiveThinkingShape:
+    """Real production failure: us.anthropic.claude-sonnet-4-6 rejected
+    the legacy `thinking.type=enabled` + `budget_tokens` body with
+    "thinking.type.enabled is not supported for this model. Use
+    thinking.type.adaptive and output_config.effort to control thinking
+    behavior." These tests pin the new shape so it can't regress."""
+
+    def _build(self, **req_kwargs):
+        provider = BedrockProvider(region="us-east-1", client=_FakeBoto3([]))
+        req = ProviderRequest(model="m", messages=[], **req_kwargs)
+        return provider._build_anthropic_body(req)
+
+    def test_explicit_effort_uses_adaptive_shape(self):
+        body = self._build(thinking_effort="high")
+        assert body["thinking"] == {"type": "adaptive"}
+        assert body["output_config"] == {"effort": "high"}
+
+    @pytest.mark.parametrize("effort", ["low", "medium", "high", "max"])
+    def test_all_valid_efforts_pass_through(self, effort):
+        body = self._build(thinking_effort=effort)
+        assert body["output_config"]["effort"] == effort
+
+    def test_unknown_effort_falls_back_to_budget(self):
+        body = self._build(thinking_effort="bogus", thinking_budget=8_000)
+        # Invalid effort dropped → derive from budget (medium)
+        assert body["output_config"] == {"effort": "medium"}
+
+    @pytest.mark.parametrize("budget,expected", [
+        (1_000, "low"),
+        (2_000, "low"),
+        (4_000, "medium"),
+        (8_000, "medium"),
+        (16_000, "high"),
+        (32_000, "high"),
+        (64_000, "max"),
+        (100_000, "max"),
+    ])
+    def test_budget_to_effort_ladder(self, budget, expected):
+        # Back-compat: callers that only set thinking_budget still work.
+        body = self._build(thinking_budget=budget)
+        assert body["output_config"]["effort"] == expected
+        assert body["thinking"] == {"type": "adaptive"}
+
+    def test_no_thinking_request_emits_nothing(self):
+        body = self._build()
+        assert "thinking" not in body
+        assert "output_config" not in body
+
+    def test_zero_or_negative_budget_treated_as_no_thinking(self):
+        for b in (0, -1):
+            body = self._build(thinking_budget=b)
+            assert "thinking" not in body
+            assert "output_config" not in body
+
+    def test_explicit_effort_wins_over_budget(self):
+        # Both set → effort takes priority
+        body = self._build(thinking_effort="low", thinking_budget=64_000)
+        assert body["output_config"]["effort"] == "low"
+
+    def test_no_legacy_enabled_shape_ever_emitted(self):
+        # Belt-and-suspenders: even with both knobs, the body should
+        # NEVER contain the old enabled+budget_tokens form.
+        body = self._build(thinking_effort="high", thinking_budget=32_000)
+        thinking = body.get("thinking", {})
+        assert thinking.get("type") != "enabled"
+        assert "budget_tokens" not in thinking

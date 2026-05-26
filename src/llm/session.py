@@ -132,6 +132,7 @@ class LLMSession:
         self._system_prompt: str | None = None
         self._history: list[ProviderMessage] = []
         self._thinking_budget: int | None = None
+        self._thinking_effort: str | None = None
 
     # --- Lifecycle ---
 
@@ -166,7 +167,14 @@ class LLMSession:
     async def escalate(self, model: str, effort: str = "high") -> None:
         self._base_model = self.model
         self.model = model
-        self._thinking_budget = self._EFFORT_BUDGETS.get(effort.lower())
+        # Store BOTH the effort string and the derived token budget so
+        # providers can pick whichever shape their target model expects
+        # (Bedrock newer models want adaptive+effort; legacy
+        # Anthropic/OpenAI thinking want budget).
+        self._thinking_effort = effort.lower() if effort else None
+        self._thinking_budget = self._EFFORT_BUDGETS.get(
+            effort.lower() if effort else "",
+        )
         log.info(
             "LLMSession escalated: model=%s effort=%s budget=%s",
             model, effort, self._thinking_budget,
@@ -175,6 +183,7 @@ class LLMSession:
     async def de_escalate(self) -> None:
         self.model = self._base_model
         self._thinking_budget = None
+        self._thinking_effort = None
         log.info("LLMSession de-escalated back to %s", self.model)
 
     # --- Send ---
@@ -233,6 +242,7 @@ class LLMSession:
                 tools=list(self._tools),
                 max_tokens=self._max_tokens,
                 thinking_budget=self._thinking_budget,
+                thinking_effort=self._thinking_effort,
                 stream=True,
                 metadata={"stage": "main", "iter": str(iteration)},
             )

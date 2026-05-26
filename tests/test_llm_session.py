@@ -281,6 +281,9 @@ class TestEscalation:
 
         assert provider.last_request.model == "opus"
         assert provider.last_request.thinking_budget == 32_000
+        # Bedrock adaptive shape needs the effort string too, not just
+        # the budget. Both must flow on the same ProviderRequest.
+        assert provider.last_request.thinking_effort == "high"
 
     async def test_de_escalate_restores_base_model(self):
         provider = _ScriptedProvider([
