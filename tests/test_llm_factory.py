@@ -101,14 +101,23 @@ class TestToolsPassthrough:
         monkeypatch.setenv("LLM_STAGE_MAIN", "near:m")
         monkeypatch.setenv("NEAR_API_KEY", "k")
         # Disable always-on web + file tools so this assertion isolates
-        # to instacart/github wiring.
+        # to instacart/github wiring. Scheduler tools are always-on (they
+        # only need the local SQLite path that's already in config) so
+        # they appear here unconditionally.
         monkeypatch.setenv("WEB_TOOLS_DISABLED", "1")
         monkeypatch.setenv("FILE_TOOLS_DISABLED", "1")
         monkeypatch.setenv("WEBSEARCH_DISABLED", "1")
         config = _make_config()  # neither instacart nor github
         llm = build_main_llm(config)
-        assert llm._tools == []
-        assert llm._tool_handlers == {}
+        names = sorted(td.name for td in llm._tools)
+        assert names == sorted([
+            "scheduler_list",
+            "scheduler_get",
+            "scheduler_add",
+            "scheduler_remove",
+            "scheduler_set_enabled",
+        ])
+        assert set(llm._tool_handlers) == set(names)
 
     def test_github_tools_registered_on_session(self, monkeypatch):
         monkeypatch.setenv("LLM_STAGE_MAIN", "near:m")
@@ -118,14 +127,15 @@ class TestToolsPassthrough:
         monkeypatch.setenv("WEBSEARCH_DISABLED", "1")
         config = _make_config(github_token="ghp_fake")
         llm = build_main_llm(config)
-        # Three github tools should land on the session
-        names = sorted(td.name for td in llm._tools)
-        assert names == sorted([
+        # Three github tools should land on the session, alongside the
+        # always-on scheduler tools.
+        names = {td.name for td in llm._tools}
+        assert {
             "github_list_repos",
             "github_repo_summary",
             "github_recent_activity",
-        ])
-        assert set(llm._tool_handlers.keys()) == set(names)
+        } <= names
+        assert set(llm._tool_handlers.keys()) == names
 
     def test_webfetch_registered_by_default(self, monkeypatch):
         # Without WEB_TOOLS_DISABLED, webfetch appears on the NEAR path

@@ -33,13 +33,22 @@ class TestProviderRegistry:
     isolates to the env keys it controls. Web-tool registration is
     covered separately in test_web_tools.py."""
 
+    # Scheduler tools are always-on (DB-backed, no env key required).
+    # Tests below filter them out where keyed-only tools are under test.
+    _SCHED = {
+        "scheduler_list", "scheduler_get", "scheduler_add",
+        "scheduler_remove", "scheduler_set_enabled",
+    }
+
     def test_empty_when_no_keys(self, monkeypatch):
         monkeypatch.setenv("WEB_TOOLS_DISABLED", "1")
         monkeypatch.setenv("FILE_TOOLS_DISABLED", "1")
         monkeypatch.setenv("WEBSEARCH_DISABLED", "1")
         config = SimpleNamespace(instacart_api_key="", github_token="")
         tools = build_provider_tools(config)
-        assert tools == []
+        # Only scheduler tools should register without any env keys.
+        names = {t.definition.name for t in tools}
+        assert names == self._SCHED
 
     def test_instacart_only(self, monkeypatch):
         monkeypatch.setenv("WEB_TOOLS_DISABLED", "1")
@@ -51,8 +60,8 @@ class TestProviderRegistry:
             github_token="",
         )
         tools = build_provider_tools(config)
-        names = [t.definition.name for t in tools]
-        assert names == ["instacart_create_cart"]
+        names = {t.definition.name for t in tools} - self._SCHED
+        assert names == {"instacart_create_cart"}
 
     def test_github_only_registers_three(self, monkeypatch):
         monkeypatch.setenv("WEB_TOOLS_DISABLED", "1")
@@ -63,7 +72,10 @@ class TestProviderRegistry:
             github_token="ghp_fake",
         )
         tools = build_provider_tools(config)
-        names = [t.definition.name for t in tools]
+        names = [
+            t.definition.name for t in tools
+            if t.definition.name not in self._SCHED
+        ]
         assert names == [
             "github_list_repos",
             "github_repo_summary",
@@ -80,7 +92,10 @@ class TestProviderRegistry:
             github_token="ghp_fake",
         )
         tools = build_provider_tools(config)
-        names = sorted(t.definition.name for t in tools)
+        names = sorted(
+            t.definition.name for t in tools
+            if t.definition.name not in self._SCHED
+        )
         assert names == sorted([
             "instacart_create_cart",
             "github_list_repos",
@@ -101,7 +116,9 @@ class TestProviderRegistry:
         monkeypatch.setenv("WEBSEARCH_DISABLED", "1")
         config = SimpleNamespace(instacart_api_key="", github_token="")
         tools = build_provider_tools(config)
-        assert tools == []
+        # Only scheduler tools remain when every keyed/env tool is off.
+        names = {t.definition.name for t in tools}
+        assert names == self._SCHED
 
     def test_read_file_registered_when_workspace_set(self, monkeypatch, tmp_path):
         # workspace_dir present + FILE_TOOLS_DISABLED unset → read_file appears.

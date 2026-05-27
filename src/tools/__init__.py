@@ -175,8 +175,24 @@ def build_tools(config) -> ToolBundle:
             catalog_lines.append(WEBSEARCH_TOOL_DOCS)
             log.info("Registered native websearch tool")
 
+    # --- Scheduler docs (no SDK tool, provider-path only) -----------------
+    # The scheduler tool only exists on the provider path (build_provider_tools
+    # below). But the LLM reads its tool catalog from this function's
+    # `catalog_text`, so we splice the docs in here. No SDK MCP tool is
+    # registered for it — when the SDK path is finally removed in Phase C.4,
+    # this whole branch goes away cleanly.
+    from src.tools.scheduler import SCHEDULER_TOOL_DOCS
+
+    catalog_lines.append(SCHEDULER_TOOL_DOCS)
+
     if not tools:
-        return ToolBundle(mcp_servers={}, allowed_tools=[], catalog_text="")
+        # Catalog still ships even without SDK tools — the provider path
+        # may have tools (like scheduler) that aren't SDK-registered.
+        return ToolBundle(
+            mcp_servers={},
+            allowed_tools=[],
+            catalog_text="\n\n".join(catalog_lines),
+        )
 
     server = create_sdk_mcp_server(
         name=MCP_SERVER_NAME,
@@ -313,6 +329,57 @@ def build_provider_tools(config) -> list[ProviderTool]:
                 handler=_websearch,
             )
         )
+
+    # --- Scheduler (always on — same DB the daemon already uses) ---
+    from src.tools import scheduler as sched_mod
+
+    def _make_sched_handler(fn):
+        async def call(args: dict[str, Any]) -> str:
+            return await fn(args, config=config)
+        return call
+
+    out.extend([
+        ProviderTool(
+            definition=ToolDefinition(
+                name="scheduler_list",
+                description="List all scheduled jobs (name, cron, mode, channel, enabled, last-run).",
+                input_schema=sched_mod.SCHEDULER_LIST_SCHEMA,
+            ),
+            handler=_make_sched_handler(sched_mod._handle_list),
+        ),
+        ProviderTool(
+            definition=ToolDefinition(
+                name="scheduler_get",
+                description="Get full details on one scheduled job by name.",
+                input_schema=sched_mod.SCHEDULER_GET_SCHEMA,
+            ),
+            handler=_make_sched_handler(sched_mod._handle_get),
+        ),
+        ProviderTool(
+            definition=ToolDefinition(
+                name="scheduler_add",
+                description="Create a new scheduled job (mode: llm | direct | script).",
+                input_schema=sched_mod.SCHEDULER_ADD_SCHEMA,
+            ),
+            handler=_make_sched_handler(sched_mod._handle_add),
+        ),
+        ProviderTool(
+            definition=ToolDefinition(
+                name="scheduler_remove",
+                description="Delete a scheduled job by name.",
+                input_schema=sched_mod.SCHEDULER_REMOVE_SCHEMA,
+            ),
+            handler=_make_sched_handler(sched_mod._handle_remove),
+        ),
+        ProviderTool(
+            definition=ToolDefinition(
+                name="scheduler_set_enabled",
+                description="Enable or disable a scheduled job by name (keeps the row).",
+                input_schema=sched_mod.SCHEDULER_SET_ENABLED_SCHEMA,
+            ),
+            handler=_make_sched_handler(sched_mod._handle_set_enabled),
+        ),
+    ])
 
     # --- GitHub ---
     if getattr(config, "github_token", ""):
