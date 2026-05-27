@@ -97,16 +97,18 @@ class TestNearPath:
 
 
 class TestToolsPassthrough:
-    def test_no_tools_when_no_keys(self, monkeypatch):
+    def test_no_tools_when_no_keys(self, monkeypatch, tmp_path):
         monkeypatch.setenv("LLM_STAGE_MAIN", "near:m")
         monkeypatch.setenv("NEAR_API_KEY", "k")
         # Disable always-on web + file tools so this assertion isolates
         # to instacart/github wiring. Scheduler tools are always-on (they
         # only need the local SQLite path that's already in config) so
-        # they appear here unconditionally.
+        # they appear here unconditionally. Point Blink creds at a
+        # nonexistent path so the dev machine's real creds don't leak in.
         monkeypatch.setenv("WEB_TOOLS_DISABLED", "1")
         monkeypatch.setenv("FILE_TOOLS_DISABLED", "1")
         monkeypatch.setenv("WEBSEARCH_DISABLED", "1")
+        monkeypatch.setenv("BLINK_CREDENTIALS_PATH", str(tmp_path / "no-blink.json"))
         config = _make_config()  # neither instacart nor github
         llm = build_main_llm(config)
         names = sorted(td.name for td in llm._tools)

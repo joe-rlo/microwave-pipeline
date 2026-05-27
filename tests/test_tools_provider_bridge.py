@@ -40,6 +40,17 @@ class TestProviderRegistry:
         "scheduler_remove", "scheduler_set_enabled",
     }
 
+    @pytest.fixture(autouse=True)
+    def _no_blink(self, monkeypatch, tmp_path):
+        """Default: no Blink credentials → no Blink tools register.
+
+        On the dev machine the OpenClaw credentials file exists at
+        ~/Development/Claw Files/OpenClaw/scripts/blink-credentials.json,
+        which would otherwise add 4 tools to every assertion in this
+        class. Point at a nonexistent path so the gating is deterministic.
+        """
+        monkeypatch.setenv("BLINK_CREDENTIALS_PATH", str(tmp_path / "no-blink.json"))
+
     def test_empty_when_no_keys(self, monkeypatch):
         monkeypatch.setenv("WEB_TOOLS_DISABLED", "1")
         monkeypatch.setenv("FILE_TOOLS_DISABLED", "1")

@@ -185,6 +185,15 @@ def build_tools(config) -> ToolBundle:
 
     catalog_lines.append(SCHEDULER_TOOL_DOCS)
 
+    # --- Blink docs (provider-path only, gated on creds file) -------------
+    # Same provider-only pattern as the scheduler tool above. Gated so the
+    # LLM doesn't see Blink tools advertised when there's no way to call
+    # them (no creds → tool would error on every invocation).
+    from src.tools import blink as blink_mod
+
+    if blink_mod.credentials_available():
+        catalog_lines.append(blink_mod.BLINK_TOOL_DOCS)
+
     if not tools:
         # Catalog still ships even without SDK tools — the provider path
         # may have tools (like scheduler) that aren't SDK-registered.
@@ -329,6 +338,45 @@ def build_provider_tools(config) -> list[ProviderTool]:
                 handler=_websearch,
             )
         )
+
+    # --- Blink (gated on credentials file presence) ---
+    from src.tools import blink as blink_mod
+
+    if blink_mod.credentials_available():
+        out.extend([
+            ProviderTool(
+                definition=ToolDefinition(
+                    name="blink_status",
+                    description="Read Blink system snapshot (networks armed, cameras battery/wifi/temp, sync modules).",
+                    input_schema=blink_mod.BLINK_STATUS_SCHEMA,
+                ),
+                handler=blink_mod._handle_status,
+            ),
+            ProviderTool(
+                definition=ToolDefinition(
+                    name="blink_arm",
+                    description="Arm a Blink network by name (turns motion detection ON).",
+                    input_schema=blink_mod.BLINK_ARM_SCHEMA,
+                ),
+                handler=blink_mod._handle_arm,
+            ),
+            ProviderTool(
+                definition=ToolDefinition(
+                    name="blink_disarm",
+                    description="Disarm a Blink network by name (turns motion detection OFF).",
+                    input_schema=blink_mod.BLINK_DISARM_SCHEMA,
+                ),
+                handler=blink_mod._handle_disarm,
+            ),
+            ProviderTool(
+                definition=ToolDefinition(
+                    name="blink_snap",
+                    description="Trigger a fresh thumbnail capture on a Blink camera by name.",
+                    input_schema=blink_mod.BLINK_SNAP_SCHEMA,
+                ),
+                handler=blink_mod._handle_snap,
+            ),
+        ])
 
     # --- Scheduler (always on — same DB the daemon already uses) ---
     from src.tools import scheduler as sched_mod
