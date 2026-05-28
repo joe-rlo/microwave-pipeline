@@ -218,34 +218,85 @@ class TestBuildBaaLlm:
         assert result is None
         assert any("vertex" in r.message for r in caplog.records)
 
-    def test_returns_llmsession_when_fully_configured(self, monkeypatch):
-        monkeypatch.setenv("AWS_REGION", "us-east-1")
-        config = _make_config()
-        config.health = _make_health_baa_config()
-
-        # Inject a fake bedrock client via the provider's `client` arg
-        # would require patching boto3.client at the import site; simpler
-        # is to confirm the factory returns an LLMSession with the
-        # right model + no tools, and trust the provider's own tests.
-        # We monkeypatch boto3 import to avoid the real dependency.
-        from src.llm.providers import bedrock as bedrock_mod
-
-        # Build a placeholder boto3 module so BedrockProvider's lazy
-        # import succeeds even though the real boto3 isn't installed.
+    def _stub_boto3(self, monkeypatch):
+        """Shared boto3 stub so BedrockProvider's lazy import succeeds in
+        tests without the real dependency installed."""
         class _StubBoto3:
             @staticmethod
             def client(name, **kwargs):
-                return object()  # never called in this test
-
+                return object()
         import sys
         monkeypatch.setitem(sys.modules, "boto3", _StubBoto3)
+
+    def test_returns_llmsession_when_fully_configured(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("AWS_REGION", "us-east-1")
+        # Isolate from always-on tools we don't care about for this assertion
+        monkeypatch.setenv("WEB_TOOLS_DISABLED", "1")
+        monkeypatch.setenv("FILE_TOOLS_DISABLED", "1")
+        monkeypatch.setenv("WEBSEARCH_DISABLED", "1")
+        monkeypatch.setenv("BLINK_CREDENTIALS_PATH", str(tmp_path / "no-blink.json"))
+        self._stub_boto3(monkeypatch)
+        config = _make_config()
+        config.health = _make_health_baa_config()
 
         llm = build_baa_llm(config)
         assert isinstance(llm, LLMSession)
         assert llm.model == "anthropic.claude-sonnet-4-x"
-        # No tools wired on the BAA path
-        assert llm._tools == []
-        assert llm._tool_handlers == {}
+        # Health-profile tools are now wired on BAA so the LLM can answer
+        # "what's in my profile?" instead of confabulating "empty".
+        names = {td.name for td in llm._tools}
+        assert names == {
+            "health_profile_summary",
+            "health_profile_show",
+            "health_profile_audit",
+        }
+        # Handlers agree
+        assert set(llm._tool_handlers) == names
+
+    def test_external_tools_never_register_on_baa_path(self, monkeypatch, tmp_path):
+        """PHI privacy regression: webfetch / github / instacart / blink
+        / scheduler MUST NOT be exposed to the BAA model even when their
+        own gate conditions are met. They could leak PHI to external
+        services. Adding any of them to the BAA path requires explicit
+        opt-in via _BAA_ALLOWED_TOOLS, which this test guards."""
+        monkeypatch.setenv("AWS_REGION", "us-east-1")
+        # Try to enable EVERY external tool — they should still be filtered out
+        monkeypatch.delenv("WEB_TOOLS_DISABLED", raising=False)
+        monkeypatch.delenv("FILE_TOOLS_DISABLED", raising=False)
+        monkeypatch.delenv("WEBSEARCH_DISABLED", raising=False)
+        # Real blink creds present on the dev machine — point elsewhere
+        # so the test isn't sensitive to machine state.
+        monkeypatch.setenv("BLINK_CREDENTIALS_PATH", str(tmp_path / "no-blink.json"))
+        self._stub_boto3(monkeypatch)
+
+        config = _make_config(
+            github_token="ghp_fake",
+            instacart_api_key="ic_fake",
+        )
+        config.workspace_dir = tmp_path / "ws"
+        config.health = _make_health_baa_config()
+
+        llm = build_baa_llm(config)
+        names = {td.name for td in llm._tools}
+        # Forbidden families on BAA
+        forbidden_prefixes = ("github_", "instacart_", "blink_", "webfetch", "read_file", "websearch", "scheduler_")
+        leaked = [n for n in names if n.startswith(forbidden_prefixes)]
+        assert leaked == [], f"BAA path leaked external tools: {leaked}"
+        # And we still have the health-profile tools
+        assert "health_profile_summary" in names
+
+    def test_baa_omits_health_tools_when_module_off(self, monkeypatch, tmp_path):
+        """Sanity: the gating that makes health-profile tools register
+        (config.health.enabled) is the SAME gate that lets build_baa_llm
+        return non-None. So a disabled health module → no BAA LLM at all,
+        not a BAA LLM with empty tools. This test just pins that path."""
+        monkeypatch.setenv("AWS_REGION", "us-east-1")
+        config = _make_config()
+        # phi_path_available will be False here
+        config.health = HealthConfig(
+            enabled=False, baa_provider="bedrock", baa_model_main="x",
+        )
+        assert build_baa_llm(config) is None
 
     def test_builtin_tools_warn_on_near_path(self, monkeypatch, caplog):
         # BOT_BUILTIN_TOOLS is an SDK-only feature. When set alongside

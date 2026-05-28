@@ -135,10 +135,19 @@ def build_baa_llm(config: Any):
     are present in env, and the BAA model IDs are configured. Returns
     None in any other case — the router uses `decline_phi` instead.
 
-    No tools are wired on the BAA path. PHI responses are
-    evidence-grounded via the spliced `[Evidence context]` block + the
-    `health-qa` skill body. Cross-tool calls aren't part of the spec
-    (and webfetch / instacart / github don't need to see PHI prompts).
+    Tool wiring policy: the BAA path is privacy-restricted on purpose.
+    External-service tools (webfetch / instacart / github / blink) are
+    NEVER registered here — letting the model call them on a PHI turn
+    would leak personal health data outside the BAA boundary. Only
+    tools whose handlers touch the user's own local encrypted profile
+    DB (and therefore can't exfiltrate) are exposed. Currently:
+
+      - health_profile_summary / _show / _audit (read-only)
+
+    New tools intended for the BAA path must be added explicitly to
+    `_BAA_ALLOWED_TOOLS` below — opt-in, not name-prefix magic. A new
+    health_* tool that talks to an external API would NOT belong on
+    this list even though its name shares the prefix.
 
     Lifecycle is per-turn (the orchestrator constructs, connects,
     sends, disconnects). That keeps PHI history isolated from the main
@@ -167,6 +176,7 @@ def build_baa_llm(config: Any):
 
     from src.llm.providers.bedrock import BedrockProvider
     from src.llm.session import LLMSession
+    from src.tools import build_provider_tools
 
     try:
         provider = BedrockProvider(region=region)
@@ -174,12 +184,35 @@ def build_baa_llm(config: Any):
         log.error("Failed to construct BedrockProvider: %s", e)
         return None
 
+    # Filter the registered provider tools down to the PHI-safe allowlist.
+    # See class docstring above for the policy.
+    all_tools = build_provider_tools(config)
+    baa_tools = [t for t in all_tools if t.definition.name in _BAA_ALLOWED_TOOLS]
+    if baa_tools:
+        log.info(
+            "[baa] Registered %d BAA-safe tool(s): %s",
+            len(baa_tools),
+            ", ".join(t.definition.name for t in baa_tools),
+        )
+
     return LLMSession(
         model=health.baa_model_main,
         provider=provider,
-        tools=[],
-        tool_handlers={},
+        tools=[t.definition for t in baa_tools],
+        tool_handlers={t.definition.name: t.handler for t in baa_tools},
     )
+
+
+# Allowlist of tool names that may be called from the BAA path. Membership
+# means the tool's handler does NOT leak PHI to any external service —
+# typically because it only reads the user's own local encrypted DB.
+# Adding here is an explicit privacy assertion; don't expand without
+# verifying the handler's network surface.
+_BAA_ALLOWED_TOOLS = frozenset({
+    "health_profile_summary",
+    "health_profile_show",
+    "health_profile_audit",
+})
 
 
 def _build_near_session(config: Any, model_override: str):
