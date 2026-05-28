@@ -194,6 +194,12 @@ def build_tools(config) -> ToolBundle:
     if blink_mod.credentials_available():
         catalog_lines.append(blink_mod.BLINK_TOOL_DOCS)
 
+    # --- Health profile docs (provider-path only, gated on health enabled) -
+    from src.tools import health_profile as hp_mod
+
+    if hp_mod.health_module_available(config):
+        catalog_lines.append(hp_mod.HEALTH_PROFILE_TOOL_DOCS)
+
     if not tools:
         # Catalog still ships even without SDK tools — the provider path
         # may have tools (like scheduler) that aren't SDK-registered.
@@ -338,6 +344,44 @@ def build_provider_tools(config) -> list[ProviderTool]:
                 handler=_websearch,
             )
         )
+
+    # --- Health profile (gated on HEALTH_MODULE_ENABLED) ---
+    # All three handlers are read-only; destructive ops stay behind the
+    # `/profile clear` slash command which requires an explicit phrase.
+    from src.tools import health_profile as hp_mod
+
+    if hp_mod.health_module_available(config):
+        def _make_hp_handler(fn):
+            async def call(args: dict[str, Any]) -> str:
+                return await fn(args, config=config)
+            return call
+
+        out.extend([
+            ProviderTool(
+                definition=ToolDefinition(
+                    name="health_profile_summary",
+                    description="Read a high-level snapshot of the user's health profile: section counts + last updated.",
+                    input_schema=hp_mod.HEALTH_PROFILE_SUMMARY_SCHEMA,
+                ),
+                handler=_make_hp_handler(hp_mod._handle_summary),
+            ),
+            ProviderTool(
+                definition=ToolDefinition(
+                    name="health_profile_show",
+                    description="Get the detailed contents of one profile section (medications, conditions, allergies, etc.).",
+                    input_schema=hp_mod.HEALTH_PROFILE_SHOW_SCHEMA,
+                ),
+                handler=_make_hp_handler(hp_mod._handle_show),
+            ),
+            ProviderTool(
+                definition=ToolDefinition(
+                    name="health_profile_audit",
+                    description="Recent change-log entries for the profile (op + section + timestamp).",
+                    input_schema=hp_mod.HEALTH_PROFILE_AUDIT_SCHEMA,
+                ),
+                handler=_make_hp_handler(hp_mod._handle_audit),
+            ),
+        ])
 
     # --- Blink (gated on credentials file presence) ---
     from src.tools import blink as blink_mod
