@@ -7,154 +7,23 @@ The output is a single Excalidraw file you can open at excalidraw.com
 Why generate vs hand-author: Excalidraw's JSON has a lot of required
 boilerplate per element. Keeping the layout in code lets future edits
 land as small diffs instead of merge-conflict-prone giant JSONs.
+
+Shared element factories + palette live in `_excalidraw_lib.py` —
+sibling generators import from there too.
 """
 
 from __future__ import annotations
 
 import json
-import random
-import time
 from pathlib import Path
 
-random.seed(20260528)  # deterministic so reruns don't churn the file
+from _excalidraw_lib import (
+    rect, diamond, label, arrow,
+    CHANNEL_BG, PIPE_BG, ROUTER_BG, LANE_NEAR_BG, LANE_BAA_BG, LANE_TEE_BG,
+    STORE_BG, LOOP_BG, TOOL_BG,
+)
 
 OUT = Path(__file__).parent / "architecture.excalidraw"
-
-
-def _seed() -> int:
-    return random.randint(1, 2**31 - 1)
-
-
-def _nonce() -> int:
-    return random.randint(1, 2**31 - 1)
-
-
-_NOW = int(time.time() * 1000)
-_ID_COUNTER = [0]
-
-
-def _id(prefix: str) -> str:
-    _ID_COUNTER[0] += 1
-    return f"{prefix}_{_ID_COUNTER[0]}"
-
-
-def rect(
-    *, x, y, w, h, text, bg="transparent", stroke="#1e1e1e",
-    text_color=None, font_size=16, kind="rectangle",
-    stroke_width=2, roughness=1,
-):
-    """Make a rounded rectangle with centered text (two linked elements)."""
-    rid = _id("rect")
-    tid = _id("text")
-    rect_el = {
-        "id": rid, "type": kind,
-        "x": x, "y": y, "width": w, "height": h,
-        "angle": 0, "strokeColor": stroke, "backgroundColor": bg,
-        "fillStyle": "solid" if bg != "transparent" else "hachure",
-        "strokeWidth": stroke_width, "strokeStyle": "solid",
-        "roughness": roughness, "opacity": 100,
-        "groupIds": [], "frameId": None,
-        "roundness": {"type": 3} if kind == "rectangle" else None,
-        "seed": _seed(), "version": 1, "versionNonce": _nonce(),
-        "isDeleted": False, "boundElements": [{"type": "text", "id": tid}],
-        "updated": _NOW, "link": None, "locked": False,
-    }
-    # Text wrapping inside a container: container handles bounds, text auto-fits
-    text_el = {
-        "id": tid, "type": "text",
-        "x": x + 8, "y": y + 8, "width": w - 16, "height": h - 16,
-        "angle": 0, "strokeColor": text_color or stroke,
-        "backgroundColor": "transparent",
-        "fillStyle": "solid", "strokeWidth": 2, "strokeStyle": "solid",
-        "roughness": 1, "opacity": 100,
-        "groupIds": [], "frameId": None, "roundness": None,
-        "seed": _seed(), "version": 1, "versionNonce": _nonce(),
-        "isDeleted": False, "boundElements": [],
-        "updated": _NOW, "link": None, "locked": False,
-        "fontSize": font_size, "fontFamily": 5,  # 5 = Excalifont (default new)
-        "text": text, "textAlign": "center", "verticalAlign": "middle",
-        "baseline": int(font_size * 0.85),
-        "containerId": rid, "originalText": text,
-        "lineHeight": 1.25,
-    }
-    return rect_el, text_el, rid
-
-
-def diamond(*, x, y, w, h, text, bg="#fff3bf"):
-    """Decision diamond — same shape as rectangle but kind=diamond."""
-    return rect(x=x, y=y, w=w, h=h, text=text, bg=bg, kind="diamond")
-
-
-def label(*, x, y, text, font_size=20, color="#1e1e1e", bold=False):
-    """Free-floating text (section header, annotation)."""
-    tid = _id("text")
-    # rough text width estimate so the element has plausible dims
-    width = max(80, int(len(text) * font_size * 0.55))
-    height = int(font_size * 1.4)
-    return {
-        "id": tid, "type": "text",
-        "x": x, "y": y, "width": width, "height": height,
-        "angle": 0, "strokeColor": color, "backgroundColor": "transparent",
-        "fillStyle": "solid", "strokeWidth": 2, "strokeStyle": "solid",
-        "roughness": 1, "opacity": 100,
-        "groupIds": [], "frameId": None, "roundness": None,
-        "seed": _seed(), "version": 1, "versionNonce": _nonce(),
-        "isDeleted": False, "boundElements": [],
-        "updated": _NOW, "link": None, "locked": False,
-        "fontSize": font_size, "fontFamily": 5,
-        "text": text, "textAlign": "left", "verticalAlign": "top",
-        "baseline": int(font_size * 0.85),
-        "containerId": None, "originalText": text,
-        "lineHeight": 1.25,
-    }
-
-
-def arrow(*, src_id, dst_id, label_text=None, dashed=False, color="#1e1e1e"):
-    """Arrow between two element IDs. Endpoints auto-bind to elements."""
-    aid = _id("arrow")
-    el = {
-        "id": aid, "type": "arrow",
-        "x": 0, "y": 0, "width": 100, "height": 0,
-        "angle": 0, "strokeColor": color, "backgroundColor": "transparent",
-        "fillStyle": "solid", "strokeWidth": 2,
-        "strokeStyle": "dashed" if dashed else "solid",
-        "roughness": 1, "opacity": 100,
-        "groupIds": [], "frameId": None, "roundness": {"type": 2},
-        "seed": _seed(), "version": 1, "versionNonce": _nonce(),
-        "isDeleted": False, "boundElements": [],
-        "updated": _NOW, "link": None, "locked": False,
-        "points": [[0, 0], [100, 0]],
-        "lastCommittedPoint": None,
-        "startBinding": {"elementId": src_id, "focus": 0, "gap": 4},
-        "endBinding": {"elementId": dst_id, "focus": 0, "gap": 4},
-        "startArrowhead": None, "endArrowhead": "arrow",
-        "elbowed": False,
-    }
-    extras = []
-    if label_text:
-        # small overlay label — place near arrow midpoint after the fact
-        extras.append(label(x=0, y=0, text=label_text, font_size=12,
-                            color=color))
-    return el, extras
-
-
-# --- Palette --------------------------------------------------------------
-
-CHANNEL_BG = "#d0ebff"     # input channels (Signal/Telegram/REPL)
-PIPE_BG = "#e7f5ff"        # pipeline stages
-ROUTER_BG = "#fff3bf"      # decision points
-LANE_NEAR_BG = "#d3f9d8"   # NEAR (general) lane
-LANE_BAA_BG = "#ffe3e3"    # BAA Bedrock lane (PHI)
-LANE_TEE_BG = "#fff0f6"    # Private TEE lane
-STORE_BG = "#ffe8cc"       # data stores
-LOOP_BG = "#e5dbff"        # background loops
-TOOL_BG = "#fff9db"        # tool registry
-
-
-# === Layout ===============================================================
-#
-# Coordinate system: x grows right, y grows down. Origin top-left.
-# Diagram is roughly 2400 wide × 1900 tall.
 
 elements: list = []
 
