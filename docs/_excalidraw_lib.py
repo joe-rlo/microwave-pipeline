@@ -101,11 +101,52 @@ def label(*, x, y, text, font_size=20, color="#1e1e1e"):
     }
 
 
-def arrow(*, src_id, dst_id, label_text=None, dashed=False, color="#1e1e1e"):
+def _edge_point(el, side: str) -> tuple[float, float]:
+    """Center of one side of a rect/diamond, in absolute coords."""
+    x, y, w, h = el["x"], el["y"], el["width"], el["height"]
+    cx, cy = x + w / 2, y + h / 2
+    if side == "right":  return (x + w, cy)
+    if side == "left":   return (x, cy)
+    if side == "top":    return (cx, y)
+    if side == "bottom": return (cx, y + h)
+    raise ValueError(side)
+
+
+def _pick_sides(src, dst) -> tuple[str, str]:
+    """Pick which edges of src + dst to connect.
+
+    Heuristic: whichever axis has the larger center-to-center delta wins.
+    Horizontal-dominant → right→left or left→right. Vertical-dominant →
+    bottom→top or top→bottom. Same-on-an-axis falls through cleanly.
+    """
+    sx = src["x"] + src["width"] / 2
+    sy = src["y"] + src["height"] / 2
+    dx = dst["x"] + dst["width"] / 2
+    dy = dst["y"] + dst["height"] / 2
+    if abs(dx - sx) >= abs(dy - sy):
+        return ("right", "left") if dx >= sx else ("left", "right")
+    return ("bottom", "top") if dy >= sy else ("top", "bottom")
+
+
+def arrow(*, src, dst, label_text=None, dashed=False, color="#1e1e1e",
+          src_side=None, dst_side=None):
+    """Connect two element dicts with a straight arrow.
+
+    Excalidraw renders an arrow based on its own (x, y) + `points` —
+    `startBinding` / `endBinding` only control snap-on-drag in the
+    editor, not rendering geometry. So we compute real edge points
+    here. Pass `src_side` / `dst_side` (one of left/right/top/bottom)
+    to override the auto-picked sides when the heuristic chooses
+    something ugly.
+    """
+    s_side, d_side = (src_side, dst_side) if src_side and dst_side else _pick_sides(src, dst)
+    sx, sy = _edge_point(src, s_side)
+    dx, dy = _edge_point(dst, d_side)
     aid = _id("arrow")
     el = {
         "id": aid, "type": "arrow",
-        "x": 0, "y": 0, "width": 100, "height": 0,
+        "x": sx, "y": sy,
+        "width": abs(dx - sx), "height": abs(dy - sy),
         "angle": 0, "strokeColor": color, "backgroundColor": "transparent",
         "fillStyle": "solid", "strokeWidth": 2,
         "strokeStyle": "dashed" if dashed else "solid",
@@ -114,17 +155,22 @@ def arrow(*, src_id, dst_id, label_text=None, dashed=False, color="#1e1e1e"):
         "seed": _seed(), "version": 1, "versionNonce": _nonce(),
         "isDeleted": False, "boundElements": [],
         "updated": _NOW, "link": None, "locked": False,
-        "points": [[0, 0], [100, 0]],
+        "points": [[0, 0], [dx - sx, dy - sy]],
         "lastCommittedPoint": None,
-        "startBinding": {"elementId": src_id, "focus": 0, "gap": 4},
-        "endBinding": {"elementId": dst_id, "focus": 0, "gap": 4},
+        "startBinding": {"elementId": src["id"], "focus": 0, "gap": 1},
+        "endBinding": {"elementId": dst["id"], "focus": 0, "gap": 1},
         "startArrowhead": None, "endArrowhead": "arrow",
         "elbowed": False,
     }
     extras = []
     if label_text:
-        extras.append(label(x=0, y=0, text=label_text, font_size=12,
-                            color=color))
+        # Place the label near the arrow's midpoint, slightly above the line
+        mid_x = (sx + dx) / 2
+        mid_y = (sy + dy) / 2
+        extras.append(label(
+            x=mid_x - len(label_text) * 3, y=mid_y - 18,
+            text=label_text, font_size=11, color=color,
+        ))
     return el, extras
 
 

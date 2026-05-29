@@ -273,8 +273,11 @@ add(sched_loop_r, sched_loop_t, hb_r, hb_t, consol_r, consol_t)
 
 # --- Arrows ---------------------------------------------------------------
 
-def link(src, dst, **kw):
-    el, extras = arrow(src_id=src, dst_id=dst, **kw)
+def link(src_id, dst_id, **kw):
+    # Resolve ids → element dicts so arrow() can compute real geometry.
+    src = next(e for e in elements if e["id"] == src_id)
+    dst = next(e for e in elements if e["id"] == dst_id)
+    el, extras = arrow(src=src, dst=dst, **kw)
     add(el)
     add(*extras)
 

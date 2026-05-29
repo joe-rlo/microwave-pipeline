@@ -251,8 +251,10 @@ add(u1, u1t, u2, u2t, u3, u3t, u4, u4t)
 
 # === Arrows ===============================================================
 
-def link(src, dst, **kw):
-    el, extras = arrow(src_id=src, dst_id=dst, **kw)
+def link(src_id, dst_id, **kw):
+    src = next(e for e in elements if e["id"] == src_id)
+    dst = next(e for e in elements if e["id"] == dst_id)
+    el, extras = arrow(src=src, dst=dst, **kw)
     add(el)
     add(*extras)
 

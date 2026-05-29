@@ -171,8 +171,10 @@ add(audit_r, audit_t)
 
 
 # --- Arrows ---
-def link(src, dst, **kw):
-    el, extras = arrow(src_id=src, dst_id=dst, **kw)
+def link(src_id, dst_id, **kw):
+    src = next(e for e in elements if e["id"] == src_id)
+    dst = next(e for e in elements if e["id"] == dst_id)
+    el, extras = arrow(src=src, dst=dst, **kw)
     add(el)
     add(*extras)
 
