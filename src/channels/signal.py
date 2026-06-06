@@ -24,6 +24,7 @@ import aiohttp
 
 from src.channels.base import Channel
 from src.channels._http import make_session
+from src.channels._pdf import extract_pdf_text
 from src.channels.signal_format import markdown_to_signal_text
 from src.channels.tts import TTSError, synthesize as tts_synthesize
 from src.health.profile.chat import handle_profile_command
@@ -130,6 +131,13 @@ class _PendingTurn:
     # passed through to the pipeline as multimodal content blocks.
     # Persists across addendum re-flushes so we don't have to re-download.
     images: list[tuple[bytes, str]] = field(default_factory=list)
+    # Tuples of (pdf_bytes, filename) — extracted to text at flush time
+    # (the model can't see the PDF itself on Max auth), mirroring how
+    # `voice` is transcribed lazily so a chunked voice+PDF turn coalesces.
+    pdfs: list[tuple[bytes, str]] = field(default_factory=list)
+    # Already-extracted PDF text. Drained from `pdfs` by _flush_pending;
+    # persists across addendum re-flushes so extraction/OCR isn't redone.
+    pdf_texts: list[str] = field(default_factory=list)
     is_typing: bool = False
     debounce_task: asyncio.Task | None = None
     maxhold_task: asyncio.Task | None = None
@@ -270,8 +278,9 @@ class SignalChannel(Channel):
         attachments = data.get("attachments") or []
         voice_attachments = [a for a in attachments if _is_voice_note(a)]
         image_attachments = [a for a in attachments if _is_image(a)]
+        pdf_attachments = [a for a in attachments if _is_pdf(a)]
 
-        if not text and not voice_attachments and not image_attachments:
+        if not text and not voice_attachments and not image_attachments and not pdf_attachments:
             return  # receipts, empty syncs, etc.
 
         # Swipe-to-reply context. Signal's daemon attaches a `quote` block
@@ -294,7 +303,7 @@ class SignalChannel(Channel):
         # They're meant to land instantly and don't combine meaningfully
         # with other input. Skip if the user also sent a voice note OR an
         # image — treat those as content, not a command.
-        if text and not voice_attachments and not image_attachments:
+        if text and not voice_attachments and not image_attachments and not pdf_attachments:
             for handler in (
                 handle_skill_command,
                 handle_project_command,
@@ -335,11 +344,27 @@ class SignalChannel(Channel):
                     source, f"*⚠️ couldn't download that image: {e}*"
                 )
 
+        # Download PDFs at receive-time too — extraction (and any OCR) is
+        # deferred to flush so a PDF + a follow-up text caption coalesce
+        # into a single turn, same as voice.
+        downloaded_pdfs: list[tuple[bytes, str]] = []
+        for att in pdf_attachments:
+            try:
+                pdf = await self._download_attachment(att["id"])
+                fname = att.get("filename") or att.get("fileName") or "document.pdf"
+                downloaded_pdfs.append((pdf, fname))
+            except Exception as e:
+                log.warning(f"PDF download failed: {e}")
+                await self._send_text(
+                    source, f"*⚠️ couldn't download that PDF: {e}*"
+                )
+
         await self._buffer_input(
             source,
             text=text,
             voice=downloaded_voice,
             images=downloaded_images,
+            pdfs=downloaded_pdfs,
         )
 
     async def _handle_typing(self, source: str, action: str) -> None:
@@ -379,6 +404,7 @@ class SignalChannel(Channel):
         text: str = "",
         voice: list[tuple[bytes, str]] | None = None,
         images: list[tuple[bytes, str]] | None = None,
+        pdfs: list[tuple[bytes, str]] | None = None,
     ) -> None:
         """Append to the per-sender buffer.
 
@@ -437,6 +463,8 @@ class SignalChannel(Channel):
                         target.voice.extend(voice)
                     if images:
                         target.images.extend(images)
+                    if pdfs:
+                        target.pdfs.extend(pdfs)
                     if target.debounce_task and not target.debounce_task.done():
                         target.debounce_task.cancel()
                     if not target.is_typing:
@@ -465,6 +493,8 @@ class SignalChannel(Channel):
                     queued.voice.extend(voice)
                 if images:
                     queued.images.extend(images)
+                if pdfs:
+                    queued.pdfs.extend(pdfs)
                 # No debounce here — promotion in _safe_process's finally
                 # arms it once the active pipeline clears.
                 return
@@ -488,6 +518,8 @@ class SignalChannel(Channel):
                 pending.voice.extend(voice)
             if images:
                 pending.images.extend(images)
+            if pdfs:
+                pending.pdfs.extend(pdfs)
 
             # Reset debounce: cancel old timer, start a fresh DEBOUNCE_SECONDS
             # countdown. Skip if user is actively typing — they'll resume the
@@ -566,6 +598,8 @@ class SignalChannel(Channel):
             and not pending.voice
             and not pending.transcribed
             and not pending.images
+            and not pending.pdfs
+            and not pending.pdf_texts
         ):
             return
 
@@ -594,6 +628,38 @@ class SignalChannel(Channel):
             voice_combined = "\n".join(new_transcripts)
             await self._send_text(source, f'*heard: "{voice_combined}"*')
 
+        # Extract any PDFs we haven't yet — drain `pdfs` into `pdf_texts`
+        # so the (potentially slow, OCR-bearing) extraction survives an
+        # addendum re-flush, exactly like voice transcription above.
+        new_pdf_texts: list[str] = []
+        if pending.pdfs:
+            pdfs_to_process = list(pending.pdfs)
+            pending.pdfs.clear()
+            for pdf_bytes, fname in pdfs_to_process:
+                try:
+                    extract = await extract_pdf_text(
+                        pdf_bytes, openai_api_key=self.openai_api_key
+                    )
+                except Exception as e:
+                    log.warning(f"PDF extraction failed: {e}")
+                    extract = None
+                if extract and extract.ok:
+                    note = " (scanned, OCR'd)" if extract.method == "ocr" else ""
+                    if extract.page_truncated:
+                        note += " [first pages only]"
+                    elif extract.char_truncated:
+                        note += " [truncated]"
+                    new_pdf_texts.append(
+                        f"[PDF: {fname}{note}]\n{extract.text}"
+                    )
+                else:
+                    await self._send_text(
+                        source,
+                        f"*⚠️ received {fname} but couldn't read its contents "
+                        "— paste the values as text and I'll log them*",
+                    )
+            pending.pdf_texts.extend(new_pdf_texts)
+
         # Compose the final input. Voice and text are tagged so the LLM
         # can tell them apart even when bundled together. Inline override
         # markers ("reply by voice" / "reply by text") are detected and
@@ -611,6 +677,16 @@ class SignalChannel(Channel):
                     parts.append(f"[text caption] {joined}")
                 else:
                     parts.append(joined)
+        # PDF text rides along as its own tagged block(s). When the PDF
+        # came with no caption we add a nudge so the model does something
+        # useful with it rather than just acknowledging receipt.
+        if pending.pdf_texts:
+            parts.extend(pending.pdf_texts)
+            if not all_transcripts and not clean_messages:
+                parts.append(
+                    "The user sent the PDF above with no caption. "
+                    "Acknowledge it and ask what they'd like to do with it."
+                )
         final = "\n\n".join(parts)
         # If only images were sent (no text, no voice), give the model a
         # generic prompt — Anthropic's API requires at least one text block
@@ -1221,6 +1297,18 @@ def _is_image(att: dict) -> bool:
     """
     ct = (att.get("contentType") or "").lower()
     return ct.startswith("image/")
+
+
+def _is_pdf(att: dict) -> bool:
+    """Match PDF attachments by content-type or filename. Signal labels
+    them `application/pdf`, but fall back to the extension in case the
+    daemon sends an empty/generic content-type.
+    """
+    ct = (att.get("contentType") or "").lower()
+    if ct == "application/pdf":
+        return True
+    fname = (att.get("filename") or att.get("fileName") or "").lower()
+    return fname.endswith(".pdf")
 
 
 def _ext_for_content_type(content_type: str) -> str:

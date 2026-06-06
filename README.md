@@ -729,8 +729,11 @@ Health module CLI (only relevant when `HEALTH_MODULE_ENABLED=true`):
 You can send files (documents, photos, text files) to Microwave in Telegram. It reads the content and includes it in the conversation:
 
 - **Text files** (`.txt`, `.md`, `.py`, `.json`, `.csv`, etc.) — content is extracted and included with your message
+- **PDFs** — the text layer is extracted locally (PyMuPDF) and included with your message. Scanned/photographed PDFs with no text layer fall back to OCR via OpenAI vision (reuses `OPENAI_API_KEY`). If neither yields text — encrypted or unreadable — Microwave says so and asks you to paste the values instead of pretending it read them.
 - **Photos** — acknowledged but content is not visible to the model (see Limitations)
 - **Captions** — if you attach a caption with the file, it's used as your message; otherwise Microwave asks what you'd like to do with it
+
+PDFs work the same way in Signal — they're extracted (with the same OCR fallback) and join the buffered turn alongside any text or voice.
 
 Microwave can also send files back. If a response would be better as a file (code, data, long-form writing), it creates and sends a document rather than pasting a wall of text into chat.
 
@@ -738,15 +741,14 @@ Microwave can also send files back. If a response would be better as a file (cod
 
 Things this pipeline can't do yet, or does poorly.
 
-### No vision
-Images and photos are received but not seen. The pipeline is text-only — there's no multimodal path to pass images through to the LLM. Photos sent in Telegram are acknowledged but the model has no idea what's in them.
+### No vision (except PDFs via OCR)
+Images and photos are received but not seen. On Max auth the pipeline is text-only — there's no multimodal path to pass raw images through to the LLM, so photos sent in Telegram are acknowledged but the model has no idea what's in them. PDFs are the exception: a scanned PDF is rendered to images and run through OpenAI vision *outside* the LLM path, and only the transcribed text reaches the model. Sending a photo of a lab report as a real photo still won't be read; send it as a PDF (or paste the values).
 
 ### Tool use is opt-in per integration
 Microwave wires real Agent SDK tools through an in-process MCP server (`src/tools/`). Each tool self-registers based on whether its prerequisite env var is set — no key, no tool. Today's roster:
 
 - **`instacart_create_cart`** — build a Shop with Instacart cart and return a checkout URL. Activates when `INSTACART_API_KEY` is set. The seed `instacart` skill teaches the model when to call it (and when to ask first).
 - **`github_list_repos`** / **`github_repo_summary`** / **`github_recent_activity`** — read-only GitHub walker. Lists owned repos, fetches a composite snapshot (README excerpt + recent commits + open PRs/issues + languages) for one repo, and surfaces a cross-repo activity feed. Activates when `GITHUB_TOKEN` is set. The seed `github` skill auto-activates on phrasings like "walk my repos" or "what have I been working on." Goes straight to api.github.com via aiohttp — never touches your local `gh auth` state.
-
 Tools work in **Max auth mode only**. API-key mode currently falls back to text-only — adding tool-use there means managing the tool_use loop manually against the Messages API and isn't wired in yet.
 
 The pre-existing **scheduler pre-fetch** path (`fetch.py` alongside a SKILL.md) still exists for batch-mode data pulls before scheduled LLM calls — that's how the seed `github-tool` skill pulls fresh `gh pr list` data for weekly digests. Pre-fetch and tool-use solve different problems: pre-fetch is offline data prep, tools are mid-turn capabilities.

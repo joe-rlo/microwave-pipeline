@@ -21,6 +21,7 @@ from telegram import Update
 from telegram.error import BadRequest
 from telegram.ext import Application, MessageHandler, CommandHandler, filters
 
+from src.channels._pdf import extract_pdf_text
 from src.channels.base import Channel
 from src.channels.telegram_format import markdown_to_telegram_html
 from src.health.profile.chat import handle_profile_command
@@ -156,6 +157,43 @@ class TelegramChannel(Channel):
                     message = f"{file_context}\n\n{caption}"
                 else:
                     message = f"{file_context}\n\nThe user sent this file. Acknowledge it and ask what they'd like to do with it."
+
+            elif ext == ".pdf" or doc.mime_type == "application/pdf":
+                # PDF — extract the text layer, OCR'ing if it's a scan.
+                # On Max auth the model can't see the PDF itself, so we
+                # turn it into text and inject it like any text file.
+                extract = await extract_pdf_text(
+                    bytes(data),
+                    openai_api_key=self.orchestrator.config.openai_api_key,
+                )
+                if extract.ok:
+                    note = ""
+                    if extract.method == "ocr":
+                        note = " (scanned — transcribed via OCR)"
+                    if extract.page_truncated:
+                        note += " [only the first pages were read]"
+                    elif extract.char_truncated:
+                        note += " [truncated]"
+                    file_context = (
+                        f"[PDF: {filename}{note} — extracted text]\n"
+                        f"```\n{extract.text}\n```"
+                    )
+                    if caption:
+                        message = f"{file_context}\n\n{caption}"
+                    else:
+                        message = (
+                            f"{file_context}\n\nThe user sent this PDF. "
+                            "Acknowledge it and ask what they'd like to do with it."
+                        )
+                else:
+                    # Couldn't extract (encrypted, image-only with no OCR
+                    # key, or a malformed file) — degrade to metadata so
+                    # the model doesn't pretend it read the contents.
+                    size_kb = len(data) / 1024
+                    message = (
+                        f"[PDF received but its text couldn't be extracted: {filename} ({size_kb:.1f} KB)]\n\n"
+                        f"{caption or 'Tell the user you received the PDF but could not read its contents, and ask them to paste the values as text.'}"
+                    )
 
             else:
                 # Binary file — note the metadata

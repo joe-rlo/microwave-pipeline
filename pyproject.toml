@@ -19,6 +19,7 @@ dependencies = [
     "duckduckgo-search",
     "cryptography",
     "keyring",
+    "pymupdf",
 ]
 
 [project.optional-dependencies]
