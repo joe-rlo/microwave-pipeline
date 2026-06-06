@@ -268,6 +268,7 @@ class TestRegistry:
         monkeypatch.setenv("WEB_TOOLS_DISABLED", "1")
         monkeypatch.setenv("FILE_TOOLS_DISABLED", "1")
         monkeypatch.setenv("WEBSEARCH_DISABLED", "1")
+        monkeypatch.setenv("MEDICAL_TOOLS_DISABLED", "1")
         from src.tools import build_tools
 
         config = SimpleNamespace(instacart_api_key="")

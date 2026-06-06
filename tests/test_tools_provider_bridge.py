@@ -55,6 +55,7 @@ class TestProviderRegistry:
         monkeypatch.setenv("WEB_TOOLS_DISABLED", "1")
         monkeypatch.setenv("FILE_TOOLS_DISABLED", "1")
         monkeypatch.setenv("WEBSEARCH_DISABLED", "1")
+        monkeypatch.setenv("MEDICAL_TOOLS_DISABLED", "1")
         config = SimpleNamespace(instacart_api_key="", github_token="")
         tools = build_provider_tools(config)
         # Only scheduler tools should register without any env keys.
@@ -65,6 +66,7 @@ class TestProviderRegistry:
         monkeypatch.setenv("WEB_TOOLS_DISABLED", "1")
         monkeypatch.setenv("FILE_TOOLS_DISABLED", "1")
         monkeypatch.setenv("WEBSEARCH_DISABLED", "1")
+        monkeypatch.setenv("MEDICAL_TOOLS_DISABLED", "1")
         config = SimpleNamespace(
             instacart_api_key="fake",
             instacart_partner_linkback_url="",
@@ -78,6 +80,7 @@ class TestProviderRegistry:
         monkeypatch.setenv("WEB_TOOLS_DISABLED", "1")
         monkeypatch.setenv("FILE_TOOLS_DISABLED", "1")
         monkeypatch.setenv("WEBSEARCH_DISABLED", "1")
+        monkeypatch.setenv("MEDICAL_TOOLS_DISABLED", "1")
         config = SimpleNamespace(
             instacart_api_key="",
             github_token="ghp_fake",
@@ -97,6 +100,7 @@ class TestProviderRegistry:
         monkeypatch.setenv("WEB_TOOLS_DISABLED", "1")
         monkeypatch.setenv("FILE_TOOLS_DISABLED", "1")
         monkeypatch.setenv("WEBSEARCH_DISABLED", "1")
+        monkeypatch.setenv("MEDICAL_TOOLS_DISABLED", "1")
         config = SimpleNamespace(
             instacart_api_key="fake",
             instacart_partner_linkback_url="",
@@ -125,6 +129,7 @@ class TestProviderRegistry:
         monkeypatch.setenv("WEB_TOOLS_DISABLED", "true")
         monkeypatch.setenv("FILE_TOOLS_DISABLED", "true")
         monkeypatch.setenv("WEBSEARCH_DISABLED", "1")
+        monkeypatch.setenv("MEDICAL_TOOLS_DISABLED", "1")
         config = SimpleNamespace(instacart_api_key="", github_token="")
         tools = build_provider_tools(config)
         # Only scheduler tools remain when every keyed/env tool is off.

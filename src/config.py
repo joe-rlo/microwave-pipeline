@@ -64,6 +64,13 @@ class Config(BaseModel):
     # with Contents: Read, Metadata: Read, Pull requests: Read, Issues: Read.
     github_token: str = ""
 
+    # Contact email used as the polite caller identifier for the medical
+    # literature tools (src/tools/research.py): Unpaywall *requires* it as a
+    # query param, NCBI E-utilities recommends it. No key needed — this is
+    # just so those public APIs can reach you about excessive use. A generic
+    # fallback is used if unset, so the tools work without configuration.
+    research_contact_email: str = ""
+
     # Provider routing — see spec-llm-providers-and-health-baa.md §9.
     # These fields exist on Config for visibility and `health status` /
     # debug surfaces; the runtime selector in src/llm/selector.py reads
@@ -212,6 +219,7 @@ def load_config() -> Config:
         instacart_api_key=os.getenv("INSTACART_API_KEY", ""),
         instacart_partner_linkback_url=os.getenv("INSTACART_PARTNER_LINKBACK_URL", ""),
         github_token=os.getenv("GITHUB_TOKEN", ""),
+        research_contact_email=os.getenv("RESEARCH_CONTACT_EMAIL", ""),
         llm_provider_default=os.getenv("LLM_PROVIDER_DEFAULT", "legacy"),
         llm_stage_triage=os.getenv("LLM_STAGE_TRIAGE", ""),
         llm_stage_reflection=os.getenv("LLM_STAGE_REFLECTION", ""),

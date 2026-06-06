@@ -61,6 +61,15 @@ def _websearch_disabled() -> bool:
     )
 
 
+def _medical_tools_disabled() -> bool:
+    """True when the MEDICAL_TOOLS_DISABLED env flag is set. Default enabled —
+    the research tools need no API key (Europe PMC / Unpaywall / NCBI are
+    public)."""
+    return os.environ.get("MEDICAL_TOOLS_DISABLED", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
 # Provider-shape handler: async (args) -> response text. Raises on error.
 ProviderToolHandler = Callable[[dict[str, Any]], Awaitable[str]]
 
@@ -174,6 +183,16 @@ def build_tools(config) -> ToolBundle:
             tools.extend(ws_tools)
             catalog_lines.append(WEBSEARCH_TOOL_DOCS)
             log.info("Registered native websearch tool")
+
+    # --- Medical literature (Europe PMC / Unpaywall / PubMed; no key) ---
+    if not _medical_tools_disabled():
+        from src.tools.research import build_research_sdk_tools, MEDICAL_TOOL_DOCS
+
+        research_tools = build_research_sdk_tools(config)
+        if research_tools:
+            tools.extend(research_tools)
+            catalog_lines.append(MEDICAL_TOOL_DOCS)
+            log.info("Registered medical literature tools")
 
     # --- Scheduler docs (no SDK tool, provider-path only) -----------------
     # The scheduler tool only exists on the provider path (build_provider_tools
@@ -342,6 +361,50 @@ def build_provider_tools(config) -> list[ProviderTool]:
                     input_schema=search_mod.WEBSEARCH_SCHEMA,
                 ),
                 handler=_websearch,
+            )
+        )
+
+    # --- Medical literature (native; no env key required) ---
+    if not _medical_tools_disabled():
+        from src.tools import research as research_mod
+
+        async def _med_search(args: dict[str, Any]) -> str:
+            return _unwrap_mcp_result(
+                await research_mod._handle_search(args, config=config),
+                tool_name="medical_literature_search",
+            )
+
+        async def _med_fetch(args: dict[str, Any]) -> str:
+            return _unwrap_mcp_result(
+                await research_mod._handle_fetch(args, config=config),
+                tool_name="medical_article_fetch",
+            )
+
+        out.append(
+            ProviderTool(
+                definition=ToolDefinition(
+                    name="medical_literature_search",
+                    description=(
+                        "Search biomedical literature (Europe PMC: PubMed + PMC "
+                        "+ preprints). Returns structured hits with abstracts."
+                    ),
+                    input_schema=research_mod.SEARCH_SCHEMA,
+                ),
+                handler=_med_search,
+            )
+        )
+        out.append(
+            ProviderTool(
+                definition=ToolDefinition(
+                    name="medical_article_fetch",
+                    description=(
+                        "Fetch one article by DOI/PMID/PMCID: abstract, "
+                        "open-access full text, and a legal free link via "
+                        "Unpaywall when paywalled."
+                    ),
+                    input_schema=research_mod.FETCH_SCHEMA,
+                ),
+                handler=_med_fetch,
             )
         )
 
