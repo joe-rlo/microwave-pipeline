@@ -87,6 +87,7 @@ class MemorySearcher:
         triage: TriageResult,
         max_results: int | None = None,
         active_project: str | None = None,
+        include_phi: bool = True,
     ) -> SearchResult:
         """Run hybrid search shaped by triage parameters.
 
@@ -94,6 +95,10 @@ class MemorySearcher:
         from that project's drafts/bible/outline (×1.5) and away from
         other projects' fragments (×0.5). Global memory and session
         turns are unaffected.
+
+        `include_phi` gates recent-turn recall across the BAA boundary —
+        pass False when the current turn is NOT on the BAA path so PHI
+        turns aren't pulled into a non-BAA model's context.
         """
         start = time.time()
 
@@ -143,7 +148,7 @@ class MemorySearcher:
         # the last ~48h is retrievable even before compaction indexes it.
         # These are NOT ranked against fragments — they occupy a separate slot
         # and get rendered under their own label by the assembly stage.
-        turn_fragments = self._recent_turn_fragments(query)
+        turn_fragments = self._recent_turn_fragments(query, include_phi=include_phi)
 
         elapsed_ms = int((time.time() - start) * 1000)
         return SearchResult(
@@ -153,14 +158,20 @@ class MemorySearcher:
             search_time_ms=elapsed_ms,
         )
 
-    def _recent_turn_fragments(self, query: str) -> list[MemoryFragment]:
+    def _recent_turn_fragments(
+        self, query: str, include_phi: bool = True
+    ) -> list[MemoryFragment]:
         """Pull recent conversation turns matching the query. Returns them as
-        MemoryFragments with source_type='turn' so assembly can label them."""
+        MemoryFragments with source_type='turn' so assembly can label them.
+
+        `include_phi=False` excludes BAA-covered PHI turns so they never reach
+        a non-BAA path's context."""
         if self.session_engine is None:
             return []
         try:
             turns = self.session_engine.search_recent_turns(
-                query, hours=RECENT_TURN_HOURS, limit=RECENT_TURN_LIMIT
+                query, hours=RECENT_TURN_HOURS, limit=RECENT_TURN_LIMIT,
+                include_phi=include_phi,
             )
         except Exception as e:
             log.debug(f"Recent-turn search failed: {e}")

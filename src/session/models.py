@@ -92,6 +92,11 @@ class Turn:
     timestamp: datetime = field(default_factory=datetime.now)
     token_count: int = 0
     metadata: dict = field(default_factory=dict)
+    # PHI classification carried from triage (none|general|personal|unknown).
+    # Persisted so retrieval and compaction can keep personal-health turns
+    # off the non-BAA path — see SessionEngine.search_recent_turns and
+    # get_turns_for_compaction. "none" for non-health and pre-migration rows.
+    phi_class: str = "none"
 
 
 @dataclass

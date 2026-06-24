@@ -387,6 +387,11 @@ class Orchestrator:
             active_project=(self._active_project.name if self._active_project else None),
         )
 
+        # Tag the user turn with its PHI class so retrieval/compaction can
+        # keep personal-health turns off the non-BAA path. The matching
+        # assistant turn is tagged the same way at commit time below.
+        user_turn.phi_class = triage_result.phi_class
+
         # Resolve the skill in effect for THIS turn. Explicit pin always wins;
         # otherwise triage's ephemeral match is used. Neither mutates
         # self._active_skill — auto-match is per-turn, not sticky.
@@ -517,9 +522,14 @@ class Orchestrator:
         active_project_name = (
             self._active_project.name if self._active_project else None
         )
+        # Gate recent-turn recall across the BAA boundary: only a turn that
+        # is itself on the BAA path may pull prior PHI turns into context.
+        # Non-BAA turns (skip/general/TEE) get include_phi=False so personal
+        # health turns can't leak into a non-BAA model's prompt.
         search_result = await search(
             message, triage_result, self.searcher,
             active_project=active_project_name,
+            include_phi=h_route.use_baa_llm,
         )
         # Cache for /why — overwritten on every turn that runs search.
         # Turns that skip search (triage `needs_memory=false`) leave
@@ -861,6 +871,7 @@ class Orchestrator:
             user_id=user_id,
             role="assistant",
             content=full_response,
+            phi_class=triage_result.phi_class,
             metadata={
                 "triage_intent": triage_result.intent,
                 "triage_complexity": triage_result.complexity,

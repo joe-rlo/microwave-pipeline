@@ -127,9 +127,18 @@ Health classification (set phi_class):
   news story. A bare topic mention in isolation is NOT ambiguous;
   it's general until a first-person marker appears.
 
-Topic carryover from recent conversation: if the previous turn was
-classified general and the current message is a brief follow-up
-with no first-person markers, the follow-up stays "general".
+Topic carryover from recent conversation (works both ways):
+- If the previous turn was classified general and the current message is
+  a brief follow-up with no first-person markers, the follow-up stays
+  "general".
+- If the recent conversation already established that the user is
+  discussing their OWN health (the context note flags a prior personal/PHI
+  turn) and the current message is a brief follow-up continuing that same
+  thread, classify it "personal" — carry the personal context forward even
+  without a fresh first-person marker. Examples of such follow-ups:
+  "it's not me", "I have a picture", "what about now?", "and the other
+  one?", "is that bad?". A clear change of subject to a new, unrelated
+  topic breaks the carryover (then classify the new topic on its own).
 Conversation context wins over isolated keyword patterns.
 
 Also set `health_topic` to a short tag like "diabetes", "medication",
@@ -192,6 +201,16 @@ def _format_triage_input(message: str, recent_turns: list[Turn]) -> str:
         for turn in recent_turns[-4:]:  # Last 4 turns for context
             parts.append(f"  {turn.role}: {turn.content[:200]}")
         parts.append("")
+        # Surface the prior PHI context so triage can carry a personal-health
+        # thread forward to a brief follow-up that lacks its own first-person
+        # marker. phi_class lives on the turn, not in its truncated content,
+        # so the classifier can't infer it without this hint.
+        if any(t.phi_class in ("personal", "unknown") for t in recent_turns[-2:]):
+            parts.append(
+                "Note: the recent conversation already involved the user's OWN "
+                "health details (personal/PHI)."
+            )
+            parts.append("")
     parts.append(f"Current message: {message}")
     return "\n".join(parts)
 

@@ -113,6 +113,74 @@ class TestSearchRecentTurns:
         eng.close()
 
 
+class TestPhiBoundaryFiltering:
+    """PHI turns (personal/unknown, processed under the BAA-covered LLM) must
+    not be retrievable into a non-BAA path's context. See the leak fix in
+    SessionEngine.search_recent_turns(include_phi=...) and get_turns_for_compaction."""
+
+    def test_phi_class_round_trips(self, tmp_path):
+        eng = _engine(tmp_path)
+        _add(eng, content="my biopsy result was concerning", phi_class="personal")
+        hit = eng.search_recent_turns("biopsy")[0]
+        assert hit.phi_class == "personal"
+        eng.close()
+
+    def test_default_includes_phi(self, tmp_path):
+        # Same-boundary callers (the BAA path itself) keep full recall.
+        eng = _engine(tmp_path)
+        _add(eng, content="my biopsy of the lesion", phi_class="personal")
+        assert len(eng.search_recent_turns("biopsy")) == 1
+        assert len(eng.search_recent_turns("biopsy", include_phi=True)) == 1
+        eng.close()
+
+    def test_exclude_phi_drops_personal_and_unknown(self, tmp_path):
+        eng = _engine(tmp_path)
+        _add(eng, content="biopsy personal detail", phi_class="personal")
+        _add(eng, content="biopsy ambiguous detail", phi_class="unknown", role="assistant")
+        # Non-BAA retrieval must surface neither.
+        assert eng.search_recent_turns("biopsy", include_phi=False) == []
+        eng.close()
+
+    def test_exclude_phi_keeps_general_and_none(self, tmp_path):
+        # "general" health and non-health turns are NOT PHI — still retrievable.
+        eng = _engine(tmp_path)
+        _add(eng, content="biopsy general explainer", phi_class="general")
+        _add(eng, content="biopsy mentioned in passing", phi_class="none", role="assistant")
+        contents = [h.content for h in eng.search_recent_turns("biopsy", include_phi=False)]
+        assert "biopsy general explainer" in contents
+        assert "biopsy mentioned in passing" in contents
+        eng.close()
+
+    def test_fragments_forward_include_phi(self, tmp_path):
+        eng = _engine(tmp_path)
+        _add(eng, content="biopsy personal note", phi_class="personal")
+        s = MemorySearcher.__new__(MemorySearcher)
+        s.session_engine = eng
+        assert s._recent_turn_fragments("biopsy", include_phi=False) == []
+        assert len(s._recent_turn_fragments("biopsy", include_phi=True)) == 1
+        eng.close()
+
+    def test_compaction_keeps_phi_verbatim(self, tmp_path):
+        # PHI turns must never enter to_summarize — the compactor runs on the
+        # non-BAA model, so summarizing PHI would cross the boundary.
+        eng = _engine(tmp_path)
+        # 8 old chitchat turns + 1 old PHI turn, then keep_recent (6) recent.
+        for i in range(8):
+            _add(eng, content=f"just chatting number {i}", phi_class="none")
+        _add(eng, content="my personal lab value was high", phi_class="personal")
+        for i in range(6):
+            _add(eng, content=f"recent chatter {i}", phi_class="none")
+
+        to_summarize, to_keep_verbatim, recent = eng.get_turns_for_compaction(
+            "s1", keep_recent=6
+        )
+        verbatim_contents = [t.content for t in to_keep_verbatim]
+        summarize_contents = [t.content for t in to_summarize]
+        assert "my personal lab value was high" in verbatim_contents
+        assert "my personal lab value was high" not in summarize_contents
+        eng.close()
+
+
 class TestSearcherRecentTurnFragments:
     def test_no_session_engine_returns_empty(self, tmp_path):
         # No engine wired → safe no-op, existing behavior preserved.

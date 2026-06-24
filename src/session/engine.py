@@ -69,7 +69,8 @@ class SessionEngine:
                 content TEXT NOT NULL,
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
                 token_count INTEGER,
-                metadata JSON
+                metadata JSON,
+                phi_class TEXT NOT NULL DEFAULT 'none'
             )
         """)
         # apsw doesn't support executescript, so run indexes separately
@@ -79,6 +80,15 @@ class SessionEngine:
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_turns_channel_user ON turns(channel, user_id)"
         )
+        # Migration: add phi_class to turns tables created before health
+        # routing existed. Idempotent — only fires when the column is absent.
+        # Existing rows default to 'none' (treated as non-PHI), which is the
+        # safe direction: they were already retrievable everywhere.
+        cols = {row["name"] for row in self.conn.execute("PRAGMA table_info(turns)")}
+        if "phi_class" not in cols:
+            self.conn.execute(
+                "ALTER TABLE turns ADD COLUMN phi_class TEXT NOT NULL DEFAULT 'none'"
+            )
 
     def get_last_session_id(self, channel: str | None = None) -> str | None:
         """Get the most recent session ID, optionally filtered by channel."""
@@ -107,7 +117,7 @@ class SessionEngine:
         token_count = self.count_tokens(turn.content)
         self.conn.execute(
             "INSERT INTO turns (session_id, channel, user_id, role, content, timestamp, "
-            "token_count, metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "token_count, metadata, phi_class) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 turn.session_id,
                 turn.channel,
@@ -117,6 +127,7 @@ class SessionEngine:
                 turn.timestamp.isoformat(),
                 token_count,
                 json.dumps(turn.metadata),
+                turn.phi_class or "none",
             ),
         )
         return self.conn.last_insert_rowid()
@@ -148,6 +159,7 @@ class SessionEngine:
         channel: str | None = None,
         user_id: str | None = None,
         exclude_session: str | None = None,
+        include_phi: bool = True,
     ) -> list[Turn]:
         """Find recent user/assistant turns matching a query.
 
@@ -155,6 +167,12 @@ class SessionEngine:
         no FTS needed. Each query word contributes; turns that match more
         words rank higher, ties broken by recency.
         Returns up to `limit` turns, most relevant first.
+
+        `include_phi` gates the BAA boundary: when False, turns classified
+        "personal"/"unknown" (PHI, processed under the BAA-covered LLM) are
+        excluded so they can't be surfaced into a non-BAA path's context.
+        Defaults True to preserve behavior for same-boundary callers; the
+        retrieval pipeline passes include_phi=<current turn is on BAA path>.
         """
         import re
 
@@ -180,6 +198,11 @@ class SessionEngine:
         if exclude_session:
             filters.append("session_id != ?")
             params.append(exclude_session)
+        if not include_phi:
+            # Keep BAA-covered PHI out of non-BAA retrieval. 'general' health
+            # is not PHI and stays retrievable; only 'personal'/'unknown' are
+            # excluded. COALESCE guards pre-migration NULLs (treated as 'none').
+            filters.append("COALESCE(phi_class, 'none') NOT IN ('personal', 'unknown')")
 
         clauses = ["LOWER(content) LIKE ?" for _ in words]
         params.extend(f"%{w}%" for w in words)
@@ -262,7 +285,15 @@ class SessionEngine:
         to_summarize: list[Turn] = []
         to_keep_verbatim: list[Turn] = []
         for turn in old:
-            if _is_important_turn(turn, importance_threshold):
+            # PHI turns are kept verbatim and never summarized — the compactor
+            # runs on the non-BAA model, so summarizing PHI would send it
+            # across the BAA boundary, and the resulting summary would be an
+            # untagged blob that retrieval could surface to the non-BAA path.
+            # Keeping them verbatim leaves them individually phi_class-tagged
+            # and filtered by search_recent_turns(include_phi=False).
+            if turn.phi_class in ("personal", "unknown"):
+                to_keep_verbatim.append(turn)
+            elif _is_important_turn(turn, importance_threshold):
                 to_keep_verbatim.append(turn)
             else:
                 to_summarize.append(turn)
@@ -302,6 +333,7 @@ class SessionEngine:
             timestamp=datetime.fromisoformat(row["timestamp"]),
             token_count=row["token_count"] or 0,
             metadata=json.loads(row["metadata"]) if row["metadata"] else {},
+            phi_class=row.get("phi_class") or "none",
         )
 
     def get_recent_stats(self, channel: str, user_id: str, limit: int = 10) -> dict:

@@ -216,6 +216,47 @@ class TestHealthClassification:
         # The clarifying example phrasings the prompt uses
         assert "what about" in prompt.lower() or "and statins" in prompt.lower()
 
+    def test_health_prompt_carries_personal_context_forward(self):
+        """The bug Joe hit: a brief follow-up to a personal-health turn
+        ('it's not me, I do have a picture') lost its PHI context and went
+        to the non-BAA path. The prompt must instruct carrying 'personal'
+        forward on a continuing thread, not just 'general'."""
+        prompt = _build_prompt(skills=None, health_enabled=True)
+        low = prompt.lower()
+        # The both-ways carryover must mention carrying personal/PHI forward.
+        assert "carry the personal context forward" in low
+        # And reference the context note that signals the prior PHI turn.
+        assert "personal/phi" in low
+
+    def test_format_input_surfaces_prior_phi_context(self):
+        from datetime import datetime
+        from src.pipeline.triage import _format_triage_input
+        from src.session.models import Turn
+
+        prior = [
+            Turn(role="user", content="is this mole on my arm cancer?",
+                 phi_class="personal", timestamp=datetime.now()),
+            Turn(role="assistant", content="Lesions in unreachable areas...",
+                 phi_class="personal", timestamp=datetime.now()),
+        ]
+        out = _format_triage_input("it's not me, I do have a picture", prior)
+        assert "personal/PHI" in out
+        assert "Current message: it's not me" in out
+
+    def test_format_input_no_phi_note_when_recent_not_personal(self):
+        from datetime import datetime
+        from src.pipeline.triage import _format_triage_input
+        from src.session.models import Turn
+
+        prior = [
+            Turn(role="user", content="what's the weather",
+                 phi_class="none", timestamp=datetime.now()),
+            Turn(role="assistant", content="sunny",
+                 phi_class="none", timestamp=datetime.now()),
+        ]
+        out = _format_triage_input("and tomorrow?", prior)
+        assert "personal/PHI" not in out
+
     def test_health_prompt_distinguishes_topic_from_marker(self):
         """A sensitive TOPIC alone (ED, cancer, mental health) must NOT
         trigger 'personal' without a first-person marker. The prompt
