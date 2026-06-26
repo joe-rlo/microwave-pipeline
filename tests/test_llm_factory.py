@@ -109,6 +109,7 @@ class TestToolsPassthrough:
         monkeypatch.setenv("FILE_TOOLS_DISABLED", "1")
         monkeypatch.setenv("WEBSEARCH_DISABLED", "1")
         monkeypatch.setenv("MEDICAL_TOOLS_DISABLED", "1")
+        monkeypatch.setenv("MEMORY_WRITE_DISABLED", "1")
         monkeypatch.setenv("BLINK_CREDENTIALS_PATH", str(tmp_path / "no-blink.json"))
         config = _make_config()  # neither instacart nor github
         llm = build_main_llm(config)
@@ -129,6 +130,7 @@ class TestToolsPassthrough:
         monkeypatch.setenv("FILE_TOOLS_DISABLED", "1")
         monkeypatch.setenv("WEBSEARCH_DISABLED", "1")
         monkeypatch.setenv("MEDICAL_TOOLS_DISABLED", "1")
+        monkeypatch.setenv("MEMORY_WRITE_DISABLED", "1")
         config = _make_config(github_token="ghp_fake")
         llm = build_main_llm(config)
         # Three github tools should land on the session, alongside the
@@ -237,6 +239,7 @@ class TestBuildBaaLlm:
         monkeypatch.setenv("FILE_TOOLS_DISABLED", "1")
         monkeypatch.setenv("WEBSEARCH_DISABLED", "1")
         monkeypatch.setenv("MEDICAL_TOOLS_DISABLED", "1")
+        monkeypatch.setenv("MEMORY_WRITE_DISABLED", "1")
         monkeypatch.setenv("BLINK_CREDENTIALS_PATH", str(tmp_path / "no-blink.json"))
         self._stub_boto3(monkeypatch)
         config = _make_config()

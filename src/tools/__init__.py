@@ -194,6 +194,18 @@ def build_tools(config) -> ToolBundle:
             catalog_lines.append(MEDICAL_TOOL_DOCS)
             log.info("Registered medical literature tools")
 
+    # --- Memory write (remember; appends to MEMORY.md / daily notes) ---
+    from src.tools.memory_write import (
+        build_remember_sdk_tools, memory_write_disabled, REMEMBER_TOOL_DOCS,
+    )
+
+    if not memory_write_disabled():
+        remember_tools = build_remember_sdk_tools(config)
+        if remember_tools:
+            tools.extend(remember_tools)
+            catalog_lines.append(REMEMBER_TOOL_DOCS)
+            log.info("Registered memory-write tool (remember)")
+
     # --- Scheduler docs (no SDK tool, provider-path only) -----------------
     # The scheduler tool only exists on the provider path (build_provider_tools
     # below). But the LLM reads its tool catalog from this function's
@@ -405,6 +417,31 @@ def build_provider_tools(config) -> list[ProviderTool]:
                     input_schema=research_mod.FETCH_SCHEMA,
                 ),
                 handler=_med_fetch,
+            )
+        )
+
+    # --- Memory write (remember; appends to MEMORY.md / daily notes) ---
+    from src.tools import memory_write as mem_mod
+
+    if not mem_mod.memory_write_disabled():
+        async def _remember(args: dict[str, Any]) -> str:
+            return _unwrap_mcp_result(
+                await mem_mod._handle_remember(args, config=config),
+                tool_name="remember",
+            )
+
+        out.append(
+            ProviderTool(
+                definition=ToolDefinition(
+                    name="remember",
+                    description=(
+                        "Save a fact to memory so it persists across "
+                        "conversations. scope=long_term → MEMORY.md (default), "
+                        "scope=daily → today's daily note. Appends only."
+                    ),
+                    input_schema=mem_mod.REMEMBER_SCHEMA,
+                ),
+                handler=_remember,
             )
         )
 

@@ -187,6 +187,9 @@ class MemoryStore:
 
     def append_daily(self, content: str, day: date | None = None) -> None:
         path = self.daily_path(day)
+        # Ensure the daily-notes dir exists — on a fresh workspace (or a
+        # first-ever daily write via the `remember` tool) it may not yet.
+        path.parent.mkdir(parents=True, exist_ok=True)
         existing = path.read_text() if path.exists() else ""
         separator = "\n\n" if existing.strip() else ""
         path.write_text(existing + separator + content.strip() + "\n")
