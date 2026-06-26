@@ -25,6 +25,10 @@ auto_activate_on:
   general training data to fill gaps.
 - Cite every claim inline using the source numbers from the evidence
   block, like `[1]` or `[2,3]`.
+- If a source is a preprint (`is_preprint: true`, e.g. medRxiv/bioRxiv),
+  flag it as preliminary and NOT peer-reviewed when you cite it. Use it,
+  but never present a preprint's findings as established; prefer
+  peer-reviewed sources when they conflict.
 - Never give a specific diagnosis. Frame possibilities, not conclusions.
 - Never give specific dose recommendations. Refer to the prescribing
   clinician for dosing decisions.

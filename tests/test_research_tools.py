@@ -218,6 +218,54 @@ class TestFetchArticle:
         assert payload["found"] is False
 
 
+class TestPreprintFlagging:
+    """Preprints (medRxiv/bioRxiv) stay in results but are flagged is_preprint
+    so the model can caveat them as not-peer-reviewed."""
+
+    def test_epmc_preprint_by_source_ppr(self):
+        a = R._epmc_article({
+            "title": "A long covid preprint", "source": "PPR",
+            "doi": "10.1101/2026.01.01", "pubYear": 2026,
+            "journalTitle": "", "authorString": "Smith J",
+        })
+        assert a.is_preprint is True
+        assert a.to_payload()["is_preprint"] is True
+
+    def test_epmc_preprint_by_pubtype(self):
+        a = R._epmc_article({
+            "title": "X", "source": "MED", "pubType": "Preprint",
+            "doi": "10.1/x",
+        })
+        assert a.is_preprint is True
+
+    def test_epmc_peer_reviewed_not_flagged(self):
+        a = R._epmc_article({
+            "title": "Peer reviewed study", "source": "MED",
+            "journalTitle": "Nature", "doi": "10.1/x",
+        })
+        assert a.is_preprint is False
+        assert a.to_payload()["is_preprint"] is False
+
+    @pytest.mark.asyncio
+    async def test_search_payload_carries_flag(self):
+        preprint_hit = {
+            "resultList": {"result": [{
+                "title": "medRxiv finding", "source": "PPR",
+                "journalTitle": "medRxiv", "pubYear": 2026,
+                "doi": "10.1101/x", "authorString": "A B",
+            }]}
+        }
+
+        def router(req: httpx.Request) -> httpx.Response:
+            return _json_response(preprint_hit)
+
+        client = _make_client(router)
+        results = await R.search_literature("anything", client=client)
+        await client.aclose()
+        assert results[0].is_preprint is True
+        assert results[0].journal == "medRxiv"
+
+
 class TestNormalizeId:
     def test_doi(self):
         assert R._normalize_id("10.1234/abc") == ("doi", "10.1234/abc")

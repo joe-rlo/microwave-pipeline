@@ -96,6 +96,10 @@ class Article:
     abstract: str = ""
     url: str = ""
     source: str = ""
+    # True for preprints (medRxiv / bioRxiv / other PPR-source records).
+    # Preprints are NOT peer-reviewed — kept in results but flagged so the
+    # model can caveat them rather than present them as established.
+    is_preprint: bool = False
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -107,6 +111,7 @@ class Article:
             "pmid": self.pmid,
             "pmcid": self.pmcid,
             "is_open_access": self.is_open_access,
+            "is_preprint": self.is_preprint,
             "abstract": _clip(self.abstract, ABSTRACT_MAX_CHARS),
             "url": self.url,
             "source": self.source,
@@ -187,6 +192,10 @@ def _epmc_article(rec: dict) -> Article:
     doi = rec.get("doi") or ""
     pmid = rec.get("pmid") or ""
     is_oa = (rec.get("isOpenAccess") or "").upper() == "Y" or bool(rec.get("inEPMC") == "Y")
+    # Europe PMC flags preprints with source "PPR" (medRxiv/bioRxiv/etc.);
+    # some also carry "preprint" in pubType. Either marks it not-peer-reviewed.
+    is_preprint = (rec.get("source") or "").upper() == "PPR" or \
+        "preprint" in (rec.get("pubType") or "").lower()
     if doi:
         url = f"https://doi.org/{doi}"
     elif pmcid:
@@ -207,6 +216,7 @@ def _epmc_article(rec: dict) -> Article:
         abstract=(rec.get("abstractText") or "").strip(),
         url=url,
         source="europepmc",
+        is_preprint=is_preprint,
     )
 
 
@@ -268,6 +278,11 @@ async def _search_pubmed(
             if aid.get("idtype") == "doi":
                 doi = aid.get("value", "")
                 break
+        # PubMed is largely peer-reviewed, but the NIH Preprint Pilot indexes
+        # some preprints — esummary lists them in pubtype. Flag if present.
+        is_preprint = any(
+            "preprint" in str(pt).lower() for pt in (rec.get("pubtype") or [])
+        )
         out.append(Article(
             title=(rec.get("title") or "").strip().rstrip("."),
             authors=authors,
@@ -277,6 +292,7 @@ async def _search_pubmed(
             pmid=uid,
             url=f"https://pubmed.ncbi.nlm.nih.gov/{uid}/",
             source="pubmed",
+            is_preprint=is_preprint,
         ))
     return out
 
@@ -491,7 +507,10 @@ How to use:
   `metformin AND cardiovascular outcomes`, `AUTH:"Smith" AND vitamin D`.
 - `max_results`: defaults to 8, max 25.
 - Returns {title, authors, journal, year, doi, pmid, pmcid, is_open_access,
-  abstract, url}. Follow up with `medical_article_fetch` for full text.
+  is_preprint, abstract, url}. Follow up with `medical_article_fetch` for full text.
+- `is_preprint: true` means medRxiv/bioRxiv-style preprint — NOT peer-reviewed.
+  Keep it in the picture, but caveat it as preliminary; never present a
+  preprint's findings as established or settled.
 
 **medical_article_fetch** — Get one article by DOI / PMID / PMCID: abstract
 always, open-access full text when it exists, and a legally-posted free
